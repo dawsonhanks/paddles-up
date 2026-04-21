@@ -1,0 +1,357 @@
+import { STATUS_PIN_COLOR, type Court, type CourtStatus } from '@/lib/courts'
+import { formatDistanceMiles } from '@/lib/geo'
+import BottomSheet, { BottomSheetFlatList } from '@gorhom/bottom-sheet'
+import type { ReactNode } from 'react'
+import { useCallback, useMemo } from 'react'
+import {
+  Dimensions,
+  FlatList,
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  View,
+} from 'react-native'
+import { GestureHandlerRootView } from 'react-native-gesture-handler'
+import { useSafeAreaInsets } from 'react-native-safe-area-context'
+
+export type ListFilter = 'all' | 'open' | 'outdoor' | 'indoor'
+
+export type CourtWithDistance = Court & { distanceKm: number }
+
+export function matchesListFilter(court: Court, filter: ListFilter): boolean {
+  if (filter === 'all') return true
+  if (filter === 'open') return court.status === 'open'
+  const label = (court.indoorOutdoor ?? '').toLowerCase()
+  if (filter === 'outdoor') return label.includes('outdoor')
+  if (filter === 'indoor') return label.includes('indoor')
+  return true
+}
+
+const FILTER_OPTIONS: { key: ListFilter; label: string }[] = [
+  { key: 'all', label: 'All' },
+  { key: 'open', label: 'Open only' },
+  { key: 'outdoor', label: 'Outdoor' },
+  { key: 'indoor', label: 'Indoor' },
+]
+
+function AvailabilityBadge({ status, isDark }: { status: CourtStatus; isDark: boolean }) {
+  if (status === 'unknown') {
+    return (
+      <View style={[styles.badgeUnknown, { backgroundColor: isDark ? '#374151' : '#E5E7EB' }]}>
+        <Text style={[styles.badgeUnknownMark, { color: isDark ? '#9CA3AF' : '#6B7280' }]}>?</Text>
+      </View>
+    )
+  }
+  const bg = STATUS_PIN_COLOR[status]
+  const label = status === 'open' ? 'Open' : status === 'busy' ? 'Busy' : 'Full'
+  return (
+    <View style={[styles.badgePill, { backgroundColor: bg }]}>
+      <Text style={styles.badgePillText}>{label}</Text>
+    </View>
+  )
+}
+
+function FilterPills({
+  filter,
+  onChange,
+  isDark,
+}: {
+  filter: ListFilter
+  onChange: (f: ListFilter) => void
+  isDark: boolean
+}) {
+  return (
+    <View style={styles.filterWrap}>
+      <Text style={[styles.sheetTitle, { color: isDark ? '#F8FAFC' : '#0F172A' }]}>Nearby courts</Text>
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        contentContainerStyle={styles.filterScroll}>
+        {FILTER_OPTIONS.map((opt) => {
+          const active = filter === opt.key
+          return (
+            <Pressable
+              key={opt.key}
+              onPress={() => onChange(opt.key)}
+              style={({ pressed }) => [
+                styles.filterPill,
+                {
+                  backgroundColor: active ? (isDark ? '#F8FAFC' : '#0F172A') : isDark ? '#27272A' : '#F1F5F9',
+                  borderColor: active ? 'transparent' : isDark ? '#3F3F46' : '#E2E8F0',
+                  opacity: pressed ? 0.85 : 1,
+                },
+              ]}>
+              <Text
+                style={[
+                  styles.filterPillText,
+                  { color: active ? (isDark ? '#0F172A' : '#FFFFFF') : isDark ? '#A1A1AA' : '#475569' },
+                ]}>
+                {opt.label}
+              </Text>
+            </Pressable>
+          )
+        })}
+      </ScrollView>
+    </View>
+  )
+}
+
+function CourtRow({
+  item,
+  onPress,
+  selected,
+  isDark,
+}: {
+  item: CourtWithDistance
+  onPress: () => void
+  selected: boolean
+  isDark: boolean
+}) {
+  const venue = item.indoorOutdoor?.trim() || '—'
+  const courtsLabel = `${item.courtCount} court${item.courtCount === 1 ? '' : 's'}`
+  return (
+    <Pressable
+      onPress={onPress}
+      style={({ pressed }) => [
+        styles.courtCard,
+        {
+          backgroundColor: isDark ? '#1C1C1E' : '#FFFFFF',
+          borderColor: selected ? '#0EA5E9' : isDark ? '#3F3F46' : '#E2E8F0',
+          borderWidth: selected ? 2 : StyleSheet.hairlineWidth,
+          opacity: pressed ? 0.92 : 1,
+        },
+        !isDark && Platform.OS !== 'web' ? styles.courtCardShadow : null,
+      ]}>
+      <View style={styles.courtCardBody}>
+        <Text style={[styles.courtName, { color: isDark ? '#F8FAFC' : '#0F172A' }]} numberOfLines={2}>
+          {item.name}
+        </Text>
+        <Text style={[styles.courtMeta, { color: isDark ? '#A1A1AA' : '#64748B' }]}>
+          {formatDistanceMiles(item.distanceKm)} · {courtsLabel} · {venue}
+        </Text>
+      </View>
+      <AvailabilityBadge status={item.status} isDark={isDark} />
+    </Pressable>
+  )
+}
+
+type NearbyCourtsSheetProps = {
+  courts: CourtWithDistance[]
+  filter: ListFilter
+  onFilterChange: (f: ListFilter) => void
+  onCourtPress: (id: string) => void
+  selectedId: string | null
+  isDark: boolean
+}
+
+const WEB_SHEET_MAX = Math.round(Dimensions.get('window').height * 0.46)
+
+export function NearbyCourtsSheet(props: NearbyCourtsSheetProps) {
+  const { courts, filter, onFilterChange, onCourtPress, selectedId, isDark } = props
+  const insets = useSafeAreaInsets()
+  const snapPoints = useMemo(() => ['22%', '48%', '82%'], [])
+
+  const renderItem = useCallback(
+    ({ item }: { item: CourtWithDistance }) => (
+      <CourtRow
+        item={item}
+        selected={item.id === selectedId}
+        isDark={isDark}
+        onPress={() => onCourtPress(item.id)}
+      />
+    ),
+    [isDark, onCourtPress, selectedId]
+  )
+
+  const ListHeader = useCallback(
+    () => <FilterPills filter={filter} onChange={onFilterChange} isDark={isDark} />,
+    [filter, onFilterChange, isDark]
+  )
+
+  const empty = useCallback(
+    () => (
+      <Text style={[styles.emptyText, { color: isDark ? '#71717A' : '#94A3B8' }]}>
+        No courts match this filter.
+      </Text>
+    ),
+    [isDark]
+  )
+
+  if (Platform.OS === 'web') {
+    return (
+      <View
+        style={[
+          styles.webSheet,
+          {
+            maxHeight: WEB_SHEET_MAX,
+            paddingBottom: insets.bottom + 8,
+            backgroundColor: isDark ? '#18181B' : '#FFFFFF',
+            borderColor: isDark ? '#3F3F46' : '#E2E8F0',
+          },
+        ]}>
+        <View style={[styles.handle, { backgroundColor: isDark ? '#52525B' : '#CBD5E1' }]} />
+        <FilterPills filter={filter} onChange={onFilterChange} isDark={isDark} />
+        <FlatList
+          data={courts}
+          extraData={filter}
+          keyExtractor={(item) => item.id}
+          renderItem={renderItem}
+          ListEmptyComponent={empty}
+          contentContainerStyle={styles.listPad}
+          style={{ flex: 1 }}
+          nestedScrollEnabled
+        />
+      </View>
+    )
+  }
+
+  return (
+    <BottomSheet
+      index={0}
+      snapPoints={snapPoints}
+      enablePanDownToClose={false}
+      bottomInset={insets.bottom}
+      backgroundStyle={{
+        backgroundColor: isDark ? '#18181B' : '#FFFFFF',
+      }}
+      handleIndicatorStyle={{
+        backgroundColor: isDark ? '#52525B' : '#CBD5E1',
+        width: 40,
+      }}
+      style={styles.sheetRoot}>
+      <BottomSheetFlatList
+        data={courts}
+        extraData={filter}
+        keyExtractor={(item) => item.id}
+        renderItem={renderItem}
+        ListHeaderComponent={ListHeader}
+        ListEmptyComponent={empty}
+        contentContainerStyle={[styles.listPad, { paddingBottom: insets.bottom + 20 }]}
+        ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
+      />
+    </BottomSheet>
+  )
+}
+
+/** Wrap map tab when using the native bottom sheet (required by @gorhom/bottom-sheet). */
+export function MapTabGestureRoot({ children }: { children: ReactNode }) {
+  return <GestureHandlerRootView style={styles.gestureRoot}>{children}</GestureHandlerRootView>
+}
+
+const styles = StyleSheet.create({
+  gestureRoot: {
+    flex: 1,
+  },
+  sheetRoot: {
+    flex: 1,
+  },
+  webSheet: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    zIndex: 20,
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    overflow: 'hidden',
+  },
+  handle: {
+    alignSelf: 'center',
+    width: 36,
+    height: 4,
+    borderRadius: 2,
+    marginTop: 8,
+    marginBottom: 4,
+  },
+  filterWrap: {
+    paddingBottom: 8,
+  },
+  sheetTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    letterSpacing: -0.3,
+    paddingHorizontal: 16,
+    marginBottom: 10,
+  },
+  filterScroll: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 12,
+    gap: 8,
+  },
+  filterPill: {
+    paddingHorizontal: 16,
+    paddingVertical: 9,
+    borderRadius: 999,
+    borderWidth: 1,
+  },
+  filterPillText: {
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  listPad: {
+    paddingHorizontal: 16,
+    paddingTop: 4,
+  },
+  courtCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderRadius: 16,
+    paddingVertical: 14,
+    paddingHorizontal: 14,
+    gap: 12,
+  },
+  courtCardShadow: {
+    shadowColor: '#0f172a',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.06,
+    shadowRadius: 12,
+    elevation: 3,
+  },
+  courtCardBody: {
+    flex: 1,
+    minWidth: 0,
+  },
+  courtName: {
+    fontSize: 16,
+    fontWeight: '600',
+    lineHeight: 21,
+  },
+  courtMeta: {
+    marginTop: 4,
+    fontSize: 13,
+    lineHeight: 18,
+  },
+  badgePill: {
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: 999,
+    minWidth: 64,
+    alignItems: 'center',
+  },
+  badgePillText: {
+    color: '#FFFFFF',
+    fontSize: 12,
+    fontWeight: '800',
+    letterSpacing: 0.4,
+  },
+  badgeUnknown: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  badgeUnknownMark: {
+    fontSize: 18,
+    fontWeight: '800',
+  },
+  emptyText: {
+    textAlign: 'center',
+    paddingVertical: 28,
+    fontSize: 15,
+  },
+})

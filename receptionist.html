@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Paddles Up — SunPro Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f0; min-height: 100vh; }
+    .header { background: #0F6E56; padding: 20px 24px; display: flex; align-items: center; justify-content: space-between; }
+    .header h1 { color: white; font-size: 22px; font-weight: 600; }
+    .header p { color: #9FE1CB; font-size: 13px; margin-top: 2px; }
+    .last-updated { color: #9FE1CB; font-size: 12px; text-align: right; }
+    .container { max-width: 680px; margin: 0 auto; padding: 24px 16px; }
+    .section-title { font-size: 13px; font-weight: 600; color: #5F5E5A; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px; margin-top: 24px; }
+    .section-title:first-child { margin-top: 0; }
+    .court-card { background: white; border-radius: 14px; border: 1px solid rgba(0,0,0,0.08); padding: 16px; margin-bottom: 10px; }
+    .court-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+    .court-name { font-size: 16px; font-weight: 600; color: #1a1a1a; }
+    .current-badge { font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 8px; }
+    .badge-open { background: #E1F5EE; color: #0F6E56; }
+    .badge-busy { background: #FAEEDA; color: #633806; }
+    .badge-full { background: #FCEBEB; color: #791F1F; }
+    .badge-unknown { background: #F1EFE8; color: #5F5E5A; }
+    .btn-row { display: flex; gap: 8px; }
+    .btn { flex: 1; padding: 12px 8px; border-radius: 10px; border: 2px solid transparent; font-size: 14px; font-weight: 600; cursor: pointer; transition: all 0.15s; background: #f5f5f0; color: #888; }
+    .btn:hover { opacity: 0.85; }
+    .btn-open { background: #E1F5EE; color: #0F6E56; border-color: #E1F5EE; }
+    .btn-busy { background: #FAEEDA; color: #633806; border-color: #FAEEDA; }
+    .btn-full { background: #FCEBEB; color: #791F1F; border-color: #FCEBEB; }
+    .btn-open.active { border-color: #1D9E75; }
+    .btn-busy.active { border-color: #BA7517; }
+    .btn-full.active { border-color: #E24B4A; }
+    .btn.loading { opacity: 0.5; pointer-events: none; }
+    .all-courts-row { display: flex; gap: 8px; margin-bottom: 24px; }
+    .all-btn { flex: 1; padding: 14px 8px; border-radius: 12px; border: none; font-size: 14px; font-weight: 600; cursor: pointer; transition: all 0.15s; }
+    .all-btn:hover { opacity: 0.85; }
+    .all-open { background: #1D9E75; color: white; }
+    .all-busy { background: #BA7517; color: white; }
+    .all-full { background: #E24B4A; color: white; }
+    .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: #1a1a1a; color: white; padding: 12px 24px; border-radius: 12px; font-size: 14px; font-weight: 500; opacity: 0; transition: opacity 0.3s; pointer-events: none; z-index: 999; }
+    .toast.show { opacity: 1; }
+    .divider { height: 1px; background: rgba(0,0,0,0.06); margin: 8px 0 16px; }
+  </style>
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <h1>Paddles Up</h1>
+    <p>SunPro Tennis & Pickleball — Staff Dashboard</p>
+  </div>
+  <div class="last-updated" id="last-updated">Loading...</div>
+</div>
+
+<div class="container">
+
+  <div class="section-title">Set all courts at once</div>
+  <div class="all-courts-row">
+    <button class="all-btn all-open" onclick="setAllCourts('open')">All Open</button>
+    <button class="all-btn all-busy" onclick="setAllCourts('busy')">All Busy</button>
+    <button class="all-btn all-full" onclick="setAllCourts('full')">All Full</button>
+  </div>
+
+  <div class="divider"></div>
+
+  <div class="section-title">Indoor courts</div>
+  <div id="indoor-courts"></div>
+
+  <div class="section-title">Outdoor courts</div>
+  <div id="outdoor-courts"></div>
+
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+  const SUPABASE_URL = 'https://pjpkrctqsekwhzhmdpmv.supabase.co'
+  const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBqcGtyY3Rxc2Vrd2h6aG1kcG12Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzU1MzU1MDUsImV4cCI6MjA5MTExMTUwNX0.ee30V4pjNw-I_CQszQl6xCoQ0j3Fv9QEL5IE3vyqGIY'
+  const { createClient } = supabase
+  const db = createClient(SUPABASE_URL, SUPABASE_KEY)
+
+  let courts = []
+  let courtStatuses = {}
+
+  async function loadCourts() {
+    const { data, error } = await db
+      .from('courts')
+      .select('*')
+      .eq('facility', 'sunpro')
+      .order('indoor_outdoor', { ascending: false })
+
+    if (error) { console.error(error); return; }
+    courts = data
+    await loadLatestStatuses()
+    renderCourts()
+    updateLastUpdated()
+  }
+
+  async function loadLatestStatuses() {
+    for (const court of courts) {
+      const { data } = await db
+        .from('availability_reports')
+        .select('status, reported_at')
+        .eq('court_id', court.id)
+        .gt('expires_at', new Date().toISOString())
+        .order('reported_at', { ascending: false })
+        .limit(1)
+        .maybeSingle()
+
+      courtStatuses[court.id] = data?.status ?? 'unknown'
+    }
+  }
+
+  function renderCourts() {
+    const indoor = courts.filter(c => c.indoor_outdoor === 'indoor')
+    const outdoor = courts.filter(c => c.indoor_outdoor === 'outdoor')
+    document.getElementById('indoor-courts').innerHTML = indoor.map(courtHTML).join('')
+    document.getElementById('outdoor-courts').innerHTML = outdoor.map(courtHTML).join('')
+  }
+
+  function courtHTML(court) {
+    const status = courtStatuses[court.id] ?? 'unknown'
+    const badgeClass = `badge-${status}`
+    const label = status.charAt(0).toUpperCase() + status.slice(1)
+    return `
+      <div class="court-card" id="card-${court.id}">
+        <div class="court-header">
+          <div class="court-name">${court.name}</div>
+          <div class="current-badge ${badgeClass}" id="badge-${court.id}">${label}</div>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-open ${status === 'open' ? 'active' : ''}" onclick="updateStatus('${court.id}', 'open')">Open</button>
+          <button class="btn btn-busy ${status === 'busy' ? 'active' : ''}" onclick="updateStatus('${court.id}', 'busy')">Busy</button>
+          <button class="btn btn-full ${status === 'full' ? 'active' : ''}" onclick="updateStatus('${court.id}', 'full')">Full</button>
+        </div>
+      </div>
+    `
+  }
+
+  async function updateStatus(courtId, status) {
+    const btns = document.querySelectorAll(`#card-${courtId} .btn`)
+    btns.forEach(b => b.classList.add('loading'))
+
+    const now = new Date()
+    const expires = new Date(now.getTime() + 30 * 60 * 1000)
+
+    const { error } = await db.from('availability_reports').insert({
+      court_id: courtId,
+      user_id: '00000000-0000-0000-0000-000000000000',
+      court_number: 1,
+      status: status,
+      reported_lat: 40.1441,
+      reported_lng: -111.6318,
+      reported_at: now.toISOString(),
+      expires_at: expires.toISOString(),
+    })
+
+    if (error) {
+      showToast('Error updating — try again')
+      btns.forEach(b => b.classList.remove('loading'))
+      return
+    }
+
+    courtStatuses[courtId] = status
+    btns.forEach(b => b.classList.remove('loading'))
+    renderCourts()
+    updateLastUpdated()
+    showToast('Updated!')
+  }
+
+  async function setAllCourts(status) {
+    for (const court of courts) {
+      await updateStatus(court.id, status)
+    }
+    showToast(`All courts set to ${status}!`)
+  }
+
+  function updateLastUpdated() {
+    const now = new Date()
+    document.getElementById('last-updated').textContent =
+      'Last updated ' + now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  }
+
+  function showToast(msg) {
+    const toast = document.getElementById('toast')
+    toast.textContent = msg
+    toast.classList.add('show')
+    setTimeout(() => toast.classList.remove('show'), 2000)
+  }
+
+  loadCourts()
+  setInterval(loadCourts, 60000)
+</script>
+
+</body>
+</html>

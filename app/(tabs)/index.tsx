@@ -1,98 +1,279 @@
-import { Image } from 'expo-image';
-import { Platform, StyleSheet } from 'react-native';
+import {
+  MapTabGestureRoot,
+  matchesListFilter,
+  NearbyCourtsSheet,
+  type CourtWithDistance,
+  type ListFilter,
+} from '@/components/nearby-courts-sheet'
+import { Colors } from '@/constants/theme'
+import { useColorScheme } from '@/hooks/use-color-scheme'
+import { courtFromRow, type Court } from '@/lib/courts'
+import { distanceKm } from '@/lib/geo'
+import { MaterialIcons } from '@expo/vector-icons'
+import AsyncStorage from '@react-native-async-storage/async-storage'
+import * as Location from 'expo-location'
+import { Redirect, useRouter } from 'expo-router'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { ActivityIndicator, StyleSheet, Text, TextInput, View } from 'react-native'
+import { SafeAreaView } from 'react-native-safe-area-context'
+import { CourtMap } from '../../components/court-map'
 
-import { HelloWave } from '@/components/hello-wave';
-import ParallaxScrollView from '@/components/parallax-scroll-view';
-import { ThemedText } from '@/components/themed-text';
-import { ThemedView } from '@/components/themed-view';
-import { Link } from 'expo-router';
+import { supabase } from '@/supabase'
 
-export default function HomeScreen() {
+const AUTO_NAVIGATE_RADIUS_KM = 0.15
+const AUTO_NAVIGATE_DELAY_MS = 10000
+
+export default function MapScreen() {
+  const colorScheme = useColorScheme()
+  const theme = Colors[colorScheme ?? 'light']
+  const isDark = colorScheme === 'dark'
+  const router = useRouter()
+
+  const [onboarded, setOnboarded] = useState<boolean | null>(null)
+  const [permissionDenied, setPermissionDenied] = useState(false)
+  const [locationLoading, setLocationLoading] = useState(true)
+  const [userLat, setUserLat] = useState<number | null>(null)
+  const [userLon, setUserLon] = useState<number | null>(null)
+
+  const [courtsLoading, setCourtsLoading] = useState(true)
+  const [courtsError, setCourtsError] = useState<string | null>(null)
+  const [courts, setCourts] = useState<Court[]>([])
+
+  const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [listFilter, setListFilter] = useState<ListFilter>('all')
+  const [searchQuery, setSearchQuery] = useState('')
+
+  const autoNavigated = useRef(false)
+
+  useEffect(() => {
+    AsyncStorage.getItem('onboarded').then((val) => {
+      setOnboarded(val === 'true')
+    })
+  }, [])
+
+  const openCourtDetail = useCallback(
+    (id: string) => {
+      setSelectedId(id)
+      router.push(`/court/${encodeURIComponent(id)}`)
+    },
+    [router]
+  )
+
+  useEffect(() => {
+    let cancelled = false
+
+    ;(async () => {
+      setLocationLoading(true)
+      const { status } = await Location.requestForegroundPermissionsAsync()
+      if (cancelled) return
+      if (status !== 'granted') {
+        setPermissionDenied(true)
+        setLocationLoading(false)
+        return
+      }
+
+      const pos = await Location.getCurrentPositionAsync({
+        accuracy: Location.Accuracy.Balanced,
+      })
+      if (cancelled) return
+      setUserLat(pos.coords.latitude)
+      setUserLon(pos.coords.longitude)
+      setLocationLoading(false)
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
+    if (userLat == null || userLon == null) return
+
+    let cancelled = false
+    ;(async () => {
+      setCourtsLoading(true)
+      setCourtsError(null)
+
+      const { data, error } = await supabase.from('courts').select('*').limit(500)
+
+      if (cancelled) return
+      if (error) {
+        setCourtsError(error.message)
+        setCourts([])
+      } else {
+        const parsed = (data ?? [])
+          .map((row) => courtFromRow(row as Record<string, unknown>))
+          .filter((c): c is Court => c != null)
+        setCourts(parsed)
+      }
+      setCourtsLoading(false)
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [userLat, userLon])
+
+  const courtsWithDistance: CourtWithDistance[] = useMemo(() => {
+    if (userLat == null || userLon == null) return []
+    return courts
+      .map((c) => ({
+        ...c,
+        distanceKm: distanceKm(userLat, userLon, c.latitude, c.longitude),
+      }))
+      .sort((a, b) => a.distanceKm - b.distanceKm)
+  }, [courts, userLat, userLon])
+
+  useEffect(() => {
+    if (autoNavigated.current) return
+    if (courtsWithDistance.length === 0) return
+    if (userLat == null || userLon == null) return
+
+    const nearest = courtsWithDistance[0]
+    if (nearest.distanceKm <= AUTO_NAVIGATE_RADIUS_KM) {
+      const timer = setTimeout(() => {
+        if (autoNavigated.current) return
+        autoNavigated.current = true
+        openCourtDetail(nearest.id)
+      }, AUTO_NAVIGATE_DELAY_MS)
+      return () => clearTimeout(timer)
+    }
+  }, [courtsWithDistance, userLat, userLon, openCourtDetail])
+
+  const searchFilteredCourts = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase()
+    if (!q) return courtsWithDistance
+    return courtsWithDistance.filter((c) => c.name.toLowerCase().includes(q))
+  }, [courtsWithDistance, searchQuery])
+
+  const filteredCourts = useMemo(
+    () => searchFilteredCourts.filter((c) => matchesListFilter(c, listFilter)),
+    [searchFilteredCourts, listFilter]
+  )
+
+  const loading = locationLoading || (userLat != null && courtsLoading)
+
+  if (onboarded === null) return null
+  if (!onboarded) return <Redirect href="/onboarding" />
+
+  if (permissionDenied) {
+    return (
+      <SafeAreaView style={[styles.centered, { backgroundColor: theme.background }]} edges={['top']}>
+        <Text style={[styles.message, { color: theme.text }]}>
+          Location permission is required to sort courts by distance and show them on the map. You can enable it in Settings.
+        </Text>
+      </SafeAreaView>
+    )
+  }
+
+  if (userLat != null && userLon != null && courtsError) {
+    return (
+      <SafeAreaView style={[styles.centered, { backgroundColor: theme.background }]} edges={['top']}>
+        <Text style={[styles.message, { color: theme.text }]}>Could not load courts.</Text>
+        <Text style={[styles.subMessage, { color: theme.icon }]}>{courtsError}</Text>
+      </SafeAreaView>
+    )
+  }
+
+  if (loading || userLat == null || userLon == null) {
+    return (
+      <SafeAreaView style={[styles.centered, { backgroundColor: theme.background }]} edges={['top']}>
+        <ActivityIndicator size="large" color={theme.tint} />
+        <Text style={[styles.hint, { color: theme.icon }]}>Finding your location…</Text>
+      </SafeAreaView>
+    )
+  }
+
   return (
-    <ParallaxScrollView
-      headerBackgroundColor={{ light: '#A1CEDC', dark: '#1D3D47' }}
-      headerImage={
-        <Image
-          source={require('@/assets/images/partial-react-logo.png')}
-          style={styles.reactLogo}
-        />
-      }>
-      <ThemedView style={styles.titleContainer}>
-        <ThemedText type="title">Welcome!</ThemedText>
-        <HelloWave />
-      </ThemedView>
-      <ThemedView style={styles.stepContainer}>
-        <ThemedText type="subtitle">Step 1: Try it</ThemedText>
-        <ThemedText>
-          Edit <ThemedText type="defaultSemiBold">app/(tabs)/index.tsx</ThemedText> to see changes.
-          Press{' '}
-          <ThemedText type="defaultSemiBold">
-            {Platform.select({
-              ios: 'cmd + d',
-              android: 'cmd + m',
-              web: 'F12',
-            })}
-          </ThemedText>{' '}
-          to open developer tools.
-        </ThemedText>
-      </ThemedView>
-      <ThemedView style={styles.stepContainer}>
-        <Link href="/modal">
-          <Link.Trigger>
-            <ThemedText type="subtitle">Step 2: Explore</ThemedText>
-          </Link.Trigger>
-          <Link.Preview />
-          <Link.Menu>
-            <Link.MenuAction title="Action" icon="cube" onPress={() => alert('Action pressed')} />
-            <Link.MenuAction
-              title="Share"
-              icon="square.and.arrow.up"
-              onPress={() => alert('Share pressed')}
-            />
-            <Link.Menu title="More" icon="ellipsis">
-              <Link.MenuAction
-                title="Delete"
-                icon="trash"
-                destructive
-                onPress={() => alert('Delete pressed')}
+    <SafeAreaView style={[styles.root, { backgroundColor: theme.background }]} edges={['top']}>
+      <MapTabGestureRoot>
+        <View style={styles.mapStack}>
+          <View style={styles.searchAndMap}>
+            <View
+              style={[
+                styles.searchBar,
+                {
+                  backgroundColor: isDark ? '#1C1C1E' : '#FFFFFF',
+                  borderColor: isDark ? 'rgba(255,255,255,0.1)' : 'rgba(15,23,42,0.1)',
+                },
+              ]}>
+              <MaterialIcons name="search" size={22} color={theme.icon} />
+              <TextInput
+                value={searchQuery}
+                onChangeText={setSearchQuery}
+                placeholder="Search courts by name"
+                placeholderTextColor={theme.icon}
+                style={[styles.searchInput, { color: theme.text }]}
+                returnKeyType="search"
+                autoCorrect={false}
+                autoCapitalize="words"
+                clearButtonMode="while-editing"
               />
-            </Link.Menu>
-          </Link.Menu>
-        </Link>
-
-        <ThemedText>
-          {`Tap the Explore tab to learn more about what's included in this starter app.`}
-        </ThemedText>
-      </ThemedView>
-      <ThemedView style={styles.stepContainer}>
-        <ThemedText type="subtitle">Step 3: Get a fresh start</ThemedText>
-        <ThemedText>
-          {`When you're ready, run `}
-          <ThemedText type="defaultSemiBold">npm run reset-project</ThemedText> to get a fresh{' '}
-          <ThemedText type="defaultSemiBold">app</ThemedText> directory. This will move the current{' '}
-          <ThemedText type="defaultSemiBold">app</ThemedText> to{' '}
-          <ThemedText type="defaultSemiBold">app-example</ThemedText>.
-        </ThemedText>
-      </ThemedView>
-    </ParallaxScrollView>
-  );
+            </View>
+            <View style={styles.mapArea}>
+              <CourtMap
+                userLat={userLat}
+                userLon={userLon}
+                courts={filteredCourts}
+                selectedId={selectedId}
+                onSelectCourt={openCourtDetail}
+              />
+            </View>
+          </View>
+          <NearbyCourtsSheet
+            courts={filteredCourts}
+            filter={listFilter}
+            onFilterChange={setListFilter}
+            onCourtPress={openCourtDetail}
+            selectedId={selectedId}
+            isDark={isDark}
+          />
+        </View>
+      </MapTabGestureRoot>
+    </SafeAreaView>
+  )
 }
 
 const styles = StyleSheet.create({
-  titleContainer: {
+  root: { flex: 1 },
+  mapStack: { flex: 1 },
+  searchAndMap: { flex: 1 },
+  searchBar: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
-  },
-  stepContainer: {
-    gap: 8,
+    marginHorizontal: 12,
+    marginTop: 6,
     marginBottom: 8,
+    paddingHorizontal: 12,
+    height: 48,
+    borderRadius: 14,
+    borderWidth: StyleSheet.hairlineWidth,
   },
-  reactLogo: {
-    height: 178,
-    width: 290,
-    bottom: 0,
-    left: 0,
-    position: 'absolute',
+  searchInput: {
+    flex: 1,
+    marginLeft: 8,
+    fontSize: 16,
+    paddingVertical: 0,
   },
-});
+  mapArea: { flex: 1 },
+  centered: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 24,
+  },
+  message: {
+    fontSize: 16,
+    textAlign: 'center',
+    lineHeight: 22,
+  },
+  subMessage: {
+    marginTop: 8,
+    fontSize: 14,
+    textAlign: 'center',
+  },
+  hint: {
+    marginTop: 12,
+    fontSize: 15,
+  },
+})

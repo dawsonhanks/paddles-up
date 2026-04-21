@@ -1,15 +1,22 @@
 {
   "expo": {
-    "name": "pickleball-app",
-    "slug": "pickleball-app",
+    "name": "Paddles Up",
+    "slug": "paddles-up",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "pickleballapp",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
+    "privacy": "https://dawsonhanks.github.io/paddles-up-privacy/",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "privacyManifests": {
+        "NSPrivacyAccessedAPITypes": []
+      },
+      "config": {
+        "googleMapsApiKey": "AIzaSyDIIfA-IG2_eHBlXx0kw92T1Gvox8XcoM4"
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -19,7 +26,11 @@
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
       "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION"
+      ]
     },
     "web": {
       "output": "static",
@@ -27,6 +38,12 @@
     },
     "plugins": [
       "expo-router",
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Allow Paddles Up to use your location to find courts near you."
+        }
+      ],
       [
         "expo-splash-screen",
         {
@@ -43,6 +60,13 @@
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
-    }
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "5b08d659-3160-45f5-b63f-3ecd0fe3eddc"
+      }
+    },
+    "owner": "dawsonhanks"
   }
 }
