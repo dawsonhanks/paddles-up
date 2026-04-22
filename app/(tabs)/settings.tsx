@@ -2,12 +2,19 @@ import { Colors } from '@/constants/theme'
 import { useColorScheme } from '@/hooks/use-color-scheme'
 import { submitChallenge } from '@/lib/challenges'
 import { ensureFavoritesUser } from '@/lib/favorites'
+import {
+  isValidEmail,
+  isValidPhone,
+  isValidUsername,
+  normalizeUsername,
+  sanitizeUsernameInput,
+} from '@/lib/profileValidation'
 import { MaterialIcons } from '@expo/vector-icons'
 import { useFocusEffect } from '@react-navigation/native'
 import * as ImagePicker from 'expo-image-picker'
 import * as Linking from 'expo-linking'
 import { useRouter } from 'expo-router'
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import {
   ActivityIndicator,
   Alert,
@@ -27,7 +34,7 @@ import { supabase } from '@/supabase'
 
 const ITEMS = [
   { id: 'privacy', label: 'Privacy Policy', icon: 'lock-outline', url: 'https://dawsonhanks.github.io/paddles-up-privacy/' },
-  { id: 'suggest', label: 'Suggest a Court', icon: 'add-location-alt', url: 'mailto:paddlesupapp@gmail.com?subject=Court Suggestion' },
+  { id: 'suggest', label: 'Suggest a Court', icon: 'add-location-alt' },
   { id: 'feedback', label: 'Send Feedback', icon: 'chat-bubble-outline', url: 'mailto:paddlesupapp@gmail.com?subject=Paddles Up Feedback' },
 ]
 
@@ -35,6 +42,7 @@ type Profile = {
   display_name: string | null
   username: string | null
   avatar_url: string | null
+  contact: string | null
   wins: number
   losses: number
 }
@@ -77,9 +85,18 @@ export default function ProfileScreen() {
   const [profile, setProfile] = useState<Profile | null>(null)
   const [loading, setLoading] = useState(true)
   const [showEdit, setShowEdit] = useState(false)
+  const [showCreate, setShowCreate] = useState(false)
   const [saving, setSaving] = useState(false)
+  const [createSaving, setCreateSaving] = useState(false)
   const [editName, setEditName] = useState('')
   const [editUsername, setEditUsername] = useState('')
+  const [editContact, setEditContact] = useState('')
+  const [editContactType, setEditContactType] = useState<'email' | 'phone'>('email')
+  const [createName, setCreateName] = useState('')
+  const [createUsername, setCreateUsername] = useState('')
+  const [createContact, setCreateContact] = useState('')
+  const [createContactType, setCreateContactType] = useState<'email' | 'phone'>('email')
+  const [createUsernameStatus, setCreateUsernameStatus] = useState<'idle' | 'invalid' | 'checking' | 'available' | 'taken'>('idle')
   const [avatarUri, setAvatarUri] = useState<string | null>(null)
 
   // Friends state
@@ -103,6 +120,17 @@ export default function ProfileScreen() {
   const [searchResults, setSearchResults] = useState<PlayerResult[]>([])
   const [searching, setSearching] = useState(false)
   const [addingId, setAddingId] = useState<string | null>(null)
+  const [showSuggestCourt, setShowSuggestCourt] = useState(false)
+  const [suggestSubmitting, setSuggestSubmitting] = useState(false)
+  const [suggestCourtName, setSuggestCourtName] = useState('')
+  const [suggestAddress, setSuggestAddress] = useState('')
+  const [suggestCity, setSuggestCity] = useState('')
+  const [suggestNumCourts, setSuggestNumCourts] = useState('')
+  const [suggestIndoorOutdoor, setSuggestIndoorOutdoor] = useState<'indoor' | 'outdoor'>('outdoor')
+  const [suggestSurfaceType, setSuggestSurfaceType] = useState('')
+  const [suggestFee, setSuggestFee] = useState('')
+  const [suggestHours, setSuggestHours] = useState('')
+  const [suggestNotes, setSuggestNotes] = useState('')
 
   async function loadProfile() {
     setLoading(true)
@@ -121,6 +149,7 @@ export default function ProfileScreen() {
       display_name: playerData?.display_name ?? null,
       username: playerData?.username ?? null,
       avatar_url: playerData?.avatar_url ?? null,
+      contact: (playerData as { contact?: string | null } | null)?.contact ?? null,
       wins,
       losses,
     })
@@ -175,19 +204,58 @@ export default function ProfileScreen() {
     if (!result.canceled && result.assets[0]) setAvatarUri(result.assets[0].uri)
   }
 
+  function pickEditContactType(contact: string | null): 'email' | 'phone' {
+    if (!contact || !contact.trim()) return 'email'
+    if (isValidEmail(contact)) return 'email'
+    if (isValidPhone(contact)) return 'phone'
+    return 'email'
+  }
+
   async function saveProfile() {
     if (!editName.trim()) { Alert.alert('Name required', 'Please enter your display name.'); return }
+    const c = editContact.trim()
+    if (c) {
+      const ok = editContactType === 'email' ? isValidEmail(c) : isValidPhone(c)
+      if (!ok) {
+        Alert.alert('Invalid contact', editContactType === 'email' ? 'Enter a valid email address.' : 'Enter a valid phone number (10+ digits).')
+        return
+      }
+    }
+    if (editUsername.trim()) {
+      const u = normalizeUsername(editUsername)
+      if (!isValidUsername(u)) { Alert.alert('Invalid username', 'Use 2–32 characters: lowercase letters, numbers, and underscores only.'); return }
+    }
     setSaving(true)
     try {
       const gate = await ensureFavoritesUser()
       if ('error' in gate) { Alert.alert('Error', gate.error); return }
+      if (editUsername.trim()) {
+        const handle = normalizeUsername(editUsername)
+        const { data: taken } = await supabase
+          .from('players')
+          .select('user_id')
+          .eq('username', handle)
+          .maybeSingle()
+        if (taken && taken.user_id !== gate.userId) {
+          Alert.alert('Username taken', 'That username is already in use.')
+          return
+        }
+      }
       const { error } = await supabase.from('players').upsert({
         user_id: gate.userId,
         display_name: editName.trim(),
-        username: editUsername.trim() || null,
+        username: editUsername.trim() ? normalizeUsername(editUsername) : null,
+        contact: c || null,
         avatar_url: avatarUri ?? profile?.avatar_url ?? null,
       }, { onConflict: 'user_id' })
-      if (error) { Alert.alert('Could not save', error.message); return }
+      if (error) {
+        if (error.code === '23505') {
+          Alert.alert('Username taken', 'That username is already in use.')
+          return
+        }
+        Alert.alert('Could not save', error.message)
+        return
+      }
       setShowEdit(false)
       loadProfile()
     } finally {
@@ -195,9 +263,68 @@ export default function ProfileScreen() {
     }
   }
 
+  function openCreateProfile() {
+    setCreateName('')
+    setCreateUsername('')
+    setCreateContact('')
+    setCreateContactType('email')
+    setShowCreate(true)
+  }
+
+  async function saveCreateProfile() {
+    if (!createName.trim()) { Alert.alert('Name required', 'Please enter your display name.'); return }
+    const handle = normalizeUsername(createUsername)
+    if (!isValidUsername(handle)) {
+      Alert.alert('Invalid username', 'Use 2–32 characters: lowercase letters, numbers, and underscores only. No spaces.')
+      return
+    }
+    const c = createContact.trim()
+    if (!c) { Alert.alert('Contact required', 'Add an email or phone number so we can reach you if needed.'); return }
+    const contactOk = createContactType === 'email' ? isValidEmail(c) : isValidPhone(c)
+    if (!contactOk) {
+      Alert.alert('Invalid contact', createContactType === 'email' ? 'Enter a valid email address.' : 'Enter a valid phone number (10+ digits).')
+      return
+    }
+    setCreateSaving(true)
+    try {
+      const gate = await ensureFavoritesUser()
+      if ('error' in gate) { Alert.alert('Error', gate.error); return }
+      const { data: taken } = await supabase
+        .from('players')
+        .select('user_id')
+        .eq('username', handle)
+        .maybeSingle()
+      if (taken && taken.user_id !== gate.userId) {
+        Alert.alert('Username taken', 'That username is already in use. Try another.')
+        return
+      }
+      const { error } = await supabase.from('players').upsert({
+        user_id: gate.userId,
+        display_name: createName.trim(),
+        username: handle,
+        contact: c,
+        avatar_url: profile?.avatar_url ?? null,
+      }, { onConflict: 'user_id' })
+      if (error) {
+        if (error.code === '23505') {
+          Alert.alert('Username taken', 'That username is already in use. Try another.')
+          return
+        }
+        Alert.alert('Could not save', error.message)
+        return
+      }
+      setShowCreate(false)
+      loadProfile()
+    } finally {
+      setCreateSaving(false)
+    }
+  }
+
   function openEdit() {
     setEditName(profile?.display_name ?? '')
     setEditUsername(profile?.username ?? '')
+    setEditContact(profile?.contact ?? '')
+    setEditContactType(pickEditContactType(profile?.contact ?? null))
     setAvatarUri(profile?.avatar_url ?? null)
     setShowEdit(true)
   }
@@ -279,13 +406,112 @@ export default function ProfileScreen() {
     ? `${Math.round((profile.wins / (profile.wins + profile.losses)) * 100)}%`
     : '—'
 
+  const hasProfile = Boolean(profile?.display_name?.trim())
+
+  useEffect(() => {
+    if (!showCreate) return
+    const handle = normalizeUsername(createUsername)
+    if (!handle) {
+      setCreateUsernameStatus('idle')
+      return
+    }
+    if (!isValidUsername(handle)) {
+      setCreateUsernameStatus('invalid')
+      return
+    }
+
+    let cancelled = false
+    setCreateUsernameStatus('checking')
+    const timer = setTimeout(async () => {
+      const gate = await ensureFavoritesUser()
+      if (cancelled || 'error' in gate) return
+
+      const { data: taken, error } = await supabase
+        .from('players')
+        .select('user_id')
+        .eq('username', handle)
+        .maybeSingle()
+
+      if (cancelled) return
+      if (error) {
+        setCreateUsernameStatus('idle')
+        return
+      }
+      setCreateUsernameStatus(taken && taken.user_id !== gate.userId ? 'taken' : 'available')
+    }, 350)
+
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
+  }, [createUsername, showCreate])
+
+  function openSuggestCourt() {
+    setSuggestCourtName('')
+    setSuggestAddress('')
+    setSuggestCity('')
+    setSuggestNumCourts('')
+    setSuggestIndoorOutdoor('outdoor')
+    setSuggestSurfaceType('')
+    setSuggestFee('')
+    setSuggestHours('')
+    setSuggestNotes('')
+    setShowSuggestCourt(true)
+  }
+
+  async function submitCourtSuggestion() {
+    if (!suggestCourtName.trim()) { Alert.alert('Court name required', 'Please enter the court name.'); return }
+    if (!suggestAddress.trim()) { Alert.alert('Address required', 'Please enter the court address.'); return }
+    if (!suggestCity.trim()) { Alert.alert('City required', 'Please enter the city.'); return }
+    const numCourts = parseInt(suggestNumCourts, 10)
+    if (!Number.isFinite(numCourts) || numCourts < 1) { Alert.alert('Number of courts required', 'Enter a valid number of courts.'); return }
+    if (!suggestSurfaceType.trim()) { Alert.alert('Surface type required', 'Please enter a surface type.'); return }
+    if (!suggestFee.trim()) { Alert.alert('Fee required', 'Please enter fee information (e.g. Free, $5/hour).'); return }
+    if (!suggestHours.trim()) { Alert.alert('Hours required', 'Please enter court hours.'); return }
+
+    setSuggestSubmitting(true)
+    try {
+      const gate = await ensureFavoritesUser()
+      if ('error' in gate) { Alert.alert('Error', gate.error); return }
+
+      const { data: me } = await supabase
+        .from('players')
+        .select('display_name')
+        .eq('user_id', gate.userId)
+        .maybeSingle()
+
+      const { error } = await supabase.from('court_submissions').insert({
+        user_id: gate.userId,
+        display_name: me?.display_name ?? profile?.display_name ?? 'Player',
+        court_name: suggestCourtName.trim(),
+        address: suggestAddress.trim(),
+        city: suggestCity.trim(),
+        num_courts: numCourts,
+        surface_type: suggestSurfaceType.trim(),
+        indoor_outdoor: suggestIndoorOutdoor,
+        fee: suggestFee.trim(),
+        hours: suggestHours.trim(),
+        notes: suggestNotes.trim() || null,
+      })
+
+      if (error) { Alert.alert('Could not submit', error.message); return }
+      setShowSuggestCourt(false)
+      Alert.alert("Thanks! We'll review your suggestion and add it soon.")
+    } finally {
+      setSuggestSubmitting(false)
+    }
+  }
+
   return (
     <SafeAreaView style={[styles.root, { backgroundColor: theme.background }]} edges={['top']}>
       <ScrollView contentContainerStyle={styles.container}>
 
         {/* Profile section */}
         <View style={styles.profileSection}>
-          <TouchableOpacity style={styles.avatarWrap} onPress={openEdit} activeOpacity={0.85}>
+          <TouchableOpacity
+            style={styles.avatarWrap}
+            onPress={() => (hasProfile ? openEdit() : openCreateProfile())}
+            activeOpacity={0.85}>
             {profile?.avatar_url ? (
               <Image source={{ uri: profile.avatar_url }} style={styles.avatar} />
             ) : (
@@ -294,9 +520,19 @@ export default function ProfileScreen() {
               </View>
             )}
             <View style={styles.avatarEditBadge}>
-              <MaterialIcons name="edit" size={12} color="#fff" />
+              <MaterialIcons name={hasProfile ? 'edit' : 'add'} size={12} color="#fff" />
             </View>
           </TouchableOpacity>
+
+          {!loading && !hasProfile ? (
+            <TouchableOpacity
+              style={styles.createProfileBtn}
+              onPress={openCreateProfile}
+              activeOpacity={0.85}>
+              <MaterialIcons name="person-add" size={18} color="#fff" />
+              <Text style={styles.createProfileBtnText}>Create Profile</Text>
+            </TouchableOpacity>
+          ) : null}
 
           {loading ? (
             <ActivityIndicator color={theme.tint} style={{ marginTop: 12 }} />
@@ -326,24 +562,26 @@ export default function ProfileScreen() {
                 </View>
               </View>
 
-              <View style={styles.profileBtnRow}>
-                <TouchableOpacity style={styles.editBtn} onPress={openEdit} activeOpacity={0.8}>
-                  <MaterialIcons name="edit" size={16} color="#0F6E56" />
-                  <Text style={styles.editBtnText}>Edit Profile</Text>
-                </TouchableOpacity>
-                {profile?.username ? (
-                  <TouchableOpacity
-                    style={styles.shareBtn}
-                    onPress={() => Share.share({
-                      message: `Check out my Paddles Up profile: https://paddlesup.app/${profile.username}`,
-                      url: `https://paddlesup.app/${profile.username}`,
-                    })}
-                    activeOpacity={0.8}>
-                    <MaterialIcons name="share" size={16} color="#0EA5E9" />
-                    <Text style={styles.shareBtnText}>Share Profile</Text>
+              {hasProfile ? (
+                <View style={styles.profileBtnRow}>
+                  <TouchableOpacity style={styles.editBtn} onPress={openEdit} activeOpacity={0.8}>
+                    <MaterialIcons name="edit" size={16} color="#0F6E56" />
+                    <Text style={styles.editBtnText}>Edit Profile</Text>
                   </TouchableOpacity>
-                ) : null}
-              </View>
+                  {profile?.username ? (
+                    <TouchableOpacity
+                      style={styles.shareBtn}
+                      onPress={() => Share.share({
+                        message: `Check out my Paddles Up profile: https://paddlesup.app/${profile.username}`,
+                        url: `https://paddlesup.app/${profile.username}`,
+                      })}
+                      activeOpacity={0.8}>
+                      <MaterialIcons name="share" size={16} color="#0EA5E9" />
+                      <Text style={styles.shareBtnText}>Share Profile</Text>
+                    </TouchableOpacity>
+                  ) : null}
+                </View>
+              ) : null}
             </>
           )}
         </View>
@@ -391,7 +629,10 @@ export default function ProfileScreen() {
             <TouchableOpacity
               key={item.id}
               style={[styles.row, i < ITEMS.length - 1 && { borderBottomWidth: 0.5, borderBottomColor: cardBorder }]}
-              onPress={() => Linking.openURL(item.url)}
+              onPress={() => {
+                if (item.id === 'suggest') { openSuggestCourt(); return }
+                if (item.url) Linking.openURL(item.url)
+              }}
               activeOpacity={0.7}>
               <MaterialIcons name={item.icon as any} size={22} color="#1D9E75" style={styles.rowIcon} />
               <Text style={[styles.rowLabel, { color: theme.text }]}>{item.label}</Text>
@@ -399,6 +640,13 @@ export default function ProfileScreen() {
             </TouchableOpacity>
           ))}
         </View>
+        <TouchableOpacity
+          style={styles.adminTestBtn}
+          onPress={() => router.push('/admin/submissions')}
+          activeOpacity={0.8}>
+          <MaterialIcons name="admin-panel-settings" size={18} color="#fff" />
+          <Text style={styles.adminTestBtnText}>Open Admin Submissions (Temp)</Text>
+        </TouchableOpacity>
 
         <Text style={[styles.tagline, { color: muted }]}>Find your court. Play your game.</Text>
         <Text style={[styles.version, { color: muted }]}>Version 1.0.0</Text>
@@ -436,15 +684,195 @@ export default function ProfileScreen() {
             />
             <Text style={[styles.fieldLabel, { color: muted }]}>Username</Text>
             <TextInput
-              value={editUsername} onChangeText={setEditUsername}
+              value={editUsername} onChangeText={t => setEditUsername(sanitizeUsernameInput(t))}
               placeholder="e.g. pickleball_jake" placeholderTextColor={muted}
               autoCapitalize="none"
+              style={[styles.input, { color: theme.text, borderColor: cardBorder, backgroundColor: cardBg }]}
+            />
+            <Text style={[styles.fieldLabel, { color: muted }]}>Contact (optional)</Text>
+            <View style={styles.contactPillRow}>
+              {(['email', 'phone'] as const).map(key => (
+                <TouchableOpacity
+                  key={key}
+                  onPress={() => setEditContactType(key)}
+                  style={[
+                    styles.contactPill,
+                    { borderColor: cardBorder, backgroundColor: cardBg },
+                    editContactType === key && { borderColor: '#1D9E75', backgroundColor: isDark ? 'rgba(29, 158, 117, 0.2)' : '#E1F5EE' },
+                  ]}
+                  activeOpacity={0.8}>
+                  <Text style={[styles.contactPillText, { color: editContactType === key ? '#0F6E56' : muted }]}>
+                    {key === 'email' ? 'Email' : 'Phone'}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+            <TextInput
+              value={editContact} onChangeText={setEditContact}
+              placeholder={editContactType === 'email' ? 'you@example.com' : '(555) 123-4567'}
+              placeholderTextColor={muted}
+              keyboardType={editContactType === 'phone' ? 'phone-pad' : 'email-address'}
+              autoCapitalize="none"
+              autoCorrect={false}
               style={[styles.input, { color: theme.text, borderColor: cardBorder, backgroundColor: cardBg }]}
             />
             <TouchableOpacity
               style={[styles.submitBtn, saving && { opacity: 0.6 }]}
               onPress={saveProfile} disabled={saving} activeOpacity={0.8}>
               {saving ? <ActivityIndicator color="#fff" /> : <Text style={styles.submitBtnText}>Save profile</Text>}
+            </TouchableOpacity>
+            <View style={{ height: 40 }} />
+          </ScrollView>
+        </SafeAreaView>
+      </Modal>
+
+      {/* Suggest Court modal */}
+      <Modal visible={showSuggestCourt} animationType="slide" presentationStyle="pageSheet" onRequestClose={() => setShowSuggestCourt(false)}>
+        <SafeAreaView style={[styles.modal, { backgroundColor: theme.background }]} edges={['top']}>
+          <View style={styles.modalHeader}>
+            <Text style={[styles.modalTitle, { color: theme.text }]}>Suggest a Court</Text>
+            <TouchableOpacity onPress={() => setShowSuggestCourt(false)}>
+              <MaterialIcons name="close" size={24} color={muted} />
+            </TouchableOpacity>
+          </View>
+          <ScrollView style={styles.modalScroll} keyboardShouldPersistTaps="handled">
+            <Text style={[styles.fieldLabel, { color: muted }]}>Court name</Text>
+            <TextInput value={suggestCourtName} onChangeText={setSuggestCourtName} placeholder="e.g. Willow Creek Park" placeholderTextColor={muted} style={[styles.input, { color: theme.text, borderColor: cardBorder, backgroundColor: cardBg }]} />
+
+            <Text style={[styles.fieldLabel, { color: muted }]}>Address</Text>
+            <TextInput value={suggestAddress} onChangeText={setSuggestAddress} placeholder="e.g. 123 Main St" placeholderTextColor={muted} style={[styles.input, { color: theme.text, borderColor: cardBorder, backgroundColor: cardBg }]} />
+
+            <Text style={[styles.fieldLabel, { color: muted }]}>City</Text>
+            <TextInput value={suggestCity} onChangeText={setSuggestCity} placeholder="e.g. Lehi" placeholderTextColor={muted} style={[styles.input, { color: theme.text, borderColor: cardBorder, backgroundColor: cardBg }]} />
+
+            <Text style={[styles.fieldLabel, { color: muted }]}>Number of courts</Text>
+            <TextInput value={suggestNumCourts} onChangeText={setSuggestNumCourts} placeholder="e.g. 6" placeholderTextColor={muted} keyboardType="number-pad" style={[styles.input, { color: theme.text, borderColor: cardBorder, backgroundColor: cardBg }]} />
+
+            <Text style={[styles.fieldLabel, { color: muted }]}>Indoor or outdoor</Text>
+            <View style={styles.contactPillRow}>
+              {(['indoor', 'outdoor'] as const).map(key => (
+                <TouchableOpacity
+                  key={key}
+                  onPress={() => setSuggestIndoorOutdoor(key)}
+                  style={[
+                    styles.contactPill,
+                    { borderColor: cardBorder, backgroundColor: cardBg },
+                    suggestIndoorOutdoor === key && { borderColor: '#1D9E75', backgroundColor: isDark ? 'rgba(29, 158, 117, 0.2)' : '#E1F5EE' },
+                  ]}
+                  activeOpacity={0.8}>
+                  <Text style={[styles.contactPillText, { color: suggestIndoorOutdoor === key ? '#0F6E56' : muted }]}>
+                    {key === 'indoor' ? 'Indoor' : 'Outdoor'}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+
+            <Text style={[styles.fieldLabel, { color: muted }]}>Surface type</Text>
+            <TextInput value={suggestSurfaceType} onChangeText={setSuggestSurfaceType} placeholder="e.g. Acrylic" placeholderTextColor={muted} style={[styles.input, { color: theme.text, borderColor: cardBorder, backgroundColor: cardBg }]} />
+
+            <Text style={[styles.fieldLabel, { color: muted }]}>Fee</Text>
+            <TextInput value={suggestFee} onChangeText={setSuggestFee} placeholder="e.g. Free" placeholderTextColor={muted} style={[styles.input, { color: theme.text, borderColor: cardBorder, backgroundColor: cardBg }]} />
+
+            <Text style={[styles.fieldLabel, { color: muted }]}>Hours</Text>
+            <TextInput value={suggestHours} onChangeText={setSuggestHours} placeholder="e.g. 6am - 10pm" placeholderTextColor={muted} style={[styles.input, { color: theme.text, borderColor: cardBorder, backgroundColor: cardBg }]} />
+
+            <Text style={[styles.fieldLabel, { color: muted }]}>Notes (optional)</Text>
+            <TextInput
+              value={suggestNotes}
+              onChangeText={setSuggestNotes}
+              placeholder="Any extra details..."
+              placeholderTextColor={muted}
+              multiline
+              numberOfLines={4}
+              style={[styles.input, styles.notesInput, { color: theme.text, borderColor: cardBorder, backgroundColor: cardBg }]}
+            />
+
+            <TouchableOpacity
+              style={[styles.submitBtn, suggestSubmitting && { opacity: 0.6 }]}
+              onPress={submitCourtSuggestion}
+              disabled={suggestSubmitting}
+              activeOpacity={0.8}>
+              {suggestSubmitting ? <ActivityIndicator color="#fff" /> : <Text style={styles.submitBtnText}>Submit Suggestion</Text>}
+            </TouchableOpacity>
+            <View style={{ height: 40 }} />
+          </ScrollView>
+        </SafeAreaView>
+      </Modal>
+
+      {/* Create profile modal */}
+      <Modal visible={showCreate} animationType="slide" presentationStyle="pageSheet" onRequestClose={() => setShowCreate(false)}>
+        <SafeAreaView style={[styles.modal, { backgroundColor: theme.background }]} edges={['top']}>
+          <View style={styles.modalHeader}>
+            <Text style={[styles.modalTitle, { color: theme.text }]}>Create Profile</Text>
+            <TouchableOpacity onPress={() => setShowCreate(false)}>
+              <MaterialIcons name="close" size={24} color={muted} />
+            </TouchableOpacity>
+          </View>
+          <ScrollView style={styles.modalScroll} keyboardShouldPersistTaps="handled">
+            <Text style={[styles.fieldLabel, { color: muted }]}>Display name</Text>
+            <TextInput
+              value={createName} onChangeText={setCreateName}
+              placeholder="Name shown to other players"
+              placeholderTextColor={muted}
+              style={[styles.input, { color: theme.text, borderColor: cardBorder, backgroundColor: cardBg }]}
+            />
+            <Text style={[styles.fieldLabel, { color: muted }]}>Username</Text>
+            <Text style={[styles.usernameHint, { color: muted }]}>
+              Lowercase, no spaces. Shown as {'@' + (createUsername || 'yourname')}
+            </Text>
+            <TextInput
+              value={createUsername} onChangeText={t => setCreateUsername(sanitizeUsernameInput(t))}
+              placeholder="dawson"
+              placeholderTextColor={muted}
+              autoCapitalize="none"
+              autoCorrect={false}
+              style={[styles.input, { color: theme.text, borderColor: cardBorder, backgroundColor: cardBg }]}
+            />
+            {createUsernameStatus === 'checking' ? (
+              <Text style={[styles.usernameStatus, { color: muted }]}>Checking availability…</Text>
+            ) : null}
+            {createUsernameStatus === 'available' ? (
+              <Text style={[styles.usernameStatus, { color: '#1D9E75' }]}>Username is available.</Text>
+            ) : null}
+            {createUsernameStatus === 'taken' ? (
+              <Text style={[styles.usernameStatus, { color: '#E24B4A' }]}>Username is already taken.</Text>
+            ) : null}
+            {createUsernameStatus === 'invalid' ? (
+              <Text style={[styles.usernameStatus, { color: '#E24B4A' }]}>
+                Use 2-32 characters: lowercase letters, numbers, and underscores only.
+              </Text>
+            ) : null}
+            <Text style={[styles.fieldLabel, { color: muted }]}>Contact</Text>
+            <View style={styles.contactPillRow}>
+              {(['email', 'phone'] as const).map(key => (
+                <TouchableOpacity
+                  key={key}
+                  onPress={() => setCreateContactType(key)}
+                  style={[
+                    styles.contactPill,
+                    { borderColor: cardBorder, backgroundColor: cardBg },
+                    createContactType === key && { borderColor: '#1D9E75', backgroundColor: isDark ? 'rgba(29, 158, 117, 0.2)' : '#E1F5EE' },
+                  ]}
+                  activeOpacity={0.8}>
+                  <Text style={[styles.contactPillText, { color: createContactType === key ? '#0F6E56' : muted }]}>
+                    {key === 'email' ? 'Email' : 'Phone'}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+            <TextInput
+              value={createContact} onChangeText={setCreateContact}
+              placeholder={createContactType === 'email' ? 'you@example.com' : '(555) 123-4567'}
+              placeholderTextColor={muted}
+              keyboardType={createContactType === 'phone' ? 'phone-pad' : 'email-address'}
+              autoCapitalize="none"
+              autoCorrect={false}
+              style={[styles.input, { color: theme.text, borderColor: cardBorder, backgroundColor: cardBg }]}
+            />
+            <TouchableOpacity
+              style={[styles.submitBtn, createSaving && { opacity: 0.6 }]}
+              onPress={saveCreateProfile} disabled={createSaving} activeOpacity={0.8}>
+              {createSaving ? <ActivityIndicator color="#fff" /> : <Text style={styles.submitBtnText}>Save</Text>}
             </TouchableOpacity>
             <View style={{ height: 40 }} />
           </ScrollView>
@@ -673,6 +1101,8 @@ const styles = StyleSheet.create({
   statNum: { fontSize: 20, fontWeight: '700' },
   statLabel: { fontSize: 11, marginTop: 2 },
   statDivider: { width: 0.5 },
+  createProfileBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, marginTop: 4, marginBottom: 4, backgroundColor: '#1D9E75', paddingHorizontal: 24, paddingVertical: 12, borderRadius: 24, alignSelf: 'center', minWidth: 200 },
+  createProfileBtnText: { color: '#fff', fontSize: 16, fontWeight: '700' },
   profileBtnRow: { flexDirection: 'row', gap: 10 },
   editBtn: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 20, paddingVertical: 10, borderRadius: 20, borderWidth: 1, borderColor: '#1D9E75' },
   editBtnText: { color: '#0F6E56', fontSize: 14, fontWeight: '600' },
@@ -693,6 +1123,8 @@ const styles = StyleSheet.create({
   row: { flexDirection: 'row', alignItems: 'center', padding: 16 },
   rowIcon: { marginRight: 14 },
   rowLabel: { flex: 1, fontSize: 15 },
+  adminTestBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, backgroundColor: '#334155', borderRadius: 12, paddingVertical: 12, marginBottom: 20 },
+  adminTestBtnText: { color: '#fff', fontSize: 14, fontWeight: '600' },
   tagline: { textAlign: 'center', fontSize: 13, marginBottom: 4 },
   version: { textAlign: 'center', fontSize: 12, marginBottom: 24 },
   // Modals shared
@@ -702,6 +1134,12 @@ const styles = StyleSheet.create({
   modalScroll: { flex: 1, paddingHorizontal: 20 },
   fieldLabel: { fontSize: 13, fontWeight: '600', marginBottom: 8, marginTop: 16, textTransform: 'uppercase', letterSpacing: 0.5 },
   input: { borderWidth: 0.5, borderRadius: 12, padding: 14, fontSize: 15 },
+  usernameHint: { fontSize: 12, marginBottom: 8, marginTop: -4 },
+  usernameStatus: { fontSize: 12, marginTop: 8 },
+  contactPillRow: { flexDirection: 'row', gap: 10, marginBottom: 10 },
+  contactPill: { paddingHorizontal: 18, paddingVertical: 10, borderRadius: 20, borderWidth: 1 },
+  contactPillText: { fontSize: 14, fontWeight: '600' },
+  notesInput: { minHeight: 100, textAlignVertical: 'top' },
   submitBtn: { backgroundColor: '#1D9E75', paddingVertical: 16, borderRadius: 14, alignItems: 'center', marginTop: 24 },
   submitBtnText: { color: '#fff', fontSize: 16, fontWeight: '700' },
   // Edit profile modal extras
