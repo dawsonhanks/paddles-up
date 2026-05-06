@@ -1,5 +1,6 @@
 import { STATUS_PIN_COLOR, type Court, type CourtStatus } from '@/lib/courts'
 import { formatDistanceMiles } from '@/lib/geo'
+import { MaterialIcons } from '@expo/vector-icons'
 import BottomSheet, { BottomSheetFlatList } from '@gorhom/bottom-sheet'
 import type { ReactNode } from 'react'
 import { useCallback, useMemo } from 'react'
@@ -16,11 +17,14 @@ import {
 import { GestureHandlerRootView } from 'react-native-gesture-handler'
 import { useSafeAreaInsets } from 'react-native-safe-area-context'
 
-export type ListFilter = 'all' | 'open' | 'outdoor' | 'indoor'
+export type ListFilter = 'all' | 'open' | 'outdoor' | 'indoor' | 'favorites'
 
 export type CourtWithDistance = Court & { distanceKm: number }
 
-export function matchesListFilter(court: Court, filter: ListFilter): boolean {
+const BRAND_GREEN = '#1D9E75'
+
+export function matchesListFilter(court: Court, filter: ListFilter, favoriteIds?: ReadonlySet<string>): boolean {
+  if (filter === 'favorites') return favoriteIds?.has(court.id) ?? false
   if (filter === 'all') return true
   if (filter === 'open') return court.status === 'open'
   const label = (court.indoorOutdoor ?? '').toLowerCase()
@@ -29,8 +33,9 @@ export function matchesListFilter(court: Court, filter: ListFilter): boolean {
   return true
 }
 
-const FILTER_OPTIONS: { key: ListFilter; label: string }[] = [
+const FILTER_OPTIONS: { key: ListFilter; label: string; icon?: 'favorite' }[] = [
   { key: 'all', label: 'All' },
+  { key: 'favorites', label: 'Favorites', icon: 'favorite' },
   { key: 'open', label: 'Open only' },
   { key: 'outdoor', label: 'Outdoor' },
   { key: 'indoor', label: 'Indoor' },
@@ -74,20 +79,25 @@ function FilterPills({
           return (
             <Pressable
               key={opt.key}
-              onPress={() => onChange(opt.key)}
+              onPress={() =>
+                filter === opt.key && opt.key === 'favorites' ? onChange('all') : onChange(opt.key)
+              }
               style={({ pressed }) => [
                 styles.filterPill,
                 {
-                  backgroundColor: active ? (isDark ? '#F8FAFC' : '#0F172A') : isDark ? '#27272A' : '#F1F5F9',
-                  borderColor: active ? 'transparent' : isDark ? '#3F3F46' : '#E2E8F0',
+                  flexDirection: 'row',
+                  alignItems: 'center',
+                  gap: opt.icon ? 6 : 0,
+                  backgroundColor: active ? BRAND_GREEN : isDark ? '#27272A' : '#F1F5F9',
+                  borderColor: active ? BRAND_GREEN : isDark ? '#3F3F46' : '#E2E8F0',
                   opacity: pressed ? 0.85 : 1,
                 },
               ]}>
+              {opt.icon === 'favorite' ? (
+                <MaterialIcons name={opt.icon} size={17} color={active ? '#FFFFFF' : BRAND_GREEN} />
+              ) : null}
               <Text
-                style={[
-                  styles.filterPillText,
-                  { color: active ? (isDark ? '#0F172A' : '#FFFFFF') : isDark ? '#A1A1AA' : '#475569' },
-                ]}>
+                style={[styles.filterPillText, { color: active ? '#FFFFFF' : isDark ? '#A1A1AA' : '#475569' }]}>
                 {opt.label}
               </Text>
             </Pressable>
@@ -144,12 +154,15 @@ type NearbyCourtsSheetProps = {
   onCourtPress: (id: string) => void
   selectedId: string | null
   isDark: boolean
+  refreshing?: boolean
+  onRefresh?: () => void
+  showNoFavoritesYetHint?: boolean
 }
 
 const WEB_SHEET_MAX = Math.round(Dimensions.get('window').height * 0.46)
 
 export function NearbyCourtsSheet(props: NearbyCourtsSheetProps) {
-  const { courts, filter, onFilterChange, onCourtPress, selectedId, isDark } = props
+  const { courts, filter, onFilterChange, onCourtPress, selectedId, isDark, refreshing = false, onRefresh, showNoFavoritesYetHint } = props
   const insets = useSafeAreaInsets()
   const snapPoints = useMemo(() => ['22%', '48%', '82%'], [])
 
@@ -170,14 +183,18 @@ export function NearbyCourtsSheet(props: NearbyCourtsSheetProps) {
     [filter, onFilterChange, isDark]
   )
 
-  const empty = useCallback(
-    () => (
-      <Text style={[styles.emptyText, { color: isDark ? '#71717A' : '#94A3B8' }]}>
-        No courts match this filter.
-      </Text>
-    ),
-    [isDark]
-  )
+  const EmptyList = useCallback(() => {
+    if (showNoFavoritesYetHint) {
+      return (
+        <Text style={[styles.emptyText, styles.emptyHintCenter, { color: isDark ? '#A1A1AA' : '#64748B' }]}>
+          No favorites yet — tap the heart on any court to save it here
+        </Text>
+      )
+    }
+    return (
+      <Text style={[styles.emptyText, { color: isDark ? '#71717A' : '#94A3B8' }]}>No courts match this filter.</Text>
+    )
+  }, [isDark, showNoFavoritesYetHint])
 
   if (Platform.OS === 'web') {
     return (
@@ -198,10 +215,14 @@ export function NearbyCourtsSheet(props: NearbyCourtsSheetProps) {
           extraData={filter}
           keyExtractor={(item) => item.id}
           renderItem={renderItem}
-          ListEmptyComponent={empty}
+          ListEmptyComponent={EmptyList}
           contentContainerStyle={styles.listPad}
           style={{ flex: 1 }}
           nestedScrollEnabled
+          onRefresh={onRefresh}
+          refreshing={refreshing}
+          tintColor="#1D9E75"
+          colors={['#1D9E75']}
         />
       </View>
     )
@@ -227,9 +248,13 @@ export function NearbyCourtsSheet(props: NearbyCourtsSheetProps) {
         keyExtractor={(item) => item.id}
         renderItem={renderItem}
         ListHeaderComponent={ListHeader}
-        ListEmptyComponent={empty}
+        ListEmptyComponent={EmptyList}
         contentContainerStyle={[styles.listPad, { paddingBottom: insets.bottom + 20 }]}
         ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
+        onRefresh={onRefresh}
+        refreshing={refreshing}
+        tintColor="#1D9E75"
+        colors={['#1D9E75']}
       />
     </BottomSheet>
   )
@@ -353,5 +378,9 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     paddingVertical: 28,
     fontSize: 15,
+  },
+  emptyHintCenter: {
+    paddingHorizontal: 24,
+    lineHeight: 22,
   },
 })

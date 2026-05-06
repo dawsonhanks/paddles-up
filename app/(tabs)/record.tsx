@@ -3,12 +3,15 @@ import { useColorScheme } from '@/hooks/use-color-scheme'
 import { ensureFavoritesUser } from '@/lib/favorites'
 import { MaterialIcons } from '@expo/vector-icons'
 import { useFocusEffect } from '@react-navigation/native'
+import { useRouter } from 'expo-router'
 import { useCallback, useState } from 'react'
 import {
   ActivityIndicator,
   Alert,
   FlatList,
   Modal,
+  Platform,
+  Pressable,
   ScrollView,
   StyleSheet,
   Text,
@@ -16,7 +19,7 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native'
-import { SafeAreaView } from 'react-native-safe-area-context'
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context'
 
 import { sendPushNotification } from '@/lib/push'
 import { supabase } from '@/supabase'
@@ -66,7 +69,11 @@ function challengeStatusStyle(status: string) {
   }
 }
 
+const FAB_SIZE = 56
+
 export default function RecordScreen() {
+  const router = useRouter()
+  const insets = useSafeAreaInsets()
   const colorScheme = useColorScheme()
   const theme = Colors[colorScheme ?? 'light']
   const isDark = colorScheme === 'dark'
@@ -241,13 +248,6 @@ export default function RecordScreen() {
     }
   }
 
-  async function deleteMatch(id: string) {
-    Alert.alert('Delete match', 'Remove this match from your record?', [
-      { text: 'Cancel', style: 'cancel' },
-      { text: 'Delete', style: 'destructive', onPress: async () => { await supabase.from('matches').delete().eq('id', id); loadAll() } },
-    ])
-  }
-
   function renderChallenge(challenge: Challenge) {
     const isIncoming = challenge.challenged_id === currentUserId
     const isPending = challenge.status === 'pending'
@@ -348,27 +348,23 @@ export default function RecordScreen() {
 
   return (
     <SafeAreaView style={[styles.root, { backgroundColor: theme.background }]} edges={['top']}>
-      <View style={styles.header}>
-        <View>
-          <Text style={[styles.headerTitle, { color: theme.text }]}>My record</Text>
-          <Text style={[styles.headerSub, { color: theme.icon }]}>Track your wins and losses</Text>
-        </View>
-        <View style={styles.headerBtns}>
+      <View style={styles.main}>
+        <View style={styles.header}>
+          <View>
+            <Text style={[styles.headerTitle, { color: theme.text }]}>My record</Text>
+            <Text style={[styles.headerSub, { color: theme.icon }]}>Track your wins and losses</Text>
+          </View>
           <TouchableOpacity style={styles.challengeHeaderBtn} onPress={openChallengeModal} activeOpacity={0.8}>
             <MaterialIcons name="sports" size={18} color="#92400E" />
             <Text style={styles.challengeHeaderBtnText}>Challenge</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={styles.addBtn} onPress={() => setShowModal(true)} activeOpacity={0.8}>
-            <MaterialIcons name="add" size={20} color="#fff" />
-            <Text style={styles.addBtnText}>Add</Text>
-          </TouchableOpacity>
         </View>
-      </View>
 
-      <FlatList
+        <FlatList
+        style={{ flex: 1 }}
         data={matches}
         keyExtractor={(item) => item.id}
-        contentContainerStyle={styles.list}
+        contentContainerStyle={[styles.list, { paddingBottom: FAB_SIZE + 32 + insets.bottom }]}
         onRefresh={loadAll}
         refreshing={loading}
         ListHeaderComponent={listHeader}
@@ -377,7 +373,7 @@ export default function RecordScreen() {
             <View style={styles.centered}>
               <MaterialIcons name="emoji-events" size={48} color={theme.icon} />
               <Text style={[styles.emptyTitle, { color: theme.text }]}>No matches yet</Text>
-              <Text style={[styles.emptySub, { color: theme.icon }]}>Tap Add to log your first match!</Text>
+              <Text style={[styles.emptySub, { color: theme.icon }]}>Tap the + button to log your first match!</Text>
             </View>
           )
         }
@@ -386,7 +382,7 @@ export default function RecordScreen() {
           return (
             <TouchableOpacity
               style={[styles.card, { backgroundColor: cardBg, borderColor: cardBorder }]}
-              onLongPress={() => deleteMatch(item.id)}
+              onPress={() => router.push(`/match/${encodeURIComponent(item.id)}`)}
               activeOpacity={0.85}>
               <View style={styles.cardTop}>
                 <View style={styles.avatarCircle}>
@@ -414,6 +410,22 @@ export default function RecordScreen() {
           )
         }}
       />
+
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Log a match"
+          style={({ pressed }) => [
+            styles.fab,
+            {
+              bottom: 16 + insets.bottom,
+              right: 16 + insets.right,
+              opacity: pressed ? 0.92 : 1,
+            },
+          ]}
+          onPress={() => setShowModal(true)}>
+          <MaterialIcons name="add" size={30} color="#fff" />
+        </Pressable>
+      </View>
 
       {/* Log match modal */}
       <Modal visible={showModal} animationType="slide" presentationStyle="pageSheet">
@@ -491,8 +503,6 @@ export default function RecordScreen() {
               placeholderTextColor={theme.icon} multiline numberOfLines={3}
               style={[styles.input, styles.textArea, { color: theme.text, borderColor: cardBorder, backgroundColor: cardBg }]}
             />
-
-            <Text style={[styles.hintText, { color: theme.icon }]}>Long press a match to delete it</Text>
 
             <TouchableOpacity
               style={[styles.submitBtn, submitting && { opacity: 0.6 }]}
@@ -581,14 +591,31 @@ export default function RecordScreen() {
 
 const styles = StyleSheet.create({
   root: { flex: 1 },
+  main: { flex: 1 },
   header: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 20, paddingVertical: 16 },
   headerTitle: { fontSize: 22, fontWeight: '700' },
   headerSub: { fontSize: 13, marginTop: 2 },
-  headerBtns: { flexDirection: 'row', gap: 8, alignItems: 'center' },
   challengeHeaderBtn: { flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: '#FEF3C7', paddingHorizontal: 14, paddingVertical: 10, borderRadius: 20, borderWidth: 1, borderColor: '#F59E0B' },
   challengeHeaderBtnText: { color: '#92400E', fontSize: 14, fontWeight: '600' },
-  addBtn: { flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: '#1D9E75', paddingHorizontal: 16, paddingVertical: 10, borderRadius: 20 },
-  addBtnText: { color: '#fff', fontSize: 14, fontWeight: '600' },
+  fab: {
+    position: 'absolute',
+    width: FAB_SIZE,
+    height: FAB_SIZE,
+    borderRadius: FAB_SIZE / 2,
+    backgroundColor: '#1D9E75',
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 10,
+    ...Platform.select({
+      ios: {
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 4 },
+        shadowOpacity: 0.25,
+        shadowRadius: 6,
+      },
+      android: { elevation: 8 },
+    }),
+  },
   statsRow: { flexDirection: 'row', marginHorizontal: 16, borderRadius: 14, borderWidth: 0.5, padding: 16, marginBottom: 16 },
   statBlock: { flex: 1, alignItems: 'center' },
   statNum: { fontSize: 24, fontWeight: '700' },
@@ -611,7 +638,7 @@ const styles = StyleSheet.create({
   centered: { justifyContent: 'center', alignItems: 'center', padding: 24, minHeight: 200 },
   emptyTitle: { fontSize: 18, fontWeight: '600', marginTop: 16 },
   emptySub: { fontSize: 14, marginTop: 8, textAlign: 'center' },
-  list: { paddingHorizontal: 16, paddingBottom: 24, gap: 10 },
+  list: { flexGrow: 1, paddingHorizontal: 16, gap: 10 },
   card: { borderRadius: 14, borderWidth: 0.5, padding: 14 },
   cardTop: { flexDirection: 'row', alignItems: 'center', gap: 12 },
   avatarCircle: { width: 40, height: 40, borderRadius: 20, backgroundColor: '#534AB7', alignItems: 'center', justifyContent: 'center' },
@@ -642,7 +669,6 @@ const styles = StyleSheet.create({
   scoreInputLabel: { fontSize: 12, fontWeight: '600' },
   scoreInput: { borderWidth: 0.5, borderRadius: 12, padding: 14, fontSize: 20, fontWeight: '700', textAlign: 'center', width: '100%' },
   scoreDash: { fontSize: 24, fontWeight: '700' },
-  hintText: { fontSize: 12, textAlign: 'center', marginTop: 16 },
   submitBtn: { backgroundColor: '#1D9E75', paddingVertical: 16, borderRadius: 14, alignItems: 'center', marginTop: 24 },
   submitBtnText: { color: '#fff', fontSize: 16, fontWeight: '700' },
   courtPickerBtn: { flexDirection: 'row', alignItems: 'center', gap: 8, borderWidth: 0.5, borderRadius: 12, padding: 14 },

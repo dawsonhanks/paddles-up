@@ -1,6 +1,7 @@
 import { Colors, Fonts } from '@/constants/theme'
 import { useColorScheme } from '@/hooks/use-color-scheme'
 import {
+  aggregateVenueLiveStatus,
   fetchLatestAvailabilityByCourt,
   insertAvailabilityReport,
   type ReportableStatus,
@@ -132,7 +133,15 @@ async function getPushToken(): Promise<string | null> {
 
 export default function CourtDetailScreen() {
   const { id: rawId } = useLocalSearchParams<{ id: string }>()
-  const courtId = Array.isArray(rawId) ? rawId[0] : rawId
+  const courtId = (() => {
+    const v = Array.isArray(rawId) ? rawId[0] : rawId
+    if (v == null || v === '') return ''
+    try {
+      return decodeURIComponent(String(v)).trim()
+    } catch {
+      return String(v).trim()
+    }
+  })()
   const router = useRouter()
   const colorScheme = useColorScheme()
   const isDark = colorScheme === 'dark'
@@ -389,10 +398,17 @@ export default function CourtDetailScreen() {
       const { error } = await insertAvailabilityReport({ court_id: courtId, court_number: courtNumber, status, reporter_lat: pos.coords.latitude, reporter_lng: pos.coords.longitude })
       if (error) { Alert.alert('Could not save', error.message); return }
       setLatest((prev) => { const next = new Map(prev); next.set(courtNumber, status); return next })
+      await loadAvailability()
     } finally {
       setSaving(null)
     }
   }
+
+  const headerStatus = useMemo(() => {
+    if (!court) return 'unknown' as CourtStatus
+    const live = aggregateVenueLiveStatus(latest)
+    return live !== 'unknown' ? live : court.status
+  }, [court, latest])
 
   const amenityList = useMemo(() => {
     if (!court) return []
@@ -423,7 +439,7 @@ export default function CourtDetailScreen() {
     )
   }
 
-  const badge = statusBadgeColors(court.status)
+  const badge = statusBadgeColors(headerStatus)
   const hoursLines = parseHoursLines(court.hours)
   const titleFont = Fonts.rounded
 
@@ -466,8 +482,8 @@ export default function CourtDetailScreen() {
               {court.name}
             </Text>
             <View style={[styles.statusBadge, { backgroundColor: badge.bg }]}>
-              <View style={[styles.statusDot, { backgroundColor: STATUS_PIN_COLOR[court.status] }]} />
-              <Text style={[styles.statusBadgeText, { color: badge.text }]}>{statusLabel(court.status)}</Text>
+              <View style={[styles.statusDot, { backgroundColor: STATUS_PIN_COLOR[headerStatus] }]} />
+              <Text style={[styles.statusBadgeText, { color: badge.text }]}>{statusLabel(headerStatus)}</Text>
             </View>
           </View>
           <View style={styles.distanceRatingRow}>

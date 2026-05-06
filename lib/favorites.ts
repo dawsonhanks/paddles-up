@@ -41,6 +41,18 @@ export async function addFavorite(courtId: string): Promise<{ error: Error | nul
   return { error: error ? new Error(error.message) : null }
 }
 
+/** All courts the current user has favorited (`favorites.court_id`). */
+export async function fetchFavoriteCourtIds(): Promise<{ ids: string[]; error: Error | null }> {
+  const gate = await ensureFavoritesUser()
+  if ('error' in gate) {
+    return { ids: [], error: new Error(gate.error) }
+  }
+  const { data, error } = await supabase.from('favorites').select('court_id').eq('user_id', gate.userId)
+  if (error) return { ids: [], error: new Error(error.message) }
+  const ids = (data ?? []).map((r) => String((r as { court_id: string }).court_id)).filter(Boolean)
+  return { ids, error: null }
+}
+
 export async function removeFavorite(courtId: string): Promise<{ error: Error | null }> {
   const gate = await ensureFavoritesUser()
   if ('error' in gate) {

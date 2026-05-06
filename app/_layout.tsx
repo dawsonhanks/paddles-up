@@ -69,6 +69,7 @@ export default function RootLayout() {
         <Stack.Screen name="onboarding" options={{ headerShown: false }} />
         <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
         <Stack.Screen name="court/[id]" options={{ headerShown: false }} />
+        <Stack.Screen name="match/[id]" options={{ headerShown: false }} />
         <Stack.Screen name="admin/submissions" options={{ title: 'Admin Submissions' }} />
         <Stack.Screen name="modal" options={{ presentation: 'modal', title: 'Modal' }} />
       </Stack>
