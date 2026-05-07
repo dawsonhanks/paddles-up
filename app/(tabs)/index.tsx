@@ -7,27 +7,50 @@ import {
 } from '@/components/nearby-courts-sheet'
 import { Colors } from '@/constants/theme'
 import { useColorScheme } from '@/hooks/use-color-scheme'
+import { fetchActiveCheckinCountsByCourtIds, checkinCountToCourtStatus } from '@/lib/checkins'
 import { courtFromRow, type Court } from '@/lib/courts'
-import { fetchLatestAvailabilityVenueStatusByCourtIds } from '@/lib/availability'
+import { deleteCourtCheckIn, upsertActiveCourtCheckIn } from '@/lib/courtPresenceCheckin'
 import { fetchFavoriteCourtIds } from '@/lib/favorites'
-import { distanceKm } from '@/lib/geo'
+import { distanceKm, REPORTING_RADIUS_KM } from '@/lib/geo'
+import {
+  clearManualCheckoutSuppressIfOutsideGeofence,
+  getSilentManagedCourtId,
+  notifyBannerSilentCheckoutInitiated,
+  notifySilentCheckoutCompleted,
+  silentAutoCheckInCommitted,
+  shouldSkipSilentUpsert,
+  subscribeMapAutoCheckin,
+} from '@/lib/mapAutoCheckinCoordinator'
 import { MaterialIcons } from '@expo/vector-icons'
 import { useFocusEffect, useIsFocused } from '@react-navigation/native'
-import NetInfo from '@react-native-community/netinfo'
+import { useNetworkOffline } from '@/contexts/network-status-context'
+import { userFriendlyFromUnknown } from '@/lib/errors'
+import { openAppSettings } from '@/lib/open-settings'
 import AsyncStorage from '@react-native-async-storage/async-storage'
 import * as Location from 'expo-location'
 import { Redirect, useRouter } from 'expo-router'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { ActivityIndicator, Pressable, StyleSheet, Text, TextInput, View } from 'react-native'
+import {
+  ActivityIndicator,
+  Pressable,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+} from 'react-native'
 import { SafeAreaView } from 'react-native-safe-area-context'
+import { ErrorScreen } from '@/components/error-screen'
 import { CourtMap } from '../../components/court-map'
-import { OfflineBanner } from '@/components/offline-banner'
 import { TOUR_COMPLETED_STORAGE_KEY, useGuidedTour } from '@/components/guided-tour'
 
 import { supabase } from '@/supabase'
 
 const AUTO_NAVIGATE_RADIUS_KM = 0.15
 const AUTO_NAVIGATE_DELAY_MS = 10000
+/** Avoid refetching courts on every GPS tick when user moves within this radius of last fetch center. */
+const AREA_RELOAD_THRESHOLD_KM = 0.8
+/** Throttle map user marker / distance sort updates while still firing silent check-in on each GPS callback. */
+const USER_POSITION_UI_THROTTLE_KM = 0.05
 const AREA_HALF_DELTA_DEG = 0.5
 const SIGNIFICANT_PAN_KM = 32.2 // ~20 miles
 const SEARCH_BUTTON_PAN_KM = 1.6 // ~1 mile
@@ -53,8 +76,7 @@ export default function MapScreen() {
   const [refreshing, setRefreshing] = useState(false)
   const [courtsError, setCourtsError] = useState<string | null>(null)
   const [courts, setCourts] = useState<Court[]>([])
-  const [isOffline, setIsOffline] = useState(false)
-  const [offlineBannerDismissed, setOfflineBannerDismissed] = useState(false)
+  const isOffline = useNetworkOffline()
   const [cachedCourtsAt, setCachedCourtsAt] = useState<string | null>(null)
   const [showSearchAreaButton, setShowSearchAreaButton] = useState(false)
   const [pendingSearchCenter, setPendingSearchCenter] = useState<{ lat: number; lon: number } | null>(null)
@@ -64,6 +86,7 @@ export default function MapScreen() {
   const [favoriteCourtIds, setFavoriteCourtIds] = useState<string[]>([])
   const [favoritesLoaded, setFavoritesLoaded] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
+  const [silentCheckInBanner, setSilentCheckInBanner] = useState<{ id: string; name: string } | null>(null)
 
   const autoNavigated = useRef(false)
   const tourStarted = useRef(false)
@@ -73,6 +96,26 @@ export default function MapScreen() {
   const mergedCourtsByIdRef = useRef<Map<string, Court>>(new Map())
   const initialAreaCenterRef = useRef<{ lat: number; lon: number } | null>(null)
   const lastFetchedCenterRef = useRef<{ lat: number; lon: number } | null>(null)
+
+  const courtsRef = useRef<Court[]>([])
+  useEffect(() => {
+    courtsRef.current = courts
+  }, [courts])
+
+  const isMapFocusedRef = useRef(isMapScreenFocused)
+  useEffect(() => {
+    isMapFocusedRef.current = isMapScreenFocused
+  }, [isMapScreenFocused])
+
+  const isOfflineRef = useRef(isOffline)
+  useEffect(() => {
+    isOfflineRef.current = isOffline
+  }, [isOffline])
+
+  const silentUpsertBusyRef = useRef(false)
+  const lastThinUserPosRef = useRef<{ lat: number; lon: number } | null>(null)
+  /** Latest known user position without re-subscribing the location watcher each tick */
+  const userPosLatestRef = useRef<{ lat: number; lon: number } | null>(null)
 
   const offlineCacheAgeLabel = useMemo(() => {
     if (!cachedCourtsAt) return undefined
@@ -91,15 +134,6 @@ export default function MapScreen() {
     AsyncStorage.getItem('onboarded').then((val) => {
       setOnboarded(val === 'true')
     })
-  }, [])
-
-  useEffect(() => {
-    const unsub = NetInfo.addEventListener((state) => {
-      const offline = !(state.isConnected ?? false)
-      setIsOffline(offline)
-      if (!offline) setOfflineBannerDismissed(false)
-    })
-    return () => unsub()
   }, [])
 
   const openCourtDetail = useCallback(
@@ -133,8 +167,11 @@ export default function MapScreen() {
         accuracy: Location.Accuracy.Balanced,
       })
       if (cancelled) return
-      setUserLat(pos.coords.latitude)
-      setUserLon(pos.coords.longitude)
+      const initLat = pos.coords.latitude
+      const initLon = pos.coords.longitude
+      userPosLatestRef.current = { lat: initLat, lon: initLon }
+      setUserLat(initLat)
+      setUserLon(initLon)
       setLocationLoading(false)
     })()
 
@@ -194,11 +231,15 @@ export default function MapScreen() {
         .filter((c): c is Court => c != null)
 
       const ids = parsed.map((c) => c.id)
-      const liveById = await fetchLatestAvailabilityVenueStatusByCourtIds(ids)
+      const countsByCourt = await fetchActiveCheckinCountsByCourtIds(ids)
       const nextAreaCourts = parsed.map((c) => {
         const key = String(c.id).trim()
-        const live = liveById.get(key)
-        return { ...c, status: live ?? 'unknown' }
+        const n = countsByCourt.get(key) ?? 0
+        return {
+          ...c,
+          liveCheckins: n,
+          status: checkinCountToCourtStatus(n),
+        }
       })
 
       const merged = new Map(mergedCourtsByIdRef.current)
@@ -225,11 +266,134 @@ export default function MapScreen() {
     }
   }, [areaKeyFor, courts.length, isOffline])
 
+  const evaluateSilentPresence = useCallback(async (lat: number, lon: number) => {
+    if (!isMapFocusedRef.current) return
+    if (isOfflineRef.current) return
+
+    const list = courtsRef.current
+    const R = REPORTING_RADIUS_KM
+
+    clearManualCheckoutSuppressIfOutsideGeofence(lat, lon, list)
+
+    const managed = getSilentManagedCourtId()
+    if (managed) {
+      const row = list.find((c) => c.id === managed)
+      if (
+        row != null &&
+        distanceKm(lat, lon, row.latitude, row.longitude) > R
+      ) {
+        const rm = await deleteCourtCheckIn(managed)
+        if (rm.ok) notifySilentCheckoutCompleted(managed)
+      }
+    }
+
+    let nearestId: string | null = null
+    let nearestName = ''
+    let best = Infinity
+    for (const c of list) {
+      const dk = distanceKm(lat, lon, c.latitude, c.longitude)
+      if (dk < best) {
+        best = dk
+        nearestId = c.id
+        nearestName = c.name
+      }
+    }
+    if (nearestId == null || best > R) return
+    if (shouldSkipSilentUpsert(nearestId)) return
+
+    if (silentUpsertBusyRef.current) return
+    silentUpsertBusyRef.current = true
+    try {
+      const r = await upsertActiveCourtCheckIn(nearestId)
+      if (r.ok) {
+        silentAutoCheckInCommitted(nearestId)
+        setSilentCheckInBanner({ id: nearestId, name: nearestName })
+      }
+    } finally {
+      silentUpsertBusyRef.current = false
+    }
+  }, [])
+
+  useEffect(() => {
+    return subscribeMapAutoCheckin((evt) => {
+      setSilentCheckInBanner((prev) => {
+        if (!prev) return prev
+        if (
+          (evt.type === 'manual_checkout' ||
+            evt.type === 'silent_exit' ||
+            evt.type === 'banner_checkout') &&
+          evt.courtId === prev.id
+        ) {
+          return null
+        }
+        return prev
+      })
+    })
+  }, [])
+
   useEffect(() => {
     if (userLat == null || userLon == null) return
     if (!initialAreaCenterRef.current) initialAreaCenterRef.current = { lat: userLat, lon: userLon }
-    void loadCourtsWithLiveStatus({ lat: userLat, lon: userLon }, { background: false, force: true })
+
+    const target = { lat: userLat, lon: userLon }
+    const last = lastFetchedCenterRef.current
+    if (
+      courtsHydratedRef.current &&
+      last != null &&
+      distanceKm(last.lat, last.lon, userLat, userLon) < AREA_RELOAD_THRESHOLD_KM
+    ) {
+      return
+    }
+
+    void loadCourtsWithLiveStatus(target, {
+      background: courtsHydratedRef.current,
+      force: !courtsHydratedRef.current,
+    })
   }, [userLat, userLon, loadCourtsWithLiveStatus])
+
+  const userCoordsReady = userLat != null && userLon != null
+  useEffect(() => {
+    if (!userCoordsReady || !isMapScreenFocused) return
+
+    let cancelled = false
+    let subscription: Location.LocationSubscription | undefined
+
+    void (async () => {
+      const { status } = await Location.getForegroundPermissionsAsync()
+      if (cancelled || status !== Location.PermissionStatus.GRANTED) return
+      subscription = await Location.watchPositionAsync(
+        {
+          accuracy: Location.Accuracy.Balanced,
+          distanceInterval: 25,
+          timeInterval: 4000,
+        },
+        (pos) => {
+          const plat = pos.coords.latitude
+          const plon = pos.coords.longitude
+          userPosLatestRef.current = { lat: plat, lon: plon }
+          void evaluateSilentPresence(plat, plon)
+
+          const prevThin = lastThinUserPosRef.current
+          const moved =
+            prevThin == null ||
+            distanceKm(prevThin.lat, prevThin.lon, plat, plon) >= USER_POSITION_UI_THROTTLE_KM
+          if (moved) {
+            lastThinUserPosRef.current = { lat: plat, lon: plon }
+            setUserLat(plat)
+            setUserLon(plon)
+          }
+        }
+      )
+
+      const boot = userPosLatestRef.current
+      if (!cancelled && boot != null) void evaluateSilentPresence(boot.lat, boot.lon)
+    })()
+
+    return () => {
+      cancelled = true
+      subscription?.remove()
+    }
+  }, [userCoordsReady, isMapScreenFocused, evaluateSilentPresence])
 
   const loadFavoriteCourtIds = useCallback(async () => {
     if (isOffline) {
@@ -243,9 +407,15 @@ export default function MapScreen() {
 
   const wasOfflineRef = useRef(isOffline)
   useEffect(() => {
-    if (wasOfflineRef.current && !isOffline) void loadFavoriteCourtIds()
+    if (wasOfflineRef.current && !isOffline) {
+      void loadFavoriteCourtIds()
+      if (userLat != null && userLon != null) {
+        const center = lastFetchedCenterRef.current ?? { lat: userLat, lon: userLon }
+        void loadCourtsWithLiveStatus(center, { background: true, force: true })
+      }
+    }
     wasOfflineRef.current = isOffline
-  }, [isOffline, loadFavoriteCourtIds])
+  }, [isOffline, loadFavoriteCourtIds, userLat, userLon, loadCourtsWithLiveStatus])
 
   useFocusEffect(
     useCallback(() => {
@@ -256,13 +426,6 @@ export default function MapScreen() {
       void loadCourtsWithLiveStatus(center, { background: true })
     }, [userLat, userLon, loadCourtsWithLiveStatus, loadFavoriteCourtIds])
   )
-
-  useEffect(() => {
-    if (isOffline) return
-    if (userLat == null || userLon == null) return
-    const center = lastFetchedCenterRef.current ?? { lat: userLat, lon: userLon }
-    void loadCourtsWithLiveStatus(center, { background: true, force: true })
-  }, [isOffline, userLat, userLon, loadCourtsWithLiveStatus])
 
   const onRefreshCourts = useCallback(async () => {
     if (userLat == null || userLon == null) return
@@ -276,6 +439,14 @@ export default function MapScreen() {
       setRefreshing(false)
     }
   }, [userLat, userLon, pendingSearchCenter, loadCourtsWithLiveStatus, loadFavoriteCourtIds])
+
+  const onSilentBannerCheckOut = useCallback(async () => {
+    if (silentCheckInBanner == null || isOffline) return
+    const id = silentCheckInBanner.id
+    const rm = await deleteCourtCheckIn(id)
+    if (!rm.ok) return
+    notifyBannerSilentCheckoutInitiated(id)
+  }, [silentCheckInBanner, isOffline])
 
   const onMapRegionChangeComplete = useCallback((region: {
     latitude: number
@@ -378,51 +549,69 @@ export default function MapScreen() {
   if (permissionDenied) {
     return (
       <SafeAreaView style={[styles.centered, { backgroundColor: theme.background }]} edges={['top']}>
-        <Text style={[styles.message, { color: theme.text }]}>
-          Location permission is required to sort courts by distance and show them on the map. You can enable it in Settings.
-        </Text>
+        <Pressable
+          onPress={() => openAppSettings()}
+          style={({ pressed }) => [styles.locationSettingsPress, { opacity: pressed ? 0.85 : 1 }]}>
+          <Text style={[styles.message, { color: theme.text }]}>
+            Location access is needed for this feature — tap here to open Settings.
+          </Text>
+        </Pressable>
       </SafeAreaView>
     )
   }
 
   if (userLat != null && userLon != null && courtsError) {
     return (
-      <SafeAreaView style={[styles.centered, { backgroundColor: theme.background }]} edges={['top']}>
-        <Text style={[styles.message, { color: theme.text }]}>Could not load courts.</Text>
-        <Text style={[styles.subMessage, { color: theme.icon }]}>{courtsError}</Text>
-      </SafeAreaView>
+      <ErrorScreen
+        emoji="🏓"
+        title="Could not load courts — check your connection and try again."
+        subtitle={userFriendlyFromUnknown(courtsError)}
+        onRetry={() => {
+          void loadCourtsWithLiveStatus({ lat: userLat, lon: userLon }, { force: true })
+        }}
+      />
     )
   }
 
-  if (loading) {
-    return (
-      <SafeAreaView style={[styles.centered, { backgroundColor: theme.background }]} edges={['top']}>
-        <ActivityIndicator size="large" color={theme.tint} />
-        <Text style={[styles.hint, { color: theme.icon }]}>
-          {blockingForLocation ? 'Finding your location…' : 'Loading courts…'}
-        </Text>
-      </SafeAreaView>
-    )
-  }
+  const coordsReady = userLat != null && userLon != null
+  const sheetListLoading = loading
 
   return (
     <SafeAreaView style={[styles.root, { backgroundColor: theme.background }]} edges={['top']}>
       <MapTabGestureRoot>
         <View style={styles.mapStack}>
           <View style={styles.searchAndMap}>
-            {isOffline && !offlineBannerDismissed ? (
-              <View style={styles.offlineBannerWrap}>
-                <OfflineBanner
-                  text="You are offline — showing cached courts"
-                  subtext={offlineCacheAgeLabel}
-                  onDismiss={() => setOfflineBannerDismissed(true)}
-                />
-              </View>
-            ) : null}
             {isOffline ? (
-              <Text style={[styles.offlineLiveNotice, { color: isDark ? '#FCD34D' : '#92400E' }]}>
-                Live data unavailable offline
+              <Text style={[styles.offlineCacheHint, { color: isDark ? '#FCD34D' : '#92400E' }]}>
+                {(offlineCacheAgeLabel ? `${offlineCacheAgeLabel}. ` : '') + 'Showing saved courts; live pins wait until you reconnect.'}
               </Text>
+            ) : null}
+            {silentCheckInBanner != null ? (
+              <View style={styles.silentBannerWrap}>
+                <Pressable
+                  disabled={isOffline}
+                  style={({ pressed }) => [
+                    styles.silentBanner,
+                    {
+                      backgroundColor: isDark ? 'rgba(34,197,94,0.12)' : 'rgba(29,158,117,0.12)',
+                      borderColor: isDark ? 'rgba(74,222,128,0.35)' : 'rgba(29,158,117,0.28)',
+                      opacity: isOffline ? 0.55 : pressed ? 0.92 : 1,
+                    },
+                  ]}
+                  onPress={() => void onSilentBannerCheckOut()}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Checked in at ${silentCheckInBanner.name}. Tap to check out`}
+                >
+                  <Text
+                    style={[styles.silentBannerText, { color: isDark ? '#86EFAC' : '#0F6E56' }]}
+                    numberOfLines={1}>
+                    Checked in at {silentCheckInBanner.name}
+                  </Text>
+                  <Text style={[styles.silentBannerAction, { color: isDark ? '#BBF7D0' : '#1D9E75' }]}>
+                    Check out
+                  </Text>
+                </Pressable>
+              </View>
             ) : null}
             <View
               style={[
@@ -446,14 +635,23 @@ export default function MapScreen() {
               />
             </View>
             <View style={styles.mapArea}>
-              <CourtMap
-                userLat={userLat}
-                userLon={userLon}
-                courts={filteredCourts}
-                selectedId={selectedId}
-                onSelectCourt={openCourtDetail}
-                onRegionChangeComplete={onMapRegionChangeComplete}
-              />
+              {coordsReady ? (
+                <CourtMap
+                  userLat={userLat!}
+                  userLon={userLon!}
+                  courts={filteredCourts}
+                  selectedId={selectedId}
+                  onSelectCourt={openCourtDetail}
+                  onRegionChangeComplete={onMapRegionChangeComplete}
+                />
+              ) : (
+                <View
+                  style={[
+                    StyleSheet.absoluteFill,
+                    { backgroundColor: isDark ? '#1a1b1e' : '#E8EDF3' },
+                  ]}
+                />
+              )}
               {areaLoading ? (
                 <View
                   style={[
@@ -487,6 +685,7 @@ export default function MapScreen() {
             refreshing={refreshing}
             onRefresh={onRefreshCourts}
             showNoFavoritesYetHint={showNoFavoritesYetHint}
+            listLoading={sheetListLoading}
           />
         </View>
       </MapTabGestureRoot>
@@ -498,16 +697,41 @@ const styles = StyleSheet.create({
   root: { flex: 1 },
   mapStack: { flex: 1 },
   searchAndMap: { flex: 1 },
-  offlineBannerWrap: {
-    marginHorizontal: 12,
-    marginTop: 6,
-    marginBottom: 4,
-  },
-  offlineLiveNotice: {
+  offlineCacheHint: {
     marginHorizontal: 14,
+    marginTop: 6,
     marginBottom: 4,
     fontSize: 12,
     fontWeight: '600',
+    lineHeight: 17,
+  },
+  locationSettingsPress: {
+    padding: 12,
+    maxWidth: 320,
+  },
+  silentBannerWrap: {
+    marginHorizontal: 12,
+    marginTop: 2,
+    marginBottom: 4,
+  },
+  silentBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderRadius: 999,
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+  },
+  silentBannerText: {
+    flex: 1,
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  silentBannerAction: {
+    fontSize: 12,
+    fontWeight: '700',
   },
   searchBar: {
     flexDirection: 'row',

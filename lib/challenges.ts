@@ -1,18 +1,13 @@
 import { ensureFavoritesUser } from '@/lib/favorites'
+import { sendPushNotification } from '@/lib/push'
 import { supabase } from '@/supabase'
 
-async function sendPushNotification(token: string, title: string, body: string) {
-  try {
-    await fetch('https://exp.host/--/api/v2/push/send', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ to: token, title, body, sound: 'default' }),
-    })
-  } catch {}
-}
+export type ChallengeOpponent =
+  | { kind: 'username'; username: string }
+  | { kind: 'friend'; userId: string }
 
 export type ChallengeInput = {
-  username: string
+  opponent: ChallengeOpponent
   proposedTime: string
   courtId: string | null
   courtName: string | null
@@ -23,18 +18,31 @@ export type ChallengeResult =
   | { ok: false; error: string }
 
 export async function submitChallenge(input: ChallengeInput): Promise<ChallengeResult> {
-  const rawUsername = input.username.trim().replace(/^@/, '')
-
   const gate = await ensureFavoritesUser()
   if ('error' in gate) return { ok: false, error: gate.error }
 
-  const { data: player } = await supabase
-    .from('players')
-    .select('user_id, display_name, username')
-    .eq('username', rawUsername)
-    .maybeSingle()
+  let player: { user_id: string; display_name: string | null; username: string | null } | null = null
 
-  if (!player) return { ok: false, error: `No player with username @${rawUsername} found.` }
+  if (input.opponent.kind === 'friend') {
+    const { data } = await supabase
+      .from('players')
+      .select('user_id, display_name, username')
+      .eq('user_id', input.opponent.userId)
+      .maybeSingle()
+    player = data ?? null
+    if (!player) return { ok: false, error: 'Could not load that player.' }
+  } else {
+    const rawUsername = input.opponent.username.trim().replace(/^@/, '')
+    if (!rawUsername) return { ok: false, error: "Enter your opponent's username." }
+    const { data } = await supabase
+      .from('players')
+      .select('user_id, display_name, username')
+      .eq('username', rawUsername)
+      .maybeSingle()
+    player = data ?? null
+    if (!player) return { ok: false, error: `No player with username @${rawUsername} found.` }
+  }
+
   if (player.user_id === gate.userId) return { ok: false, error: "You can't challenge yourself!" }
 
   const { data: me } = await supabase
@@ -66,10 +74,10 @@ export async function submitChallenge(input: ChallengeInput): Promise<ChallengeR
     const timeText = input.proposedTime.trim() ? ` · ${input.proposedTime.trim()}` : ''
     await sendPushNotification(
       tokenRow.push_token,
-      '🏓 Match Challenge!',
+      'Match Challenge',
       `${me?.display_name ?? 'Someone'} challenged you${courtText}${timeText}`,
     )
   }
 
-  return { ok: true, opponentName: player.display_name ?? rawUsername }
+  return { ok: true, opponentName: player.display_name ?? player.username ?? 'Player' }
 }

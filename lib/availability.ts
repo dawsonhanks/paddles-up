@@ -1,7 +1,14 @@
 import type { CourtStatus } from '@/lib/courts'
 import { supabase } from '@/supabase'
 
+/** How long a community report counts as “live” (matches receptionist tooling). */
+const REPORT_TTL_MS = 30 * 60 * 1000
+
 export type ReportableStatus = Extract<CourtStatus, 'open' | 'busy' | 'full'>
+
+export type LatestAvailabilityByCourtResult =
+  | { ok: true; byCourt: Map<number, ReportableStatus> }
+  | { ok: false }
 
 /** Worst-case across numbered courts at a venue: full > busy > open. */
 export function aggregateVenueLiveStatus(latest: Map<number, ReportableStatus>): CourtStatus {
@@ -23,6 +30,7 @@ export type AvailabilityReportRow = {
 }
 
 export async function insertAvailabilityReport(row: AvailabilityReportRow): Promise<{ error: Error | null }> {
+  const expiresAt = new Date(Date.now() + REPORT_TTL_MS).toISOString()
   const { data, error } = await supabase
     .from('availability_reports')
     .insert({
@@ -31,6 +39,7 @@ export async function insertAvailabilityReport(row: AvailabilityReportRow): Prom
       status: row.status,
       reporter_lat: row.reporter_lat,
       reporter_lng: row.reporter_lng,
+      expires_at: expiresAt,
     })
     .select('id')
     .maybeSingle()
@@ -43,19 +52,21 @@ export async function insertAvailabilityReport(row: AvailabilityReportRow): Prom
 /** Latest status per numbered court (most recent `created_at` wins). */
 export async function fetchLatestAvailabilityByCourt(
   courtId: string
-): Promise<Map<number, ReportableStatus>> {
+): Promise<LatestAvailabilityByCourtResult> {
+  const nowIso = new Date().toISOString()
   const { data, error } = await supabase
     .from('availability_reports')
     .select('court_number, status, created_at')
     .eq('court_id', courtId)
+    .gt('expires_at', nowIso)
     .order('created_at', { ascending: false })
     .limit(400)
 
   if (error) {
     if (__DEV__) console.warn('[availability] fetchLatestAvailabilityByCourt', courtId, error.message)
-    return new Map()
+    return { ok: false }
   }
-  if (!data) return new Map()
+  if (!data) return { ok: true, byCourt: new Map() }
 
   const latest = new Map<number, ReportableStatus>()
   for (const raw of data) {
@@ -65,7 +76,7 @@ export async function fetchLatestAvailabilityByCourt(
     const s = row.status
     if (s === 'open' || s === 'busy' || s === 'full') latest.set(n, s)
   }
-  return latest
+  return { ok: true, byCourt: latest }
 }
 
 /**
@@ -84,10 +95,12 @@ export async function fetchLatestAvailabilityVenueStatusByCourtIds(
 
   for (let i = 0; i < courtIds.length; i += COURT_ID_IN_CHUNK) {
     const chunk = courtIds.slice(i, i + COURT_ID_IN_CHUNK)
+    const nowIso = new Date().toISOString()
     const { data, error } = await supabase
       .from('availability_reports')
       .select('court_id, court_number, status, created_at')
       .in('court_id', chunk)
+      .gt('expires_at', nowIso)
       .order('created_at', { ascending: false })
       .limit(2000)
 

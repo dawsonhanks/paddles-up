@@ -1,5 +1,6 @@
 import { GuidedTourProvider } from '@/components/guided-tour'
 import { ensureFavoritesUser } from '@/lib/favorites'
+import { countSessionsTodayUpcoming, fetchUpcomingScheduledSessions } from '@/lib/scheduledSessions'
 import { supabase } from '@/supabase'
 import { useFocusEffect } from '@react-navigation/native'
 import { Tabs } from 'expo-router'
@@ -13,6 +14,7 @@ import { useColorScheme } from '@/hooks/use-color-scheme'
 export default function TabLayout() {
   const colorScheme = useColorScheme()
   const [unreadCount, setUnreadCount] = useState(0)
+  const [todaySessionsCount, setTodaySessionsCount] = useState(0)
 
   const loadUnreadCount = useCallback(async () => {
     const gate = await ensureFavoritesUser()
@@ -37,7 +39,26 @@ export default function TabLayout() {
     setUnreadCount(count ?? 0)
   }, [])
 
-  useFocusEffect(useCallback(() => { loadUnreadCount() }, [loadUnreadCount]))
+  const loadPlaySessionsBadge = useCallback(async () => {
+    try {
+      const gate = await ensureFavoritesUser()
+      if ('error' in gate) {
+        setTodaySessionsCount(0)
+        return
+      }
+      const rows = await fetchUpcomingScheduledSessions(gate.userId)
+      setTodaySessionsCount(countSessionsTodayUpcoming(rows))
+    } catch {
+      setTodaySessionsCount(0)
+    }
+  }, [])
+
+  useFocusEffect(
+    useCallback(() => {
+      void loadUnreadCount()
+      void loadPlaySessionsBadge()
+    }, [loadUnreadCount, loadPlaySessionsBadge])
+  )
 
   useEffect(() => {
     const channel = supabase
@@ -48,6 +69,38 @@ export default function TabLayout() {
       .subscribe()
     return () => { supabase.removeChannel(channel) }
   }, [loadUnreadCount])
+
+  useEffect(() => {
+    let aborted = false
+    let teardown: () => void = () => {}
+    void (async () => {
+      const gate = await ensureFavoritesUser()
+      if ('error' in gate || aborted) return
+      void loadPlaySessionsBadge()
+      const ch = supabase
+        .channel(`play-sessions-badge-${gate.userId}`)
+        .on(
+          'postgres_changes',
+          {
+            event: '*',
+            schema: 'public',
+            table: 'scheduled_sessions',
+            filter: `user_id=eq.${gate.userId}`,
+          },
+          () => loadPlaySessionsBadge()
+        )
+        .subscribe()
+      teardown = () => {
+        supabase.removeChannel(ch)
+      }
+      if (aborted) teardown()
+    })()
+
+    return () => {
+      aborted = true
+      teardown()
+    }
+  }, [loadPlaySessionsBadge])
 
   return (
     <GuidedTourProvider>
@@ -69,6 +122,7 @@ export default function TabLayout() {
           options={{
             title: 'Play',
             tabBarLabel: 'Play',
+            tabBarBadge: todaySessionsCount > 0 ? (todaySessionsCount > 99 ? '99+' : todaySessionsCount) : undefined,
             tabBarIcon: ({ color }) => <IconSymbol size={28} name="figure.pickleball" color={color} />,
           }}
         />
@@ -78,6 +132,15 @@ export default function TabLayout() {
             title: 'Record',
             tabBarLabel: 'Record',
             tabBarIcon: ({ color }) => <IconSymbol size={28} name="trophy.fill" color={color} />,
+          }}
+        />
+        <Tabs.Screen
+          name="friends"
+          options={{
+            title: 'Friends',
+            tabBarLabel: 'Friends',
+            headerShown: true,
+            tabBarIcon: ({ color }) => <IconSymbol size={28} name="person.2.fill" color={color} />,
           }}
         />
         <Tabs.Screen

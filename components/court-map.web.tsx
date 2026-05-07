@@ -7,6 +7,12 @@ export type CourtMapProps = {
   courts: Court[]
   selectedId: string | null
   onSelectCourt: (id: string) => void
+  onRegionChangeComplete?: (region: {
+    latitude: number
+    longitude: number
+    latitudeDelta: number
+    longitudeDelta: number
+  }) => void
 }
 
 export function CourtMap(_props: CourtMapProps) {

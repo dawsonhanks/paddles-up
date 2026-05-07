@@ -2,6 +2,7 @@ import { Colors } from '@/constants/theme'
 import { geocodeAddress } from '@/lib/geocoding'
 import { useColorScheme } from '@/hooks/use-color-scheme'
 import { ensureFavoritesUser } from '@/lib/favorites'
+import { userFriendlyFromUnknown } from '@/lib/errors'
 import { MaterialIcons } from '@expo/vector-icons'
 import { useFocusEffect } from '@react-navigation/native'
 import { useCallback, useState } from 'react'
@@ -77,7 +78,10 @@ export default function AdminSubmissionsScreen() {
         .select('*')
         .eq('status', 'pending')
         .order('created_at', { ascending: true })
-      if (error) { Alert.alert('Could not load submissions', error.message); return }
+      if (error) {
+        Alert.alert('Submissions did not load', userFriendlyFromUnknown(error.message))
+        return
+      }
       const rows = (data as CourtSubmission[]) ?? []
       setItems(rows)
       const initialDrafts: Record<string, CoordDraft> = {}
@@ -104,7 +108,10 @@ export default function AdminSubmissionsScreen() {
         .from('court_submissions')
         .update({ status: 'rejected' })
         .eq('id', id)
-      if (error) { Alert.alert('Could not reject', error.message); return }
+      if (error) {
+        Alert.alert('Update did not go through', userFriendlyFromUnknown(error.message))
+        return
+      }
       setItems(prev => prev.filter(i => i.id !== id))
       setCoordDrafts(prev => {
         const next = { ...prev }
@@ -134,7 +141,7 @@ export default function AdminSubmissionsScreen() {
         },
       }))
     } catch (error) {
-      Alert.alert('Could not geocode', error instanceof Error ? error.message : 'Unknown geocoding error.')
+      Alert.alert('Address lookup', userFriendlyFromUnknown(error instanceof Error ? error.message : ''))
     } finally {
       setBusyId(null)
     }
@@ -168,7 +175,10 @@ export default function AdminSubmissionsScreen() {
           latitude: coords.latitude,
           longitude: coords.longitude,
         })
-      if (courtError) { Alert.alert('Could not approve', courtError.message); return }
+      if (courtError) {
+        Alert.alert('Court was not added', userFriendlyFromUnknown(courtError.message))
+        return
+      }
 
       const { error: submissionError } = await supabase
         .from('court_submissions')
@@ -180,7 +190,10 @@ export default function AdminSubmissionsScreen() {
           geocode_confidence: draft.confidence,
         })
         .eq('id', item.id)
-      if (submissionError) { Alert.alert('Could not update submission', submissionError.message); return }
+      if (submissionError) {
+        Alert.alert('Submission status', userFriendlyFromUnknown(submissionError.message))
+        return
+      }
 
       setItems(prev => prev.filter(i => i.id !== item.id))
       setCoordDrafts(prev => {

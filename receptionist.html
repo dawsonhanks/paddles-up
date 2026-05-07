@@ -42,6 +42,26 @@
     .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: #1a1a1a; color: white; padding: 12px 24px; border-radius: 12px; font-size: 14px; font-weight: 500; opacity: 0; transition: opacity 0.3s; pointer-events: none; z-index: 999; }
     .toast.show { opacity: 1; }
     .divider { height: 1px; background: rgba(0,0,0,0.06); margin: 8px 0 16px; }
+
+    @media (prefers-color-scheme: dark) {
+      body { background: #101214; color: #ECEDEE; }
+      .header { background: #0B3D33; }
+      .header h1 { color: #F8FAFC; }
+      .header p, .last-updated { color: #A7F3D0; }
+      .section-title { color: #9BA1A6; }
+      .court-card { background: #1C1C1E; border-color: rgba(255,255,255,0.1); }
+      .court-name { color: #F1F5F9; }
+      .btn { background: #2A2D31; color: #B0B6BC; }
+      .btn-open { background: rgba(16,185,129,0.18); color: #6EE7B7; border-color: rgba(16,185,129,0.35); }
+      .btn-busy { background: rgba(245,158,11,0.18); color: #FCD34D; border-color: rgba(245,158,11,0.35); }
+      .btn-full { background: rgba(239,68,68,0.18); color: #FCA5A5; border-color: rgba(239,68,68,0.35); }
+      .badge-open { background: rgba(16,185,129,0.18); color: #6EE7B7; }
+      .badge-busy { background: rgba(245,158,11,0.18); color: #FCD34D; }
+      .badge-full { background: rgba(239,68,68,0.18); color: #FCA5A5; }
+      .badge-unknown { background: #2A2D31; color: #9BA1A6; }
+      .divider { background: rgba(255,255,255,0.08); }
+      .toast { background: #F8FAFC; color: #0F172A; }
+    }
   </style>
 </head>
 <body>
@@ -99,12 +119,13 @@
   }
 
   async function loadLatestStatuses() {
+    const nowIso = new Date().toISOString()
     for (const court of courts) {
       const { data } = await db
         .from('availability_reports')
-        .select('status, reported_at')
+        .select('status, reported_at, expires_at')
         .eq('court_id', court.id)
-        .gt('expires_at', new Date().toISOString())
+        .gt('expires_at', nowIso)
         .order('reported_at', { ascending: false })
         .limit(1)
         .maybeSingle()

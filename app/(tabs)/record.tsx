@@ -1,10 +1,18 @@
+import { ContentFadeIn } from '@/components/content-fade-in'
+import { ErrorBanner } from '@/components/error-banner'
+import { FriendAvatar } from '@/components/friend-avatar'
+import { SkeletonMatchCard } from '@/components/skeleton-card'
 import { Colors } from '@/constants/theme'
 import { useColorScheme } from '@/hooks/use-color-scheme'
+import { submitChallenge } from '@/lib/challenges'
+import { fetchFriends, type FriendPlayer } from '@/lib/friends'
 import { ensureFavoritesUser } from '@/lib/favorites'
+import { userFriendlyFromUnknown } from '@/lib/errors'
 import { MaterialIcons } from '@expo/vector-icons'
 import { useFocusEffect } from '@react-navigation/native'
-import { useRouter } from 'expo-router'
-import { useCallback, useState } from 'react'
+import { useLocalSearchParams, useRouter } from 'expo-router'
+import * as Haptics from 'expo-haptics'
+import { useCallback, useMemo, useRef, useState } from 'react'
 import {
   ActivityIndicator,
   Alert,
@@ -42,7 +50,12 @@ type Challenge = {
   challenged_name: string | null
   court_id: string | null
   proposed_time: string | null
-  status: 'pending' | 'accepted' | 'declined'
+  status: 'pending' | 'accepted' | 'declined' | 'score_submitted' | 'completed'
+  winner_id: string | null
+  challenger_score: number | null
+  challenged_score: number | null
+  score_submitted_by: string | null
+  completed_at: string | null
   created_at: string
   courts?: { name: string } | null
 }
@@ -63,6 +76,8 @@ function resultColor(result: string) {
 
 function challengeStatusStyle(status: string) {
   switch (status) {
+    case 'completed': return { bg: '#E5E7EB', text: '#374151' }
+    case 'score_submitted': return { bg: '#DBEAFE', text: '#1D4ED8' }
     case 'accepted': return { bg: '#E1F5EE', text: '#0F6E56' }
     case 'declined': return { bg: '#FCEBEB', text: '#791F1F' }
     default: return { bg: '#FEF3C7', text: '#92400E' }
@@ -73,6 +88,7 @@ const FAB_SIZE = 56
 
 export default function RecordScreen() {
   const router = useRouter()
+  const params = useLocalSearchParams<{ challengeUserId?: string }>()
   const insets = useSafeAreaInsets()
   const colorScheme = useColorScheme()
   const theme = Colors[colorScheme ?? 'light']
@@ -96,7 +112,10 @@ export default function RecordScreen() {
   const [currentUserId, setCurrentUserId] = useState<string | null>(null)
   const [challenges, setChallenges] = useState<Challenge[]>([])
   const [showChallengeModal, setShowChallengeModal] = useState(false)
-  const [challengeUsername, setChallengeUsername] = useState('')
+  const [challengeFriends, setChallengeFriends] = useState<FriendPlayer[]>([])
+  const [challengeFriendsLoading, setChallengeFriendsLoading] = useState(false)
+  const [challengeFriendSearch, setChallengeFriendSearch] = useState('')
+  const [selectedChallengeFriend, setSelectedChallengeFriend] = useState<FriendPlayer | null>(null)
   const [challengeTime, setChallengeTime] = useState('')
   const [challengeCourtId, setChallengeCourtId] = useState<string | null>(null)
   const [challengeCourtName, setChallengeCourtName] = useState<string | null>(null)
@@ -104,9 +123,35 @@ export default function RecordScreen() {
   const [courts, setCourts] = useState<CourtOption[]>([])
   const [showCourtPicker, setShowCourtPicker] = useState(false)
   const [respondingId, setRespondingId] = useState<string | null>(null)
+  const [scoreModalChallenge, setScoreModalChallenge] = useState<Challenge | null>(null)
+  const [myChallengeScore, setMyChallengeScore] = useState('')
+  const [theirChallengeScore, setTheirChallengeScore] = useState('')
+  const [scoreSubmitting, setScoreSubmitting] = useState(false)
+  const [recordBanner, setRecordBanner] = useState<string | null>(null)
+
+  const challengeUserHandled = useRef<string | undefined>(undefined)
 
   const wins = matches.filter(m => m.result.toLowerCase() === 'win').length
   const losses = matches.filter(m => m.result.toLowerCase() === 'loss').length
+
+  const filteredChallengeFriends = useMemo(() => {
+    const q = challengeFriendSearch.trim().toLowerCase()
+    if (!q) return challengeFriends
+    return challengeFriends.filter(f => {
+      const name = (f.display_name ?? '').toLowerCase()
+      const un = (f.username ?? '').toLowerCase()
+      return name.includes(q) || un.includes(q)
+    })
+  }, [challengeFriends, challengeFriendSearch])
+
+  const activeChallenges = useMemo(
+    () => challenges.filter(c => c.status === 'accepted' || c.status === 'score_submitted'),
+    [challenges],
+  )
+  const completedChallenges = useMemo(
+    () => challenges.filter(c => c.status === 'completed'),
+    [challenges],
+  )
 
   async function loadAll() {
     setLoading(true)
@@ -128,6 +173,56 @@ export default function RecordScreen() {
 
   useFocusEffect(useCallback(() => { loadAll() }, []))
 
+  useFocusEffect(
+    useCallback(() => {
+      const raw = params.challengeUserId
+      const id = typeof raw === 'string' ? raw : Array.isArray(raw) ? raw[0] : undefined
+      if (!id) {
+        challengeUserHandled.current = undefined
+        return
+      }
+      if (challengeUserHandled.current === id) return
+      challengeUserHandled.current = id
+
+      void (async () => {
+        const gate = await ensureFavoritesUser()
+        if ('error' in gate) {
+          setRecordBanner(userFriendlyFromUnknown(gate.error))
+          router.setParams({ challengeUserId: undefined })
+          challengeUserHandled.current = undefined
+          return
+        }
+        await loadCourts()
+
+        const { data: player } = await supabase
+          .from('players')
+          .select('user_id, display_name, username, avatar_url, skill_rating')
+          .eq('user_id', id)
+          .maybeSingle()
+
+        if (!player) {
+          setRecordBanner('That player profile could not be opened.')
+          router.setParams({ challengeUserId: undefined })
+          challengeUserHandled.current = undefined
+          return
+        }
+
+        setSelectedChallengeFriend(player as FriendPlayer)
+        setChallengeFriendSearch('')
+        setChallengeTime('')
+        setChallengeCourtId(null)
+        setChallengeCourtName(null)
+        setShowCourtPicker(false)
+        void (async () => {
+          const { friends } = await fetchFriends()
+          setChallengeFriends(friends)
+        })()
+        setShowChallengeModal(true)
+        router.setParams({ challengeUserId: undefined })
+      })()
+    }, [params.challengeUserId]),
+  )
+
   async function loadCourts() {
     if (courts.length > 0) return
     const { data } = await supabase.from('courts').select('id, name').order('name')
@@ -135,61 +230,46 @@ export default function RecordScreen() {
   }
 
   function openChallengeModal() {
-    setChallengeUsername('')
+    setSelectedChallengeFriend(null)
+    setChallengeFriendSearch('')
     setChallengeTime('')
     setChallengeCourtId(null)
     setChallengeCourtName(null)
     setShowCourtPicker(false)
     loadCourts()
+    setChallengeFriendsLoading(true)
     setShowChallengeModal(true)
+    void (async () => {
+      const { friends } = await fetchFriends()
+      setChallengeFriends(friends)
+      setChallengeFriendsLoading(false)
+    })()
   }
 
-  async function submitChallenge() {
-    const rawUsername = challengeUsername.trim().replace(/^@/, '')
-    if (!rawUsername) { Alert.alert('Username required', "Enter your opponent's username."); return }
+  function toggleChallengeFriendSelection(friend: FriendPlayer) {
+    setSelectedChallengeFriend(prev => (prev?.user_id === friend.user_id ? null : friend))
+  }
+
+  async function sendChallenge() {
+    if (!selectedChallengeFriend) {
+      Alert.alert('Pick an opponent', 'Choose a friend to challenge.')
+      return
+    }
     setChallengeSubmitting(true)
     try {
-      const gate = await ensureFavoritesUser()
-      if ('error' in gate) { Alert.alert('Error', gate.error); return }
-
-      const { data: player } = await supabase
-        .from('players')
-        .select('user_id, display_name, username')
-        .eq('username', rawUsername)
-        .maybeSingle()
-
-      if (!player) { Alert.alert('Player not found', `No player with username @${rawUsername} was found.`); return }
-      if (player.user_id === gate.userId) { Alert.alert('Nice try', "You can't challenge yourself!"); return }
-
-      const { data: me } = await supabase.from('players').select('display_name').eq('user_id', gate.userId).maybeSingle()
-
-      const { error } = await supabase.from('challenges').insert({
-        challenger_id: gate.userId,
-        challenged_id: player.user_id,
-        challenger_name: me?.display_name ?? 'A player',
-        challenged_name: player.display_name,
-        court_id: challengeCourtId,
-        proposed_time: challengeTime.trim() || null,
-        status: 'pending',
+      const result = await submitChallenge({
+        opponent: { kind: 'friend', userId: selectedChallengeFriend.user_id },
+        proposedTime: challengeTime,
+        courtId: challengeCourtId,
+        courtName: challengeCourtName,
       })
-
-      if (error) { Alert.alert('Could not send', error.message); return }
-
-      const { data: tokenRow } = await supabase
-        .from('notification_tokens').select('push_token').eq('user_id', player.user_id).maybeSingle()
-      if (tokenRow?.push_token) {
-        const courtText = challengeCourtName ? ` at ${challengeCourtName}` : ''
-        const timeText = challengeTime.trim() ? ` · ${challengeTime.trim()}` : ''
-        await sendPushNotification(
-          tokenRow.push_token,
-          '🏓 Match Challenge!',
-          `${me?.display_name ?? 'Someone'} challenged you${courtText}${timeText}`,
-        )
+      if (!result.ok) {
+        setRecordBanner(userFriendlyFromUnknown(result.error ?? ''))
+        return
       }
-
       setShowChallengeModal(false)
       loadAll()
-      Alert.alert('Challenge sent! 🏓', `${player.display_name ?? player.username} has been challenged.`)
+      Alert.alert('Challenge sent!', `${result.opponentName} has been challenged.`)
     } finally {
       setChallengeSubmitting(false)
     }
@@ -199,7 +279,10 @@ export default function RecordScreen() {
     setRespondingId(challengeId)
     try {
       const { error } = await supabase.from('challenges').update({ status }).eq('id', challengeId)
-      if (error) { Alert.alert('Error', error.message); return }
+      if (error) {
+        setRecordBanner(userFriendlyFromUnknown(error.message))
+        return
+      }
 
       const challenge = challenges.find(c => c.id === challengeId)
       if (challenge) {
@@ -211,7 +294,7 @@ export default function RecordScreen() {
           await sendPushNotification(
             tokenRow.push_token,
             `Challenge ${verb}!`,
-            `${myName} ${verb} your match challenge.${status === 'accepted' ? ' Game on! 🏓' : ''}`,
+            `${myName} ${verb} your match challenge.${status === 'accepted' ? ' Game on!' : ''}`,
           )
         }
       }
@@ -222,13 +305,199 @@ export default function RecordScreen() {
     }
   }
 
+  async function notifyUser(userId: string, title: string, body: string) {
+    const { data: tokenRow } = await supabase
+      .from('notification_tokens')
+      .select('push_token')
+      .eq('user_id', userId)
+      .maybeSingle()
+    if (tokenRow?.push_token) {
+      await sendPushNotification(tokenRow.push_token, title, body)
+    }
+  }
+
+  function openScoreModal(challenge: Challenge) {
+    setScoreModalChallenge(challenge)
+    setMyChallengeScore('')
+    setTheirChallengeScore('')
+  }
+
+  async function submitChallengeScore() {
+    if (!scoreModalChallenge || !currentUserId) return
+    const mine = parseInt(myChallengeScore, 10)
+    const theirs = parseInt(theirChallengeScore, 10)
+    if (Number.isNaN(mine) || Number.isNaN(theirs)) {
+      Alert.alert('Enter both scores', 'Please enter valid numbers for both players.')
+      return
+    }
+    if (mine === theirs) {
+      Alert.alert('Tie scores not allowed', 'Please enter a winning score and a losing score.')
+      return
+    }
+
+    const isChallenger = scoreModalChallenge.challenger_id === currentUserId
+    const opponentId = isChallenger ? scoreModalChallenge.challenged_id : scoreModalChallenge.challenger_id
+    const winnerId = mine > theirs ? currentUserId : opponentId
+    const challengerScore = isChallenger ? mine : theirs
+    const challengedScore = isChallenger ? theirs : mine
+
+    setScoreSubmitting(true)
+    try {
+      const { error } = await supabase
+        .from('challenges')
+        .update({
+          status: 'score_submitted',
+          challenger_score: challengerScore,
+          challenged_score: challengedScore,
+          score_submitted_by: currentUserId,
+          winner_id: winnerId,
+          completed_at: null,
+        })
+        .eq('id', scoreModalChallenge.id)
+      if (error) {
+        setRecordBanner(userFriendlyFromUnknown(error.message))
+        return
+      }
+
+      const submitterName = isChallenger
+        ? (scoreModalChallenge.challenger_name ?? 'Your opponent')
+        : (scoreModalChallenge.challenged_name ?? 'Your opponent')
+      await notifyUser(
+        opponentId,
+        'Score submitted',
+        `${submitterName} submitted a score for your match - please confirm`,
+      )
+      setScoreModalChallenge(null)
+      loadAll()
+    } finally {
+      setScoreSubmitting(false)
+    }
+  }
+
+  async function confirmSubmittedScore(challenge: Challenge) {
+    if (!currentUserId) return
+    if (!challenge.winner_id || challenge.challenger_score == null || challenge.challenged_score == null) {
+      Alert.alert('Missing score', 'This challenge does not have complete score data yet.')
+      return
+    }
+
+    setRespondingId(challenge.id)
+    try {
+      const { data: existingMatches } = await supabase
+        .from('matches')
+        .select('id')
+        .eq('challenge_id', challenge.id)
+      if (!existingMatches || existingMatches.length === 0) {
+        const now = new Date().toISOString()
+        const challengerWon = challenge.winner_id === challenge.challenger_id
+        const rows = [
+          {
+            user_id: challenge.challenger_id,
+            opponent_name: challenge.challenged_name ?? 'Player',
+            result: challengerWon ? 'win' : 'loss',
+            user_score: challenge.challenger_score,
+            opponent_score: challenge.challenged_score,
+            notes: 'Challenge match',
+            played_at: now,
+            challenge_id: challenge.id,
+          },
+          {
+            user_id: challenge.challenged_id,
+            opponent_name: challenge.challenger_name ?? 'Player',
+            result: challengerWon ? 'loss' : 'win',
+            user_score: challenge.challenged_score,
+            opponent_score: challenge.challenger_score,
+            notes: 'Challenge match',
+            played_at: now,
+            challenge_id: challenge.id,
+          },
+        ]
+        const { error: insertError } = await supabase.from('matches').insert(rows)
+        if (insertError) {
+          setRecordBanner(userFriendlyFromUnknown(insertError.message))
+          return
+        }
+      }
+
+      const { error } = await supabase
+        .from('challenges')
+        .update({ status: 'completed', completed_at: new Date().toISOString() })
+        .eq('id', challenge.id)
+      if (error) {
+        setRecordBanner(userFriendlyFromUnknown(error.message))
+        return
+      }
+
+      if (challenge.score_submitted_by) {
+        await notifyUser(challenge.score_submitted_by, 'Score confirmed!', 'Score confirmed!')
+      }
+      loadAll()
+    } finally {
+      setRespondingId(null)
+    }
+  }
+
+  async function disputeSubmittedScore(challenge: Challenge) {
+    if (!currentUserId || !challenge.score_submitted_by) return
+    setRespondingId(challenge.id)
+    try {
+      const { error } = await supabase
+        .from('challenges')
+        .update({
+          status: 'accepted',
+          winner_id: null,
+          challenger_score: null,
+          challenged_score: null,
+          score_submitted_by: null,
+          completed_at: null,
+        })
+        .eq('id', challenge.id)
+      if (error) {
+        setRecordBanner(userFriendlyFromUnknown(error.message))
+        return
+      }
+      const disputerName = challenge.challenged_id === currentUserId
+        ? (challenge.challenged_name ?? 'Your opponent')
+        : (challenge.challenger_name ?? 'Your opponent')
+      await notifyUser(
+        challenge.score_submitted_by,
+        'Score disputed',
+        `${disputerName} disputed the score - please resubmit`,
+      )
+      loadAll()
+    } finally {
+      setRespondingId(null)
+    }
+  }
+
+  function requestDeleteChallenge(challenge: Challenge) {
+    Alert.alert('Delete challenge?', 'This will remove the challenge and any linked match records.', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Delete',
+        style: 'destructive',
+        onPress: async () => {
+          const { error } = await supabase.from('challenges').delete().eq('id', challenge.id)
+          if (error) {
+            setRecordBanner(userFriendlyFromUnknown(error.message))
+            return
+          }
+          loadAll()
+        },
+      },
+    ])
+  }
+
   async function submitMatch() {
     if (!opponent.trim()) { Alert.alert('Opponent required', "Enter your opponent's name."); return }
     if (!result) { Alert.alert('Result required', 'Did you win or lose?'); return }
     setSubmitting(true)
     try {
       const gate = await ensureFavoritesUser()
-      if ('error' in gate) { Alert.alert('Error', gate.error); return }
+      if ('error' in gate) {
+        setRecordBanner(userFriendlyFromUnknown(gate.error))
+        return
+      }
       const { error } = await supabase.from('matches').insert({
         user_id: gate.userId,
         opponent_name: opponent.trim(),
@@ -238,7 +507,11 @@ export default function RecordScreen() {
         notes: notes.trim() || null,
         played_at: new Date().toISOString(),
       })
-      if (error) { Alert.alert('Could not save', error.message); return }
+      if (error) {
+        setRecordBanner(userFriendlyFromUnknown(error.message))
+        return
+      }
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success)
       setShowModal(false)
       setOpponent(''); setResult(''); setUserScore(''); setOpponentScore(''); setNotes(''); setDetailedMode(false)
       loadAll()
@@ -251,13 +524,26 @@ export default function RecordScreen() {
   function renderChallenge(challenge: Challenge) {
     const isIncoming = challenge.challenged_id === currentUserId
     const isPending = challenge.status === 'pending'
+    const isAccepted = challenge.status === 'accepted'
+    const isScoreSubmitted = challenge.status === 'score_submitted'
+    const isCompleted = challenge.status === 'completed'
     const statusStyle = challengeStatusStyle(challenge.status)
     const isResponding = respondingId === challenge.id
-    const name = isIncoming ? challenge.challenger_name : challenge.challenged_name
+    const challengerName = challenge.challenger_name ?? 'Opponent'
+    const challengedName = challenge.challenged_name ?? 'Opponent'
+    const name = isIncoming ? challengerName : challengedName
+    const scoreLine = challenge.challenger_score != null && challenge.challenged_score != null
+      ? `${challengerName} ${challenge.challenger_score} - ${challenge.challenged_score} ${challengedName}`
+      : null
+    const myResult = isCompleted && challenge.winner_id
+      ? (challenge.winner_id === currentUserId ? 'win' : 'loss')
+      : null
 
     return (
-      <View
+      <Pressable
         key={challenge.id}
+        onLongPress={() => requestDeleteChallenge(challenge)}
+        delayLongPress={300}
         style={[styles.challengeCard, { backgroundColor: cardBg, borderColor: isPending && isIncoming ? '#F59E0B' : cardBorder }]}>
         <View style={styles.challengeTop}>
           <View style={[styles.avatarCircle, { backgroundColor: isIncoming ? '#F59E0B' : '#534AB7' }]}>
@@ -303,7 +589,59 @@ export default function RecordScreen() {
             </TouchableOpacity>
           </View>
         ) : null}
-      </View>
+
+        {isAccepted ? (
+          <View style={styles.challengeActions}>
+            <TouchableOpacity
+              style={styles.acceptBtn}
+              activeOpacity={0.8}
+              onPress={() => openScoreModal(challenge)}>
+              <Text style={styles.acceptBtnText}>Submit score</Text>
+            </TouchableOpacity>
+          </View>
+        ) : null}
+
+        {isScoreSubmitted ? (
+          <View style={styles.challengeActionsWrap}>
+            {scoreLine ? <Text style={[styles.challengeScoreLine, { color: theme.text }]}>{scoreLine}</Text> : null}
+            {challenge.score_submitted_by === currentUserId ? (
+              <Text style={[styles.challengeMeta, { color: theme.icon }]}>Waiting for opponent confirmation</Text>
+            ) : (
+              <View style={styles.challengeActions}>
+                <TouchableOpacity
+                  style={[styles.acceptBtn, isResponding && { opacity: 0.6 }]}
+                  onPress={() => confirmSubmittedScore(challenge)}
+                  disabled={isResponding}
+                  activeOpacity={0.8}>
+                  {isResponding
+                    ? <ActivityIndicator color="#fff" size="small" />
+                    : <Text style={styles.acceptBtnText}>Confirm</Text>}
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.declineBtn, { borderColor: cardBorder }, isResponding && { opacity: 0.6 }]}
+                  onPress={() => disputeSubmittedScore(challenge)}
+                  disabled={isResponding}
+                  activeOpacity={0.8}>
+                  <Text style={[styles.declineBtnText, { color: theme.text }]}>Dispute</Text>
+                </TouchableOpacity>
+              </View>
+            )}
+          </View>
+        ) : null}
+
+        {isCompleted ? (
+          <View style={styles.challengeActionsWrap}>
+            {scoreLine ? <Text style={[styles.challengeScoreLine, { color: theme.text }]}>{scoreLine}</Text> : null}
+            {myResult ? (
+              <View style={[styles.resultBadge, { alignSelf: 'flex-start', backgroundColor: resultColor(myResult).bg, marginTop: 8 }]}>
+                <Text style={[styles.resultText, { color: resultColor(myResult).text }]}>
+                  {myResult === 'win' ? 'Win' : 'Loss'}
+                </Text>
+              </View>
+            ) : null}
+          </View>
+        ) : null}
+      </Pressable>
     )
   }
 
@@ -333,10 +671,26 @@ export default function RecordScreen() {
         </View>
       </View>
 
-      {challenges.length > 0 ? (
+      {challenges.some(c => c.status === 'pending' || c.status === 'declined') ? (
         <View style={styles.section}>
-          <Text style={[styles.sectionTitle, { color: theme.text }]}>Challenges</Text>
-          {challenges.map(renderChallenge)}
+          <Text style={[styles.sectionTitle, { color: theme.text }]}>Invites</Text>
+          {challenges
+            .filter(c => c.status === 'pending' || c.status === 'declined')
+            .map(renderChallenge)}
+        </View>
+      ) : null}
+
+      {activeChallenges.length > 0 ? (
+        <View style={styles.section}>
+          <Text style={[styles.sectionTitle, { color: theme.text }]}>Active challenges</Text>
+          {activeChallenges.map(renderChallenge)}
+        </View>
+      ) : null}
+
+      {completedChallenges.length > 0 ? (
+        <View style={styles.section}>
+          <Text style={[styles.sectionTitle, { color: theme.text }]}>Completed challenges</Text>
+          {completedChallenges.map(renderChallenge)}
         </View>
       ) : null}
 
@@ -348,6 +702,7 @@ export default function RecordScreen() {
 
   return (
     <SafeAreaView style={[styles.root, { backgroundColor: theme.background }]} edges={['top']}>
+      <ErrorBanner message={recordBanner} onDismiss={() => setRecordBanner(null)} />
       <View style={styles.main}>
         <View style={styles.header}>
           <View>
@@ -360,56 +715,77 @@ export default function RecordScreen() {
           </TouchableOpacity>
         </View>
 
-        <FlatList
-        style={{ flex: 1 }}
-        data={matches}
-        keyExtractor={(item) => item.id}
-        contentContainerStyle={[styles.list, { paddingBottom: FAB_SIZE + 32 + insets.bottom }]}
-        onRefresh={loadAll}
-        refreshing={loading}
-        ListHeaderComponent={listHeader}
-        ListEmptyComponent={
-          loading ? null : (
-            <View style={styles.centered}>
-              <MaterialIcons name="emoji-events" size={48} color={theme.icon} />
-              <Text style={[styles.emptyTitle, { color: theme.text }]}>No matches yet</Text>
-              <Text style={[styles.emptySub, { color: theme.icon }]}>Tap the + button to log your first match!</Text>
-            </View>
-          )
-        }
-        renderItem={({ item }) => {
-          const rc = resultColor(item.result)
-          return (
-            <TouchableOpacity
-              style={[styles.card, { backgroundColor: cardBg, borderColor: cardBorder }]}
-              onPress={() => router.push(`/match/${encodeURIComponent(item.id)}`)}
-              activeOpacity={0.85}>
-              <View style={styles.cardTop}>
-                <View style={styles.avatarCircle}>
-                  <Text style={styles.avatarText}>{item.opponent_name.charAt(0).toUpperCase()}</Text>
+        {loading && matches.length === 0 ? (
+          <View style={{ flex: 1 }}>
+            {listHeader}
+            <ScrollView
+              style={{ flex: 1 }}
+              contentContainerStyle={[
+                styles.list,
+                { paddingBottom: FAB_SIZE + 32 + insets.bottom, flexGrow: 1 },
+              ]}
+              keyboardShouldPersistTaps="handled">
+              {[0, 1, 2, 3].map((k) => (
+                <SkeletonMatchCard key={k} isDark={isDark} />
+              ))}
+            </ScrollView>
+          </View>
+        ) : (
+          <ContentFadeIn show style={{ flex: 1 }}>
+            <FlatList
+              style={{ flex: 1 }}
+              data={matches}
+              keyExtractor={(item) => item.id}
+              contentContainerStyle={[styles.list, { paddingBottom: FAB_SIZE + 32 + insets.bottom }]}
+              onRefresh={loadAll}
+              refreshing={loading}
+              tintColor="#1D9E75"
+              colors={['#1D9E75']}
+              ListHeaderComponent={listHeader}
+              ListEmptyComponent={
+                <View style={styles.centered}>
+                  <MaterialIcons name="emoji-events" size={48} color={theme.icon} />
+                  <Text style={[styles.emptyTitle, { color: theme.text }]}>No matches yet</Text>
+                  <Text style={[styles.emptySub, { color: theme.icon }]}>Tap the + button to log your first match!</Text>
                 </View>
-                <View style={styles.cardInfo}>
-                  <Text style={[styles.cardName, { color: theme.text }]}>vs {item.opponent_name}</Text>
-                  <Text style={[styles.cardDate, { color: theme.icon }]}>{formatDate(item.played_at)}</Text>
-                </View>
-                <View style={styles.cardRight}>
-                  {item.user_score != null && item.opponent_score != null ? (
-                    <Text style={[styles.scoreText, { color: theme.text }]}>{item.user_score} – {item.opponent_score}</Text>
-                  ) : null}
-                  <View style={[styles.resultBadge, { backgroundColor: rc.bg }]}>
-                    <Text style={[styles.resultText, { color: rc.text }]}>
-                      {item.result.charAt(0).toUpperCase() + item.result.slice(1)}
-                    </Text>
-                  </View>
-                </View>
-              </View>
-              {item.notes ? (
-                <Text style={[styles.cardNotes, { color: theme.icon }]}>{item.notes}</Text>
-              ) : null}
-            </TouchableOpacity>
-          )
-        }}
-      />
+              }
+              renderItem={({ item }) => {
+                const rc = resultColor(item.result)
+                return (
+                  <TouchableOpacity
+                    style={[styles.card, { backgroundColor: cardBg, borderColor: cardBorder }]}
+                    onPress={() => router.push(`/match/${encodeURIComponent(item.id)}`)}
+                    activeOpacity={0.85}>
+                    <View style={styles.cardTop}>
+                      <View style={styles.avatarCircle}>
+                        <Text style={styles.avatarText}>{item.opponent_name.charAt(0).toUpperCase()}</Text>
+                      </View>
+                      <View style={styles.cardInfo}>
+                        <Text style={[styles.cardName, { color: theme.text }]}>vs {item.opponent_name}</Text>
+                        <Text style={[styles.cardDate, { color: theme.icon }]}>{formatDate(item.played_at)}</Text>
+                      </View>
+                      <View style={styles.cardRight}>
+                        {item.user_score != null && item.opponent_score != null ? (
+                          <Text style={[styles.scoreText, { color: theme.text }]}>
+                            {item.user_score} – {item.opponent_score}
+                          </Text>
+                        ) : null}
+                        <View style={[styles.resultBadge, { backgroundColor: rc.bg }]}>
+                          <Text style={[styles.resultText, { color: rc.text }]}>
+                            {item.result.charAt(0).toUpperCase() + item.result.slice(1)}
+                          </Text>
+                        </View>
+                      </View>
+                    </View>
+                    {item.notes ? (
+                      <Text style={[styles.cardNotes, { color: theme.icon }]}>{item.notes}</Text>
+                    ) : null}
+                  </TouchableOpacity>
+                )
+              }}
+            />
+          </ContentFadeIn>
+        )}
 
         <Pressable
           accessibilityRole="button"
@@ -422,7 +798,10 @@ export default function RecordScreen() {
               opacity: pressed ? 0.92 : 1,
             },
           ]}
-          onPress={() => setShowModal(true)}>
+          onPress={async () => {
+            await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium)
+            setShowModal(true)
+          }}>
           <MaterialIcons name="add" size={30} color="#fff" />
         </Pressable>
       </View>
@@ -523,14 +902,76 @@ export default function RecordScreen() {
               <MaterialIcons name="close" size={24} color={theme.icon} />
             </TouchableOpacity>
           </View>
-          <ScrollView style={styles.modalScroll} keyboardShouldPersistTaps="handled">
-            <Text style={[styles.fieldLabel, { color: theme.icon }]}>Opponent username</Text>
+          <ScrollView style={styles.modalScroll} keyboardShouldPersistTaps="handled" nestedScrollEnabled>
+            <Text style={[styles.fieldLabel, { color: theme.icon }]}>Opponent</Text>
             <TextInput
-              value={challengeUsername} onChangeText={setChallengeUsername}
-              placeholder="@username" placeholderTextColor={theme.icon}
-              autoCapitalize="none" autoCorrect={false}
-              style={[styles.input, { color: theme.text, borderColor: cardBorder, backgroundColor: cardBg }]}
+              value={challengeFriendSearch}
+              onChangeText={setChallengeFriendSearch}
+              placeholder="Search friends by name"
+              placeholderTextColor={theme.icon}
+              autoCapitalize="none"
+              autoCorrect={false}
+              style={[styles.input, styles.friendSearchInput, { color: theme.text, borderColor: cardBorder, backgroundColor: cardBg }]}
             />
+
+            {challengeFriendsLoading ? (
+              <View style={styles.friendListLoading}>
+                <ActivityIndicator color="#1D9E75" />
+              </View>
+            ) : challengeFriends.length === 0 ? (
+              <View style={styles.emptyFriendsWrap}>
+                <Text style={[styles.emptyFriendsText, { color: theme.text }]}>
+                  No friends yet — add friends from your{' '}
+                  <Text
+                    style={styles.emptyFriendsLink}
+                    onPress={() => {
+                      setShowChallengeModal(false)
+                      router.push('/(tabs)/settings')
+                    }}>
+                    Profile tab
+                  </Text>
+                </Text>
+              </View>
+            ) : filteredChallengeFriends.length === 0 ? (
+              <Text style={[styles.friendFilterEmpty, { color: theme.icon }]}>No friends match your search.</Text>
+            ) : (
+              <ScrollView
+                nestedScrollEnabled
+                keyboardShouldPersistTaps="handled"
+                style={styles.friendPickerScroll}
+                contentContainerStyle={styles.friendPickerListContent}>
+                {filteredChallengeFriends.map(item => {
+                  const selected = selectedChallengeFriend?.user_id === item.user_id
+                  return (
+                    <Pressable
+                      key={item.user_id}
+                      onPress={() => toggleChallengeFriendSelection(item)}
+                      style={({ pressed }) => [
+                        styles.friendPickerRow,
+                        {
+                          backgroundColor: cardBg,
+                          borderColor: selected ? '#1D9E75' : cardBorder,
+                          borderWidth: selected ? 2 : StyleSheet.hairlineWidth,
+                          opacity: pressed ? 0.85 : 1,
+                        },
+                      ]}>
+                      <FriendAvatar friend={item} size={44} />
+                      <View style={styles.friendPickerTextCol}>
+                        <Text style={[styles.friendPickerName, { color: theme.text }]} numberOfLines={1}>
+                          {item.display_name ?? item.username ?? 'Player'}
+                        </Text>
+                        {item.username ? (
+                          <Text style={[styles.friendPickerUsername, { color: theme.icon }]} numberOfLines={1}>
+                            @{item.username}
+                          </Text>
+                        ) : null}
+                      </View>
+                      {selected ? <MaterialIcons name="check-circle" size={22} color="#1D9E75" /> : null}
+                    </Pressable>
+                  )
+                })}
+              </ScrollView>
+            )}
 
             <Text style={[styles.fieldLabel, { color: theme.icon }]}>Proposed time</Text>
             <TextInput
@@ -576,14 +1017,74 @@ export default function RecordScreen() {
 
             <TouchableOpacity
               style={[styles.submitBtn, { marginTop: 32 }, challengeSubmitting && { opacity: 0.6 }]}
-              onPress={submitChallenge} disabled={challengeSubmitting} activeOpacity={0.8}>
+              onPress={sendChallenge} disabled={challengeSubmitting} activeOpacity={0.8}>
               {challengeSubmitting
                 ? <ActivityIndicator color="#fff" />
-                : <Text style={styles.submitBtnText}>Send Challenge 🏓</Text>}
+                : <Text style={styles.submitBtnText}>Send Challenge</Text>}
             </TouchableOpacity>
             <View style={{ height: 40 }} />
           </ScrollView>
         </SafeAreaView>
+      </Modal>
+
+      <Modal
+        visible={!!scoreModalChallenge}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setScoreModalChallenge(null)}>
+        <View style={styles.scoreModalBackdrop}>
+          <View style={[styles.scoreModalCard, { backgroundColor: cardBg, borderColor: cardBorder }]}>
+            <Text style={[styles.scoreModalTitle, { color: theme.text }]}>Submit score</Text>
+            <Text style={[styles.scoreModalSubtitle, { color: theme.icon }]}>
+              Enter your score and your opponent&apos;s score.
+            </Text>
+
+            <View style={styles.scoreRow}>
+              <View style={styles.scoreInputWrap}>
+                <Text style={[styles.scoreInputLabel, { color: theme.icon }]}>You</Text>
+                <TextInput
+                  value={myChallengeScore}
+                  onChangeText={setMyChallengeScore}
+                  placeholder="11"
+                  placeholderTextColor={theme.icon}
+                  keyboardType="number-pad"
+                  style={[styles.scoreInput, { color: theme.text, borderColor: cardBorder, backgroundColor: cardBg }]}
+                />
+              </View>
+              <Text style={[styles.scoreDash, { color: theme.icon }]}>-</Text>
+              <View style={styles.scoreInputWrap}>
+                <Text style={[styles.scoreInputLabel, { color: theme.icon }]}>Opponent</Text>
+                <TextInput
+                  value={theirChallengeScore}
+                  onChangeText={setTheirChallengeScore}
+                  placeholder="9"
+                  placeholderTextColor={theme.icon}
+                  keyboardType="number-pad"
+                  style={[styles.scoreInput, { color: theme.text, borderColor: cardBorder, backgroundColor: cardBg }]}
+                />
+              </View>
+            </View>
+
+            <View style={styles.scoreModalActions}>
+              <TouchableOpacity
+                style={[styles.declineBtn, { borderColor: cardBorder }, scoreSubmitting && { opacity: 0.6 }]}
+                onPress={() => setScoreModalChallenge(null)}
+                disabled={scoreSubmitting}
+                activeOpacity={0.8}>
+                <Text style={[styles.declineBtnText, { color: theme.text }]}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.acceptBtn, scoreSubmitting && { opacity: 0.6 }]}
+                onPress={submitChallengeScore}
+                disabled={scoreSubmitting}
+                activeOpacity={0.8}>
+                {scoreSubmitting
+                  ? <ActivityIndicator color="#fff" size="small" />
+                  : <Text style={styles.acceptBtnText}>Submit</Text>}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
       </Modal>
     </SafeAreaView>
   )
@@ -629,6 +1130,8 @@ const styles = StyleSheet.create({
   challengeTitle: { fontSize: 15, fontWeight: '600', marginBottom: 2 },
   challengeMeta: { fontSize: 13, marginTop: 3 },
   challengeActions: { flexDirection: 'row', gap: 10, marginTop: 14 },
+  challengeActionsWrap: { marginTop: 10 },
+  challengeScoreLine: { fontSize: 14, fontWeight: '600', marginTop: 6 },
   acceptBtn: { flex: 1, backgroundColor: '#1D9E75', paddingVertical: 12, borderRadius: 10, alignItems: 'center' },
   acceptBtnText: { color: '#fff', fontWeight: '700', fontSize: 14 },
   declineBtn: { flex: 1, paddingVertical: 12, borderRadius: 10, alignItems: 'center', borderWidth: 0.5 },
@@ -676,4 +1179,37 @@ const styles = StyleSheet.create({
   courtList: { borderWidth: 0.5, borderRadius: 12, marginTop: 6, maxHeight: 240 },
   courtListItem: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 14, paddingVertical: 13 },
   courtListItemText: { fontSize: 15 },
+  friendSearchInput: { marginBottom: 8 },
+  friendListLoading: { paddingVertical: 28, alignItems: 'center' },
+  emptyFriendsWrap: { paddingVertical: 20, paddingHorizontal: 8 },
+  emptyFriendsText: { fontSize: 15, lineHeight: 22, textAlign: 'center' },
+  emptyFriendsLink: { color: '#1D9E75', fontWeight: '700' },
+  friendPickerScroll: { maxHeight: 300 },
+  friendPickerListContent: { gap: 8, paddingBottom: 6 },
+  friendPickerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  friendPickerTextCol: { flex: 1, minWidth: 0 },
+  friendPickerName: { fontSize: 15, fontWeight: '600' },
+  friendPickerUsername: { fontSize: 13, marginTop: 2 },
+  friendFilterEmpty: { fontSize: 14, paddingVertical: 12, textAlign: 'center' },
+  scoreModalBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.45)',
+    justifyContent: 'center',
+    paddingHorizontal: 20,
+  },
+  scoreModalCard: {
+    borderRadius: 16,
+    borderWidth: 1,
+    padding: 18,
+  },
+  scoreModalTitle: { fontSize: 20, fontWeight: '700' },
+  scoreModalSubtitle: { fontSize: 14, marginTop: 4 },
+  scoreModalActions: { flexDirection: 'row', gap: 10, marginTop: 18 },
 })

@@ -1,6 +1,7 @@
 import { Colors } from '@/constants/theme'
 import { useColorScheme } from '@/hooks/use-color-scheme'
 import { ensureFavoritesUser } from '@/lib/favorites'
+import { userFriendlyFromUnknown } from '@/lib/errors'
 import { MaterialIcons } from '@expo/vector-icons'
 import { useLocalSearchParams, useRouter } from 'expo-router'
 import { useCallback, useEffect, useState } from 'react'
@@ -84,7 +85,7 @@ export default function MatchDetailScreen() {
   const loadMatch = useCallback(async (opts?: { silent?: boolean }) => {
     const silent = opts?.silent === true
     if (!matchId) {
-      setLoadError('Missing match id')
+      setLoadError('That match link looks incomplete.')
       setMatch(null)
       if (!silent) setLoading(false)
       return
@@ -95,7 +96,7 @@ export default function MatchDetailScreen() {
     }
     const gate = await ensureFavoritesUser()
     if ('error' in gate) {
-      setLoadError(gate.error)
+      setLoadError(userFriendlyFromUnknown(gate.error))
       setMatch(null)
       if (!silent) setLoading(false)
       return
@@ -108,10 +109,10 @@ export default function MatchDetailScreen() {
       .maybeSingle()
 
     if (error) {
-      setLoadError(error.message)
+      setLoadError(userFriendlyFromUnknown(error.message))
       setMatch(null)
     } else if (!data) {
-      setLoadError('Match not found')
+      setLoadError('We could not find that match on your profile.')
       setMatch(null)
     } else {
       setMatch(data as MatchRow)
@@ -147,7 +148,7 @@ export default function MatchDetailScreen() {
     try {
       const gate = await ensureFavoritesUser()
       if ('error' in gate) {
-        Alert.alert('Error', gate.error)
+        Alert.alert('Please try again', userFriendlyFromUnknown(gate.error))
         return
       }
       const userScore = editUserScore.trim() === '' ? null : parseInt(editUserScore, 10)
@@ -176,13 +177,13 @@ export default function MatchDetailScreen() {
         .maybeSingle()
 
       if (error) {
-        Alert.alert('Could not save', error.message)
+        Alert.alert('Please try again', userFriendlyFromUnknown(error.message))
         return
       }
       if (!updated) {
         Alert.alert(
-          'Could not save',
-          'No rows were updated. In the Supabase SQL editor, add an UPDATE policy on public.matches so authenticated users can update rows where auth.uid() = user_id (and a SELECT policy if missing).',
+          'No changes saved',
+          'Your update did not stick. Pull to refresh, or reach out if this keeps happening.',
         )
         return
       }
@@ -205,12 +206,12 @@ export default function MatchDetailScreen() {
           try {
             const gate = await ensureFavoritesUser()
             if ('error' in gate) {
-              Alert.alert('Error', gate.error)
+              Alert.alert('Please try again', userFriendlyFromUnknown(gate.error))
               return
             }
             const { error } = await supabase.from('matches').delete().eq('id', match.id).eq('user_id', gate.userId)
             if (error) {
-              Alert.alert('Could not delete', error.message)
+              Alert.alert('Please try again', userFriendlyFromUnknown(error.message))
               return
             }
             router.back()

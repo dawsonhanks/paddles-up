@@ -1,3 +1,5 @@
+import { ContentFadeIn } from '@/components/content-fade-in'
+import { SkeletonCourtSheetRow } from '@/components/skeleton-card'
 import { STATUS_PIN_COLOR, type Court, type CourtStatus } from '@/lib/courts'
 import { formatDistanceMiles } from '@/lib/geo'
 import { MaterialIcons } from '@expo/vector-icons'
@@ -50,7 +52,14 @@ function AvailabilityBadge({ status, isDark }: { status: CourtStatus; isDark: bo
     )
   }
   const bg = STATUS_PIN_COLOR[status]
-  const label = status === 'open' ? 'Open' : status === 'busy' ? 'Busy' : 'Full'
+  const label =
+    status === 'open'
+      ? 'Open'
+      : status === 'busy'
+        ? 'Busy'
+        : status === 'full'
+          ? 'Busy'
+          : '—'
   return (
     <View style={[styles.badgePill, { backgroundColor: bg }]}>
       <Text style={styles.badgePillText}>{label}</Text>
@@ -147,6 +156,8 @@ function CourtRow({
   )
 }
 
+const SHEET_SKELETON_KEYS = ['sk1', 'sk2', 'sk3', 'sk4'] as const
+
 type NearbyCourtsSheetProps = {
   courts: CourtWithDistance[]
   filter: ListFilter
@@ -157,16 +168,29 @@ type NearbyCourtsSheetProps = {
   refreshing?: boolean
   onRefresh?: () => void
   showNoFavoritesYetHint?: boolean
+  /** Shows placeholder rows shaped like court cards while the list is loading. */
+  listLoading?: boolean
 }
 
 const WEB_SHEET_MAX = Math.round(Dimensions.get('window').height * 0.46)
 
 export function NearbyCourtsSheet(props: NearbyCourtsSheetProps) {
-  const { courts, filter, onFilterChange, onCourtPress, selectedId, isDark, refreshing = false, onRefresh, showNoFavoritesYetHint } = props
+  const {
+    courts,
+    filter,
+    onFilterChange,
+    onCourtPress,
+    selectedId,
+    isDark,
+    refreshing = false,
+    onRefresh,
+    showNoFavoritesYetHint,
+    listLoading = false,
+  } = props
   const insets = useSafeAreaInsets()
   const snapPoints = useMemo(() => ['22%', '48%', '82%'], [])
 
-  const renderItem = useCallback(
+  const renderCourtItem = useCallback(
     ({ item }: { item: CourtWithDistance }) => (
       <CourtRow
         item={item}
@@ -175,8 +199,10 @@ export function NearbyCourtsSheet(props: NearbyCourtsSheetProps) {
         onPress={() => onCourtPress(item.id)}
       />
     ),
-    [isDark, onCourtPress, selectedId]
+    [isDark, onCourtPress, selectedId],
   )
+
+  const renderSkeletonSheetItem = useCallback(() => <SkeletonCourtSheetRow isDark={isDark} />, [isDark])
 
   const ListHeader = useCallback(
     () => <FilterPills filter={filter} onChange={onFilterChange} isDark={isDark} />,
@@ -210,20 +236,33 @@ export function NearbyCourtsSheet(props: NearbyCourtsSheetProps) {
         ]}>
         <View style={[styles.handle, { backgroundColor: isDark ? '#52525B' : '#CBD5E1' }]} />
         <FilterPills filter={filter} onChange={onFilterChange} isDark={isDark} />
-        <FlatList
-          data={courts}
-          extraData={filter}
-          keyExtractor={(item) => item.id}
-          renderItem={renderItem}
-          ListEmptyComponent={EmptyList}
-          contentContainerStyle={styles.listPad}
-          style={{ flex: 1 }}
-          nestedScrollEnabled
-          onRefresh={onRefresh}
-          refreshing={refreshing}
-          tintColor="#1D9E75"
-          colors={['#1D9E75']}
-        />
+        {listLoading ? (
+          <FlatList
+            data={[...SHEET_SKELETON_KEYS]}
+            keyExtractor={(item) => item}
+            renderItem={renderSkeletonSheetItem}
+            contentContainerStyle={styles.listPad}
+            style={{ flex: 1 }}
+            nestedScrollEnabled
+          />
+        ) : (
+          <ContentFadeIn show style={{ flex: 1 }}>
+            <FlatList
+              data={courts}
+              extraData={filter}
+              keyExtractor={(item) => item.id}
+              renderItem={renderCourtItem}
+              ListEmptyComponent={EmptyList}
+              contentContainerStyle={styles.listPad}
+              style={{ flex: 1 }}
+              nestedScrollEnabled
+              onRefresh={onRefresh}
+              refreshing={refreshing}
+              tintColor="#1D9E75"
+              colors={['#1D9E75']}
+            />
+          </ContentFadeIn>
+        )}
       </View>
     )
   }
@@ -242,20 +281,33 @@ export function NearbyCourtsSheet(props: NearbyCourtsSheetProps) {
         width: 40,
       }}
       style={styles.sheetRoot}>
-      <BottomSheetFlatList
-        data={courts}
-        extraData={filter}
-        keyExtractor={(item) => item.id}
-        renderItem={renderItem}
-        ListHeaderComponent={ListHeader}
-        ListEmptyComponent={EmptyList}
-        contentContainerStyle={[styles.listPad, { paddingBottom: insets.bottom + 20 }]}
-        ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
-        onRefresh={onRefresh}
-        refreshing={refreshing}
-        tintColor="#1D9E75"
-        colors={['#1D9E75']}
-      />
+      {listLoading ? (
+        <BottomSheetFlatList
+          data={[...SHEET_SKELETON_KEYS]}
+          keyExtractor={(item) => item}
+          renderItem={renderSkeletonSheetItem}
+          ListHeaderComponent={ListHeader}
+          contentContainerStyle={[styles.listPad, { paddingBottom: insets.bottom + 20 }]}
+          ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
+        />
+      ) : (
+        <ContentFadeIn show style={{ flex: 1 }}>
+          <BottomSheetFlatList
+            data={courts}
+            extraData={filter}
+            keyExtractor={(item) => item.id}
+            renderItem={renderCourtItem}
+            ListHeaderComponent={ListHeader}
+            ListEmptyComponent={EmptyList}
+            contentContainerStyle={[styles.listPad, { paddingBottom: insets.bottom + 20 }]}
+            ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
+            onRefresh={onRefresh}
+            refreshing={refreshing}
+            tintColor="#1D9E75"
+            colors={['#1D9E75']}
+          />
+        </ContentFadeIn>
+      )}
     </BottomSheet>
   )
 }

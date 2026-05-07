@@ -1,6 +1,8 @@
+import { ContentFadeIn } from '@/components/content-fade-in'
+import { ErrorBanner } from '@/components/error-banner'
+import { SkeletonSettingsProfile } from '@/components/skeleton-card'
 import { Colors } from '@/constants/theme'
 import { useColorScheme } from '@/hooks/use-color-scheme'
-import { submitChallenge } from '@/lib/challenges'
 import { ensureFavoritesUser } from '@/lib/favorites'
 import {
   isValidEmail,
@@ -9,7 +11,11 @@ import {
   normalizeUsername,
   sanitizeUsernameInput,
 } from '@/lib/profileValidation'
+import { celebrateStreakMilestonesIfNeeded } from '@/lib/streakMilestones'
+import { alertOpenSettings } from '@/lib/alerts'
+import { userFriendlyFromUnknown } from '@/lib/errors'
 import { MaterialIcons } from '@expo/vector-icons'
+import { LinearGradient } from 'expo-linear-gradient'
 import { useFocusEffect } from '@react-navigation/native'
 import * as ImagePicker from 'expo-image-picker'
 import * as Linking from 'expo-linking'
@@ -20,6 +26,7 @@ import {
   Alert,
   Image,
   Modal,
+  RefreshControl,
   ScrollView,
   Share,
   StyleSheet,
@@ -43,32 +50,30 @@ type Profile = {
   username: string | null
   avatar_url: string | null
   contact: string | null
+  skill_rating: number | null
+  pickup_skill_level: string | null
   wins: number
   losses: number
 }
 
-type Friend = {
-  user_id: string
-  display_name: string | null
-  username: string | null
-  avatar_url: string | null
+type StreakUi = {
+  current_streak: number
+  longest_streak: number
+  milestone_celebrated: string
 }
 
-type PlayerResult = Friend & { isFriend: boolean }
-type CourtOption = { id: string; name: string }
-
-function FriendAvatar({ friend, size = 56 }: { friend: Friend; size?: number }) {
-  const initials = (friend.display_name ?? friend.username ?? '?').charAt(0).toUpperCase()
-  if (friend.avatar_url) {
-    return <Image source={{ uri: friend.avatar_url }} style={{ width: size, height: size, borderRadius: size / 2 }} />
-  }
-  const colors = ['#534AB7', '#0F6E56', '#D97706', '#0EA5E9', '#9333EA']
-  const colorIndex = (friend.user_id.charCodeAt(0) + friend.user_id.charCodeAt(1)) % colors.length
-  return (
-    <View style={{ width: size, height: size, borderRadius: size / 2, backgroundColor: colors[colorIndex], alignItems: 'center', justifyContent: 'center' }}>
-      <Text style={{ color: '#fff', fontSize: size * 0.38, fontWeight: '700' }}>{initials}</Text>
-    </View>
-  )
+const PICKUP_SKILL_LEVELS = ['Beginner', 'Intermediate', 'Advanced'] as const
+const SKILL_RATING_OPTIONS = [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0] as const
+const SKILL_RATING_LABELS: Record<string, string> = {
+  '1.0': 'Beginner',
+  '1.5': 'Beginner',
+  '2.0': 'Recreational',
+  '2.5': 'Recreational',
+  '3.0': 'Intermediate',
+  '3.5': 'Intermediate',
+  '4.0': 'Advanced',
+  '4.5': 'Advanced',
+  '5.0': 'Pro',
 }
 
 export default function ProfileScreen() {
@@ -83,7 +88,13 @@ export default function ProfileScreen() {
 
   // Profile state
   const [profile, setProfile] = useState<Profile | null>(null)
+  const [streak, setStreak] = useState<StreakUi>({
+    current_streak: 0,
+    longest_streak: 0,
+    milestone_celebrated: '',
+  })
   const [loading, setLoading] = useState(true)
+  const [refreshing, setRefreshing] = useState(false)
   const [showEdit, setShowEdit] = useState(false)
   const [showCreate, setShowCreate] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -92,6 +103,8 @@ export default function ProfileScreen() {
   const [editUsername, setEditUsername] = useState('')
   const [editContact, setEditContact] = useState('')
   const [editContactType, setEditContactType] = useState<'email' | 'phone'>('email')
+  const [editSkillRating, setEditSkillRating] = useState<number | null>(null)
+  const [editPickupSkill, setEditPickupSkill] = useState<string>('')
   const [createName, setCreateName] = useState('')
   const [createUsername, setCreateUsername] = useState('')
   const [createContact, setCreateContact] = useState('')
@@ -99,27 +112,6 @@ export default function ProfileScreen() {
   const [createUsernameStatus, setCreateUsernameStatus] = useState<'idle' | 'invalid' | 'checking' | 'available' | 'taken'>('idle')
   const [avatarUri, setAvatarUri] = useState<string | null>(null)
 
-  // Friends state
-  const [friends, setFriends] = useState<Friend[]>([])
-  const [friendsLoading, setFriendsLoading] = useState(false)
-  const [selectedFriend, setSelectedFriend] = useState<Friend | null>(null)
-  const [showFriendAction, setShowFriendAction] = useState(false)
-
-  // Challenge modal (from friends)
-  const [showChallengeModal, setShowChallengeModal] = useState(false)
-  const [challengeTime, setChallengeTime] = useState('')
-  const [challengeCourtId, setChallengeCourtId] = useState<string | null>(null)
-  const [challengeCourtName, setChallengeCourtName] = useState<string | null>(null)
-  const [challengeSubmitting, setChallengeSubmitting] = useState(false)
-  const [courts, setCourts] = useState<CourtOption[]>([])
-  const [showCourtPicker, setShowCourtPicker] = useState(false)
-
-  // Add friends modal
-  const [showAddFriends, setShowAddFriends] = useState(false)
-  const [searchQuery, setSearchQuery] = useState('')
-  const [searchResults, setSearchResults] = useState<PlayerResult[]>([])
-  const [searching, setSearching] = useState(false)
-  const [addingId, setAddingId] = useState<string | null>(null)
   const [showSuggestCourt, setShowSuggestCourt] = useState(false)
   const [suggestSubmitting, setSuggestSubmitting] = useState(false)
   const [suggestCourtName, setSuggestCourtName] = useState('')
@@ -131,68 +123,99 @@ export default function ProfileScreen() {
   const [suggestFee, setSuggestFee] = useState('')
   const [suggestHours, setSuggestHours] = useState('')
   const [suggestNotes, setSuggestNotes] = useState('')
+  const [profileBanner, setProfileBanner] = useState<string | null>(null)
 
   async function loadProfile() {
     setLoading(true)
-    const gate = await ensureFavoritesUser()
-    if ('error' in gate) { setLoading(false); return }
+    let celebrate:
+      | {
+          userId: string
+          row: {
+            current_streak: number
+            longest_streak: number
+            milestone_celebrated: string | null
+          } | null
+        }
+      | undefined
+    try {
+      const gate = await ensureFavoritesUser()
+      if ('error' in gate) return
 
-    const [{ data: playerData }, { data: matchData }] = await Promise.all([
-      supabase.from('players').select('*').eq('user_id', gate.userId).maybeSingle(),
-      supabase.from('matches').select('result').eq('user_id', gate.userId),
-    ])
+      const [{ data: playerData }, { data: matchData }, { data: streakData }] = await Promise.all([
+        supabase.from('players').select('*').eq('user_id', gate.userId).maybeSingle(),
+        supabase.from('matches').select('result').eq('user_id', gate.userId),
+        supabase
+          .from('streaks')
+          .select('current_streak, longest_streak, milestone_celebrated')
+          .eq('user_id', gate.userId)
+          .maybeSingle(),
+      ])
 
-    const wins = matchData?.filter(m => m.result === 'win').length ?? 0
-    const losses = matchData?.filter(m => m.result === 'loss').length ?? 0
+      const wins = matchData?.filter(m => m.result === 'win').length ?? 0
+      const losses = matchData?.filter(m => m.result === 'loss').length ?? 0
 
-    setProfile({
-      display_name: playerData?.display_name ?? null,
-      username: playerData?.username ?? null,
-      avatar_url: playerData?.avatar_url ?? null,
-      contact: (playerData as { contact?: string | null } | null)?.contact ?? null,
-      wins,
-      losses,
-    })
-    setLoading(false)
-  }
+      setProfile({
+        display_name: playerData?.display_name ?? null,
+        username: playerData?.username ?? null,
+        avatar_url: playerData?.avatar_url ?? null,
+        contact: (playerData as { contact?: string | null } | null)?.contact ?? null,
+        skill_rating: (playerData as { skill_rating?: number | null } | null)?.skill_rating ?? null,
+        pickup_skill_level:
+          (playerData as { pickup_skill_level?: string | null } | null)?.pickup_skill_level ?? null,
+        wins,
+        losses,
+      })
 
-  async function loadFriends() {
-    setFriendsLoading(true)
-    const gate = await ensureFavoritesUser()
-    if ('error' in gate) { setFriendsLoading(false); return }
+      const nextStreak: StreakUi = streakData
+        ? {
+            current_streak: streakData.current_streak ?? 0,
+            longest_streak: streakData.longest_streak ?? 0,
+            milestone_celebrated: streakData.milestone_celebrated ?? '',
+          }
+        : { current_streak: 0, longest_streak: 0, milestone_celebrated: '' }
+      setStreak(nextStreak)
 
-    const { data: rows } = await supabase
-      .from('friendships')
-      .select('friend_id')
-      .eq('user_id', gate.userId)
+      celebrate = {
+        userId: gate.userId,
+        row: streakData
+          ? {
+              current_streak: streakData.current_streak ?? 0,
+              longest_streak: streakData.longest_streak ?? 0,
+              milestone_celebrated: streakData.milestone_celebrated,
+            }
+          : null,
+      }
+    } finally {
+      setLoading(false)
+    }
 
-    const ids = rows?.map(r => r.friend_id) ?? []
-    if (ids.length === 0) { setFriends([]); setFriendsLoading(false); return }
-
-    const { data: players } = await supabase
-      .from('players')
-      .select('user_id, display_name, username, avatar_url')
-      .in('user_id', ids)
-
-    setFriends((players as Friend[]) ?? [])
-    setFriendsLoading(false)
+    if (celebrate) {
+      await celebrateStreakMilestonesIfNeeded(celebrate.userId, celebrate.row, (merged) =>
+        setStreak((s) => ({ ...s, milestone_celebrated: merged })),
+      )
+    }
   }
 
   useFocusEffect(useCallback(() => {
     loadProfile()
-    loadFriends()
   }, []))
 
-  async function loadCourts() {
-    if (courts.length > 0) return
-    const { data } = await supabase.from('courts').select('id, name').order('name')
-    setCourts((data as CourtOption[]) ?? [])
-  }
+  const onRefresh = useCallback(async () => {
+    setRefreshing(true)
+    try {
+      await loadProfile()
+    } finally {
+      setRefreshing(false)
+    }
+  }, [])
 
   async function pickImage() {
     const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync()
     if (status !== 'granted') {
-      Alert.alert('Permission needed', 'Allow photo access to set a profile picture.')
+      alertOpenSettings(
+        'Photo library',
+        'To choose a profile picture, allow photo access in Settings.',
+      )
       return
     }
     const result = await ImagePicker.launchImageLibraryAsync({
@@ -228,7 +251,10 @@ export default function ProfileScreen() {
     setSaving(true)
     try {
       const gate = await ensureFavoritesUser()
-      if ('error' in gate) { Alert.alert('Error', gate.error); return }
+      if ('error' in gate) {
+        setProfileBanner(userFriendlyFromUnknown(gate.error))
+        return
+      }
       if (editUsername.trim()) {
         const handle = normalizeUsername(editUsername)
         const { data: taken } = await supabase
@@ -246,6 +272,8 @@ export default function ProfileScreen() {
         display_name: editName.trim(),
         username: editUsername.trim() ? normalizeUsername(editUsername) : null,
         contact: c || null,
+        skill_rating: editSkillRating,
+        pickup_skill_level: editPickupSkill.trim() ? editPickupSkill.trim() : null,
         avatar_url: avatarUri ?? profile?.avatar_url ?? null,
       }, { onConflict: 'user_id' })
       if (error) {
@@ -253,7 +281,7 @@ export default function ProfileScreen() {
           Alert.alert('Username taken', 'That username is already in use.')
           return
         }
-        Alert.alert('Could not save', error.message)
+        setProfileBanner(userFriendlyFromUnknown(error.message))
         return
       }
       setShowEdit(false)
@@ -288,7 +316,10 @@ export default function ProfileScreen() {
     setCreateSaving(true)
     try {
       const gate = await ensureFavoritesUser()
-      if ('error' in gate) { Alert.alert('Error', gate.error); return }
+      if ('error' in gate) {
+        setProfileBanner(userFriendlyFromUnknown(gate.error))
+        return
+      }
       const { data: taken } = await supabase
         .from('players')
         .select('user_id')
@@ -310,7 +341,7 @@ export default function ProfileScreen() {
           Alert.alert('Username taken', 'That username is already in use. Try another.')
           return
         }
-        Alert.alert('Could not save', error.message)
+        setProfileBanner(userFriendlyFromUnknown(error.message))
         return
       }
       setShowCreate(false)
@@ -325,81 +356,10 @@ export default function ProfileScreen() {
     setEditUsername(profile?.username ?? '')
     setEditContact(profile?.contact ?? '')
     setEditContactType(pickEditContactType(profile?.contact ?? null))
+    setEditSkillRating(profile?.skill_rating ?? null)
+    setEditPickupSkill(profile?.pickup_skill_level ?? '')
     setAvatarUri(profile?.avatar_url ?? null)
     setShowEdit(true)
-  }
-
-  function openFriendAction(friend: Friend) {
-    setSelectedFriend(friend)
-    setShowFriendAction(true)
-  }
-
-  function openChallengeFromFriend() {
-    setShowFriendAction(false)
-    setChallengeTime('')
-    setChallengeCourtId(null)
-    setChallengeCourtName(null)
-    setShowCourtPicker(false)
-    loadCourts()
-    setShowChallengeModal(true)
-  }
-
-  async function handleChallengeFriend() {
-    if (!selectedFriend?.username) {
-      Alert.alert('No username', 'This player has not set a username yet.')
-      return
-    }
-    setChallengeSubmitting(true)
-    try {
-      const result = await submitChallenge({
-        username: selectedFriend.username,
-        proposedTime: challengeTime,
-        courtId: challengeCourtId,
-        courtName: challengeCourtName,
-      })
-      if (!result.ok) { Alert.alert('Could not send', result.error); return }
-      setShowChallengeModal(false)
-      Alert.alert('Challenge sent! 🏓', `${result.opponentName} has been challenged.`)
-    } finally {
-      setChallengeSubmitting(false)
-    }
-  }
-
-  async function searchPlayers() {
-    if (!searchQuery.trim()) return
-    setSearching(true)
-    try {
-      const gate = await ensureFavoritesUser()
-      if ('error' in gate) return
-
-      const { data: results } = await supabase
-        .from('players')
-        .select('user_id, display_name, username, avatar_url')
-        .or(`username.ilike.%${searchQuery.trim()}%,display_name.ilike.%${searchQuery.trim()}%`)
-        .neq('user_id', gate.userId)
-        .limit(20)
-
-      const friendIds = new Set(friends.map(f => f.user_id))
-      setSearchResults(
-        (results ?? []).map(p => ({ ...(p as Friend), isFriend: friendIds.has(p.user_id) }))
-      )
-    } finally {
-      setSearching(false)
-    }
-  }
-
-  async function addFriend(friendUserId: string) {
-    setAddingId(friendUserId)
-    try {
-      const gate = await ensureFavoritesUser()
-      if ('error' in gate) return
-      const { error } = await supabase.from('friendships').insert({ user_id: gate.userId, friend_id: friendUserId })
-      if (error) { Alert.alert('Could not add', error.message); return }
-      setSearchResults(prev => prev.map(p => p.user_id === friendUserId ? { ...p, isFriend: true } : p))
-      loadFriends()
-    } finally {
-      setAddingId(null)
-    }
   }
 
   const winRate = profile && (profile.wins + profile.losses) > 0
@@ -472,7 +432,10 @@ export default function ProfileScreen() {
     setSuggestSubmitting(true)
     try {
       const gate = await ensureFavoritesUser()
-      if ('error' in gate) { Alert.alert('Error', gate.error); return }
+      if ('error' in gate) {
+        setProfileBanner(userFriendlyFromUnknown(gate.error))
+        return
+      }
 
       const { data: me } = await supabase
         .from('players')
@@ -494,7 +457,10 @@ export default function ProfileScreen() {
         notes: suggestNotes.trim() || null,
       })
 
-      if (error) { Alert.alert('Could not submit', error.message); return }
+      if (error) {
+        setProfileBanner(userFriendlyFromUnknown(error.message))
+        return
+      }
       setShowSuggestCourt(false)
       Alert.alert("Thanks! We'll review your suggestion and add it soon.")
     } finally {
@@ -504,45 +470,62 @@ export default function ProfileScreen() {
 
   return (
     <SafeAreaView style={[styles.root, { backgroundColor: theme.background }]} edges={['top']}>
-      <ScrollView contentContainerStyle={styles.container}>
+      <ScrollView
+        contentContainerStyle={styles.container}
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={onRefresh}
+            tintColor="#1D9E75"
+            colors={['#1D9E75']}
+          />
+        }>
+        <ErrorBanner message={profileBanner} onDismiss={() => setProfileBanner(null)} />
 
         {/* Profile section */}
         <View style={styles.profileSection}>
-          <TouchableOpacity
-            style={styles.avatarWrap}
-            onPress={() => (hasProfile ? openEdit() : openCreateProfile())}
-            activeOpacity={0.85}>
-            {profile?.avatar_url ? (
-              <Image source={{ uri: profile.avatar_url }} style={styles.avatar} />
-            ) : (
-              <View style={[styles.avatarPlaceholder, { backgroundColor: '#0F6E56' }]}>
-                <Text style={styles.avatarEmoji}>🏓</Text>
-              </View>
-            )}
-            <View style={styles.avatarEditBadge}>
-              <MaterialIcons name={hasProfile ? 'edit' : 'add'} size={12} color="#fff" />
-            </View>
-          </TouchableOpacity>
-
-          {!loading && !hasProfile ? (
-            <TouchableOpacity
-              style={styles.createProfileBtn}
-              onPress={openCreateProfile}
-              activeOpacity={0.85}>
-              <MaterialIcons name="person-add" size={18} color="#fff" />
-              <Text style={styles.createProfileBtnText}>Create Profile</Text>
-            </TouchableOpacity>
-          ) : null}
-
           {loading ? (
-            <ActivityIndicator color={theme.tint} style={{ marginTop: 12 }} />
+            <SkeletonSettingsProfile isDark={isDark} />
           ) : (
             <>
+              <TouchableOpacity
+                style={styles.avatarWrap}
+                onPress={() => (hasProfile ? openEdit() : openCreateProfile())}
+                activeOpacity={0.85}>
+                {profile?.avatar_url ? (
+                  <Image source={{ uri: profile.avatar_url }} style={styles.avatar} />
+                ) : (
+                  <View style={[styles.avatarPlaceholder, { backgroundColor: '#0F6E56' }]}>
+                    <MaterialIcons name="person" size={42} color="#FFFFFF" />
+                  </View>
+                )}
+                <View style={styles.avatarEditBadge}>
+                  <MaterialIcons name={hasProfile ? 'edit' : 'add'} size={12} color="#fff" />
+                </View>
+              </TouchableOpacity>
+
+              {!hasProfile ? (
+                <TouchableOpacity
+                  style={styles.createProfileBtn}
+                  onPress={openCreateProfile}
+                  activeOpacity={0.85}>
+                  <MaterialIcons name="person-add" size={18} color="#fff" />
+                  <Text style={styles.createProfileBtnText}>Create Profile</Text>
+                </TouchableOpacity>
+              ) : null}
+
+              <ContentFadeIn show style={{ alignItems: 'center', alignSelf: 'stretch' }}>
               <Text style={[styles.displayName, { color: theme.text }]}>
                 {profile?.display_name ?? 'Your Name'}
               </Text>
               {profile?.username ? (
                 <Text style={[styles.username, { color: muted }]}>@{profile.username}</Text>
+              ) : null}
+              {profile?.skill_rating != null ? (
+                <View style={styles.profileRatingBadge}>
+                  <Image source={require('../../assets/images/icon.png')} style={styles.ratingLogoSm} />
+                  <Text style={styles.profileRatingText}>{profile.skill_rating.toFixed(1)}</Text>
+                </View>
               ) : null}
 
               <View style={styles.statsRow}>
@@ -560,6 +543,37 @@ export default function ProfileScreen() {
                   <Text style={[styles.statNum, { color: theme.text }]}>{winRate}</Text>
                   <Text style={[styles.statLabel, { color: muted }]}>Win rate</Text>
                 </View>
+              </View>
+
+              <View style={styles.streakCardOuter}>
+                <LinearGradient
+                  colors={isDark ? ['#3D231C', '#261610'] : ['#FFF5EE', '#FFE4D4']}
+                  start={{ x: 0, y: 0 }}
+                  end={{ x: 1, y: 1 }}
+                  style={[
+                    styles.streakGradient,
+                    { borderColor: isDark ? 'rgba(255, 107, 53, 0.35)' : 'rgba(255, 107, 53, 0.5)' },
+                  ]}>
+                  <View style={styles.streakInner}>
+                    <Text style={styles.streakEmoji}>🔥</Text>
+                    <Text style={styles.streakNumber}>{streak.current_streak}</Text>
+                    <Text
+                      style={[
+                        styles.streakLabel,
+                        { color: isDark ? '#FCA5A5' : '#9A3412' },
+                      ]}>
+                      day streak
+                    </Text>
+                    <Text style={[styles.streakBest, { color: muted }]}>
+                      Best: {streak.longest_streak} days
+                    </Text>
+                    {streak.current_streak === 0 ? (
+                      <Text style={[styles.streakEncourage, { color: muted }]}>
+                        Start your streak — check in at a court today!
+                      </Text>
+                    ) : null}
+                  </View>
+                </LinearGradient>
               </View>
 
               {hasProfile ? (
@@ -582,44 +596,8 @@ export default function ProfileScreen() {
                   ) : null}
                 </View>
               ) : null}
+              </ContentFadeIn>
             </>
-          )}
-        </View>
-
-        {/* Friends section */}
-        <View style={[styles.friendsCard, { backgroundColor: cardBg, borderColor: cardBorder }]}>
-          <View style={styles.friendsHeader}>
-            <Text style={[styles.friendsTitle, { color: theme.text }]}>Friends</Text>
-            <TouchableOpacity
-              style={styles.addFriendBtn}
-              onPress={() => { setSearchQuery(''); setSearchResults([]); setShowAddFriends(true) }}
-              activeOpacity={0.8}>
-              <MaterialIcons name="person-add" size={16} color="#1D9E75" />
-              <Text style={styles.addFriendBtnText}>Add</Text>
-            </TouchableOpacity>
-          </View>
-
-          {friendsLoading ? (
-            <ActivityIndicator color={theme.tint} style={{ marginVertical: 16 }} />
-          ) : friends.length === 0 ? (
-            <Text style={[styles.friendsEmpty, { color: muted }]}>
-              No friends yet — add players you know!
-            </Text>
-          ) : (
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.friendsList}>
-              {friends.map(friend => (
-                <TouchableOpacity
-                  key={friend.user_id}
-                  style={styles.friendItem}
-                  onPress={() => openFriendAction(friend)}
-                  activeOpacity={0.75}>
-                  <FriendAvatar friend={friend} size={56} />
-                  <Text style={[styles.friendName, { color: theme.text }]} numberOfLines={1}>
-                    {friend.display_name ?? friend.username ?? '?'}
-                  </Text>
-                </TouchableOpacity>
-              ))}
-            </ScrollView>
           )}
         </View>
 
@@ -667,7 +645,7 @@ export default function ProfileScreen() {
                 <Image source={{ uri: avatarUri }} style={styles.avatarLarge} />
               ) : (
                 <View style={[styles.avatarLargePlaceholder, { backgroundColor: '#0F6E56' }]}>
-                  <Text style={styles.avatarLargeEmoji}>🏓</Text>
+                  <MaterialIcons name="person" size={46} color="#FFFFFF" />
                 </View>
               )}
               <View style={styles.avatarPickerBadge}>
@@ -707,6 +685,55 @@ export default function ProfileScreen() {
                 </TouchableOpacity>
               ))}
             </View>
+            <Text style={[styles.fieldLabel, { color: muted }]}>Skill rating (DUPR)</Text>
+            <Text style={[styles.usernameHint, { color: muted, marginTop: -4 }]}>
+              Choose from 1.0 to 5.0 in 0.5 increments.
+            </Text>
+            <View style={styles.ratingGrid}>
+              {SKILL_RATING_OPTIONS.map((rating) => {
+                const selected = editSkillRating === rating
+                const labelKey = rating.toFixed(1)
+                return (
+                  <TouchableOpacity
+                    key={labelKey}
+                    onPress={() => setEditSkillRating(selected ? null : rating)}
+                    style={[
+                      styles.ratingPill,
+                      { borderColor: cardBorder, backgroundColor: cardBg },
+                      selected && { borderColor: '#1D9E75', backgroundColor: isDark ? 'rgba(29, 158, 117, 0.2)' : '#E1F5EE' },
+                    ]}
+                    activeOpacity={0.8}>
+                    <Text style={[styles.ratingValue, { color: selected ? '#0F6E56' : theme.text }]}>
+                      {labelKey}
+                    </Text>
+                    <Text style={[styles.ratingLabel, { color: muted }]}>
+                      {SKILL_RATING_LABELS[labelKey]}
+                    </Text>
+                  </TouchableOpacity>
+                )
+              })}
+            </View>
+            <Text style={[styles.fieldLabel, { color: muted }]}>Pickup skill (optional)</Text>
+            <Text style={[styles.usernameHint, { color: muted, marginTop: -4 }]}>
+              Shown when you join a posted game — same scale as Beginner / Intermediate / Advanced.
+            </Text>
+            <View style={styles.pillRowFlexible}>
+              {PICKUP_SKILL_LEVELS.map((s) => (
+                <TouchableOpacity
+                  key={s}
+                  onPress={() => setEditPickupSkill(editPickupSkill === s ? '' : s)}
+                  style={[
+                    styles.pickupSkillPill,
+                    { borderColor: cardBorder, backgroundColor: cardBg },
+                    editPickupSkill === s && { borderColor: '#1D9E75', backgroundColor: isDark ? 'rgba(29, 158, 117, 0.2)' : '#E1F5EE' },
+                  ]}>
+                  <Text style={[styles.contactPillText, { color: editPickupSkill === s ? '#0F6E56' : muted }]}>
+                    {s}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+
             <TextInput
               value={editContact} onChangeText={setEditContact}
               placeholder={editContactType === 'email' ? 'you@example.com' : '(555) 123-4567'}
@@ -878,209 +905,6 @@ export default function ProfileScreen() {
           </ScrollView>
         </SafeAreaView>
       </Modal>
-
-      {/* Friend action sheet */}
-      <Modal visible={showFriendAction} transparent animationType="fade" onRequestClose={() => setShowFriendAction(false)}>
-        <TouchableOpacity style={styles.overlay} activeOpacity={1} onPress={() => setShowFriendAction(false)}>
-          <View style={[styles.actionSheet, { backgroundColor: cardBg }]}>
-            <View style={styles.actionSheetHandle} />
-            {selectedFriend ? (
-              <View style={styles.actionSheetProfile}>
-                <FriendAvatar friend={selectedFriend} size={48} />
-                <View style={{ marginLeft: 14 }}>
-                  <Text style={[styles.actionSheetName, { color: theme.text }]}>
-                    {selectedFriend.display_name ?? selectedFriend.username ?? 'Player'}
-                  </Text>
-                  {selectedFriend.username ? (
-                    <Text style={[styles.actionSheetUsername, { color: muted }]}>@{selectedFriend.username}</Text>
-                  ) : null}
-                </View>
-              </View>
-            ) : null}
-
-            <View style={[styles.actionSheetDivider, { backgroundColor: cardBorder }]} />
-
-            <TouchableOpacity
-              style={styles.actionSheetBtn}
-              onPress={() => {
-                setShowFriendAction(false)
-                if (selectedFriend?.username) router.push(`/profile/${selectedFriend.username}` as any)
-              }}
-              activeOpacity={0.7}>
-              <MaterialIcons name="person" size={22} color="#0EA5E9" />
-              <Text style={[styles.actionSheetBtnText, { color: theme.text }]}>View Profile</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={styles.actionSheetBtn}
-              onPress={openChallengeFromFriend}
-              activeOpacity={0.7}>
-              <MaterialIcons name="sports" size={22} color="#F59E0B" />
-              <Text style={[styles.actionSheetBtnText, { color: theme.text }]}>Challenge</Text>
-            </TouchableOpacity>
-
-            <View style={[styles.actionSheetDivider, { backgroundColor: cardBorder }]} />
-
-            <TouchableOpacity
-              style={styles.actionSheetBtn}
-              onPress={() => setShowFriendAction(false)}
-              activeOpacity={0.7}>
-              <Text style={[styles.actionSheetBtnText, { color: '#E24B4A', textAlign: 'center', flex: 1 }]}>Cancel</Text>
-            </TouchableOpacity>
-          </View>
-        </TouchableOpacity>
-      </Modal>
-
-      {/* Challenge modal (pre-filled from friend) */}
-      <Modal visible={showChallengeModal} animationType="slide" presentationStyle="pageSheet">
-        <SafeAreaView style={[styles.modal, { backgroundColor: theme.background }]} edges={['top']}>
-          <View style={styles.modalHeader}>
-            <Text style={[styles.modalTitle, { color: theme.text }]}>
-              Challenge {selectedFriend?.display_name ?? selectedFriend?.username ?? 'Player'}
-            </Text>
-            <TouchableOpacity onPress={() => setShowChallengeModal(false)}>
-              <MaterialIcons name="close" size={24} color={muted} />
-            </TouchableOpacity>
-          </View>
-          <ScrollView style={styles.modalScroll} keyboardShouldPersistTaps="handled">
-            {selectedFriend ? (
-              <View style={[styles.challengeTargetRow, { backgroundColor: isDark ? 'rgba(255,255,255,0.05)' : '#F8FAFC', borderColor: cardBorder }]}>
-                <FriendAvatar friend={selectedFriend} size={40} />
-                <View style={{ marginLeft: 12 }}>
-                  <Text style={[{ fontWeight: '600', fontSize: 15, color: theme.text }]}>
-                    {selectedFriend.display_name ?? selectedFriend.username}
-                  </Text>
-                  {selectedFriend.username
-                    ? <Text style={[{ fontSize: 13, color: muted }]}>@{selectedFriend.username}</Text>
-                    : null}
-                </View>
-              </View>
-            ) : null}
-
-            <Text style={[styles.fieldLabel, { color: muted }]}>Proposed time</Text>
-            <TextInput
-              value={challengeTime} onChangeText={setChallengeTime}
-              placeholder="e.g. Saturday at 2pm" placeholderTextColor={muted}
-              style={[styles.input, { color: theme.text, borderColor: cardBorder, backgroundColor: cardBg }]}
-            />
-
-            <Text style={[styles.fieldLabel, { color: muted }]}>Court (optional)</Text>
-            <TouchableOpacity
-              style={[styles.courtPickerBtn, { backgroundColor: cardBg, borderColor: challengeCourtId ? '#1D9E75' : cardBorder }]}
-              onPress={() => setShowCourtPicker(p => !p)}
-              activeOpacity={0.8}>
-              <MaterialIcons name="location-on" size={18} color={challengeCourtId ? '#1D9E75' : muted} />
-              <Text style={[styles.courtPickerBtnText, { color: challengeCourtId ? '#1D9E75' : muted }]}>
-                {challengeCourtName ?? 'Pick a court'}
-              </Text>
-              <MaterialIcons name={showCourtPicker ? 'expand-less' : 'expand-more'} size={20} color={muted} />
-            </TouchableOpacity>
-
-            {showCourtPicker ? (
-              <ScrollView style={[styles.courtList, { backgroundColor: cardBg, borderColor: cardBorder }]} nestedScrollEnabled>
-                <TouchableOpacity
-                  style={[styles.courtListItem, { borderBottomColor: cardBorder, borderBottomWidth: 0.5 }]}
-                  onPress={() => { setChallengeCourtId(null); setChallengeCourtName(null); setShowCourtPicker(false) }}>
-                  <Text style={[styles.courtListItemText, { color: muted }]}>None</Text>
-                </TouchableOpacity>
-                {courts.map((court, i) => (
-                  <TouchableOpacity
-                    key={court.id}
-                    style={[styles.courtListItem, i < courts.length - 1 && { borderBottomColor: cardBorder, borderBottomWidth: 0.5 }]}
-                    onPress={() => { setChallengeCourtId(court.id); setChallengeCourtName(court.name); setShowCourtPicker(false) }}>
-                    <Text style={[styles.courtListItemText, { color: theme.text }]}>{court.name}</Text>
-                    {challengeCourtId === court.id ? <MaterialIcons name="check" size={18} color="#1D9E75" /> : null}
-                  </TouchableOpacity>
-                ))}
-              </ScrollView>
-            ) : null}
-
-            <TouchableOpacity
-              style={[styles.submitBtn, { marginTop: 32 }, challengeSubmitting && { opacity: 0.6 }]}
-              onPress={handleChallengeFriend} disabled={challengeSubmitting} activeOpacity={0.8}>
-              {challengeSubmitting
-                ? <ActivityIndicator color="#fff" />
-                : <Text style={styles.submitBtnText}>Send Challenge 🏓</Text>}
-            </TouchableOpacity>
-            <View style={{ height: 40 }} />
-          </ScrollView>
-        </SafeAreaView>
-      </Modal>
-
-      {/* Add Friends modal */}
-      <Modal visible={showAddFriends} animationType="slide" presentationStyle="pageSheet">
-        <SafeAreaView style={[styles.modal, { backgroundColor: theme.background }]} edges={['top']}>
-          <View style={styles.modalHeader}>
-            <Text style={[styles.modalTitle, { color: theme.text }]}>Add Friends</Text>
-            <TouchableOpacity onPress={() => setShowAddFriends(false)}>
-              <MaterialIcons name="close" size={24} color={muted} />
-            </TouchableOpacity>
-          </View>
-
-          <View style={styles.searchRow}>
-            <TextInput
-              value={searchQuery}
-              onChangeText={setSearchQuery}
-              placeholder="Username or display name…"
-              placeholderTextColor={muted}
-              autoCapitalize="none"
-              autoCorrect={false}
-              returnKeyType="search"
-              onSubmitEditing={searchPlayers}
-              style={[styles.searchInput, { color: theme.text, borderColor: cardBorder, backgroundColor: cardBg }]}
-            />
-            <TouchableOpacity
-              style={[styles.searchBtn, searching && { opacity: 0.6 }]}
-              onPress={searchPlayers}
-              disabled={searching}
-              activeOpacity={0.8}>
-              {searching
-                ? <ActivityIndicator color="#fff" size="small" />
-                : <MaterialIcons name="search" size={20} color="#fff" />}
-            </TouchableOpacity>
-          </View>
-
-          <ScrollView style={styles.searchResults} keyboardShouldPersistTaps="handled">
-            {searchResults.length === 0 && !searching ? (
-              <Text style={[styles.searchEmpty, { color: muted }]}>
-                {searchQuery.trim() ? 'No players found.' : 'Search by username or name to find friends.'}
-              </Text>
-            ) : null}
-            {searchResults.map((player, i) => (
-              <View
-                key={player.user_id}
-                style={[styles.searchResultRow, { borderBottomColor: cardBorder }, i === searchResults.length - 1 && { borderBottomWidth: 0 }]}>
-                <FriendAvatar friend={player} size={44} />
-                <View style={styles.searchResultInfo}>
-                  <Text style={[styles.searchResultName, { color: theme.text }]}>
-                    {player.display_name ?? player.username ?? 'Player'}
-                  </Text>
-                  {player.username ? (
-                    <Text style={[styles.searchResultUsername, { color: muted }]}>@{player.username}</Text>
-                  ) : null}
-                </View>
-                {player.isFriend ? (
-                  <View style={styles.friendedBadge}>
-                    <MaterialIcons name="check" size={16} color="#1D9E75" />
-                    <Text style={styles.friendedText}>Added</Text>
-                  </View>
-                ) : (
-                  <TouchableOpacity
-                    style={[styles.addBtn, addingId === player.user_id && { opacity: 0.6 }]}
-                    onPress={() => addFriend(player.user_id)}
-                    disabled={addingId === player.user_id}
-                    activeOpacity={0.8}>
-                    {addingId === player.user_id
-                      ? <ActivityIndicator color="#fff" size="small" />
-                      : <MaterialIcons name="person-add" size={18} color="#fff" />}
-                  </TouchableOpacity>
-                )}
-              </View>
-            ))}
-            <View style={{ height: 40 }} />
-          </ScrollView>
-        </SafeAreaView>
-      </Modal>
     </SafeAreaView>
   )
 }
@@ -1096,11 +920,36 @@ const styles = StyleSheet.create({
   avatarEditBadge: { position: 'absolute', bottom: 0, right: 0, backgroundColor: '#1D9E75', borderRadius: 12, width: 24, height: 24, alignItems: 'center', justifyContent: 'center' },
   displayName: { fontSize: 22, fontWeight: '700', marginBottom: 4 },
   username: { fontSize: 14, marginBottom: 16 },
+  profileRatingBadge: {
+    backgroundColor: '#E1F5EE',
+    borderRadius: 14,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    marginBottom: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  profileRatingText: { color: '#0F6E56', fontSize: 14, fontWeight: '700' },
   statsRow: { flexDirection: 'row', marginBottom: 16 },
   statBlock: { alignItems: 'center', paddingHorizontal: 20 },
   statNum: { fontSize: 20, fontWeight: '700' },
   statLabel: { fontSize: 11, marginTop: 2 },
   statDivider: { width: 0.5 },
+  streakCardOuter: { alignSelf: 'center', marginBottom: 14, maxWidth: 200 },
+  streakGradient: { borderRadius: 12, paddingVertical: 10, paddingHorizontal: 14, borderWidth: 1 },
+  streakInner: { alignItems: 'center' },
+  streakEmoji: { fontSize: 26, lineHeight: 30 },
+  streakNumber: { fontSize: 22, fontWeight: '700', color: '#FF6B35', marginTop: 2 },
+  streakLabel: { fontSize: 11, fontWeight: '600', marginTop: 2, textAlign: 'center' },
+  streakBest: { fontSize: 10, marginTop: 4, textAlign: 'center' },
+  streakEncourage: {
+    fontSize: 10,
+    marginTop: 6,
+    fontStyle: 'italic',
+    lineHeight: 14,
+    textAlign: 'center',
+  },
   createProfileBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, marginTop: 4, marginBottom: 4, backgroundColor: '#1D9E75', paddingHorizontal: 24, paddingVertical: 12, borderRadius: 24, alignSelf: 'center', minWidth: 200 },
   createProfileBtnText: { color: '#fff', fontSize: 16, fontWeight: '700' },
   profileBtnRow: { flexDirection: 'row', gap: 10 },
@@ -1108,16 +957,7 @@ const styles = StyleSheet.create({
   editBtnText: { color: '#0F6E56', fontSize: 14, fontWeight: '600' },
   shareBtn: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 20, paddingVertical: 10, borderRadius: 20, borderWidth: 1, borderColor: '#0EA5E9' },
   shareBtnText: { color: '#0EA5E9', fontSize: 14, fontWeight: '600' },
-  // Friends section
-  friendsCard: { borderRadius: 16, borderWidth: 0.5, padding: 16, marginBottom: 16 },
-  friendsHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 },
-  friendsTitle: { fontSize: 16, fontWeight: '700' },
-  addFriendBtn: { flexDirection: 'row', alignItems: 'center', gap: 5, paddingHorizontal: 14, paddingVertical: 7, borderRadius: 20, borderWidth: 1, borderColor: '#1D9E75' },
-  addFriendBtnText: { color: '#0F6E56', fontSize: 13, fontWeight: '600' },
-  friendsEmpty: { fontSize: 14, textAlign: 'center', paddingVertical: 12 },
-  friendsList: { gap: 16, paddingVertical: 4 },
-  friendItem: { alignItems: 'center', width: 72 },
-  friendName: { fontSize: 12, marginTop: 6, textAlign: 'center', fontWeight: '500' },
+  ratingLogoSm: { width: 16, height: 16, borderRadius: 4 },
   // Settings card
   card: { borderRadius: 14, borderWidth: 0.5, overflow: 'hidden', marginBottom: 32 },
   row: { flexDirection: 'row', alignItems: 'center', padding: 16 },
@@ -1137,6 +977,19 @@ const styles = StyleSheet.create({
   usernameHint: { fontSize: 12, marginBottom: 8, marginTop: -4 },
   usernameStatus: { fontSize: 12, marginTop: 8 },
   contactPillRow: { flexDirection: 'row', gap: 10, marginBottom: 10 },
+  ratingGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 10 },
+  ratingPill: {
+    minWidth: 90,
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    alignItems: 'center',
+  },
+  ratingValue: { fontSize: 16, fontWeight: '700' },
+  ratingLabel: { fontSize: 11, marginTop: 2 },
+  pillRowFlexible: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 10 },
+  pickupSkillPill: { paddingHorizontal: 14, paddingVertical: 10, borderRadius: 20, borderWidth: 1 },
   contactPill: { paddingHorizontal: 18, paddingVertical: 10, borderRadius: 20, borderWidth: 1 },
   contactPillText: { fontSize: 14, fontWeight: '600' },
   notesInput: { minHeight: 100, textAlignVertical: 'top' },
@@ -1149,34 +1002,4 @@ const styles = StyleSheet.create({
   avatarLargeEmoji: { fontSize: 44 },
   avatarPickerBadge: { position: 'absolute', bottom: 20, right: '30%', backgroundColor: '#1D9E75', borderRadius: 16, width: 32, height: 32, alignItems: 'center', justifyContent: 'center' },
   avatarPickerHint: { fontSize: 12, marginTop: 8 },
-  // Friend action sheet
-  overlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.45)', justifyContent: 'flex-end' },
-  actionSheet: { borderTopLeftRadius: 20, borderTopRightRadius: 20, paddingBottom: 32 },
-  actionSheetHandle: { width: 36, height: 4, borderRadius: 2, backgroundColor: '#CBD5E1', alignSelf: 'center', marginTop: 12, marginBottom: 4 },
-  actionSheetProfile: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 20, paddingVertical: 16 },
-  actionSheetName: { fontSize: 16, fontWeight: '700' },
-  actionSheetUsername: { fontSize: 13, marginTop: 2 },
-  actionSheetDivider: { height: 0.5, marginHorizontal: 0 },
-  actionSheetBtn: { flexDirection: 'row', alignItems: 'center', gap: 14, paddingHorizontal: 20, paddingVertical: 16 },
-  actionSheetBtnText: { fontSize: 16, fontWeight: '500' },
-  // Challenge modal
-  challengeTargetRow: { flexDirection: 'row', alignItems: 'center', borderWidth: 0.5, borderRadius: 14, padding: 14, marginTop: 8 },
-  courtPickerBtn: { flexDirection: 'row', alignItems: 'center', gap: 8, borderWidth: 0.5, borderRadius: 12, padding: 14 },
-  courtPickerBtnText: { flex: 1, fontSize: 15 },
-  courtList: { borderWidth: 0.5, borderRadius: 12, marginTop: 6, maxHeight: 220 },
-  courtListItem: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 14, paddingVertical: 13 },
-  courtListItemText: { fontSize: 15 },
-  // Add friends modal
-  searchRow: { flexDirection: 'row', gap: 10, paddingHorizontal: 20, paddingBottom: 16 },
-  searchInput: { flex: 1, borderWidth: 0.5, borderRadius: 12, padding: 13, fontSize: 15 },
-  searchBtn: { backgroundColor: '#1D9E75', width: 48, height: 48, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
-  searchResults: { flex: 1, paddingHorizontal: 20 },
-  searchEmpty: { textAlign: 'center', marginTop: 32, fontSize: 14 },
-  searchResultRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 12, borderBottomWidth: 0.5, gap: 12 },
-  searchResultInfo: { flex: 1 },
-  searchResultName: { fontSize: 15, fontWeight: '600' },
-  searchResultUsername: { fontSize: 13, marginTop: 2 },
-  friendedBadge: { flexDirection: 'row', alignItems: 'center', gap: 4 },
-  friendedText: { color: '#1D9E75', fontSize: 13, fontWeight: '600' },
-  addBtn: { backgroundColor: '#1D9E75', width: 36, height: 36, borderRadius: 18, alignItems: 'center', justifyContent: 'center' },
 })

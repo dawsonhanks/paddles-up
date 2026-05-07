@@ -1,31 +1,51 @@
+import { ContentFadeIn } from '@/components/content-fade-in'
+import { ErrorBanner } from '@/components/error-banner'
+import { CourtDetailSkeleton } from '@/components/court-detail-skeleton'
+import { SkeletonBox } from '@/components/skeleton-box'
 import { Colors, Fonts } from '@/constants/theme'
 import { useColorScheme } from '@/hooks/use-color-scheme'
+import { checkinBucketLabel, checkinBucketTone, checkinCountToCourtStatus } from '@/lib/checkins'
+import { courtDetailFromRow, STATUS_PIN_COLOR, type CourtDetail, type CourtStatus } from '@/lib/courts'
 import {
-  aggregateVenueLiveStatus,
-  fetchLatestAvailabilityByCourt,
-  insertAvailabilityReport,
-  type ReportableStatus,
-} from '@/lib/availability'
+  courtHasOutdoorVenue,
+  fetchCourtWeatherCached,
+  peekCourtWeatherCache,
+  weatherEmoji,
+  weatherShortLabel,
+  type CachedCourtWeather,
+} from '@/lib/courtWeather'
+import type { CourtReview } from '@/lib/courtReviews'
 import {
-  courtDetailFromRow,
-  STATUS_PIN_COLOR,
-  type CourtAmenities,
-  type CourtDetail,
-  type CourtStatus,
-} from '@/lib/courts'
+  deleteCourtReview,
+  fetchCourtReviewsPreview,
+  fetchRecentWrittenCourtReviews,
+  upsertCourtReview,
+  upsertCourtReviewFromCheckout,
+} from '@/lib/courtReviews'
+import { deleteCourtCheckIn, upsertActiveCourtCheckIn } from '@/lib/courtPresenceCheckin'
 import { addFavorite, ensureFavoritesUser, isCourtFavorite, removeFavorite } from '@/lib/favorites'
+import { notifyManualCheckoutFromCourtDetail } from '@/lib/mapAutoCheckinCoordinator'
+import { alertOpenSettings } from '@/lib/alerts'
+import { userFriendlyFromUnknown } from '@/lib/errors'
+import { fetchLatestZoneReportsForCourt, fetchZonesForCourt, insertZoneReport, type CourtZoneRow } from '@/lib/zones'
 import { distanceKm, formatDistanceDetail, isWithinReportingRadius, REPORTING_RADIUS_KM } from '@/lib/geo'
 import { MaterialIcons } from '@expo/vector-icons'
+import { useNetworkOffline } from '@/contexts/network-status-context'
 import { useFocusEffect } from '@react-navigation/native'
 import * as Device from 'expo-device'
+import * as ExpoFSLegacy from 'expo-file-system/legacy'
+import * as Haptics from 'expo-haptics'
+import * as ImagePicker from 'expo-image-picker'
 import * as Location from 'expo-location'
 import * as Notifications from 'expo-notifications'
 import { useLocalSearchParams, useRouter } from 'expo-router'
-import type { ComponentProps } from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ActivityIndicator,
   Alert,
+  Image,
+  KeyboardAvoidingView,
+  LayoutAnimation,
   Linking,
   Modal,
   Platform,
@@ -33,15 +53,14 @@ import {
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
+  UIManager,
+  useWindowDimensions,
   View,
 } from 'react-native'
 import { SafeAreaView } from 'react-native-safe-area-context'
 
 import { supabase } from '@/supabase'
-
-const OPEN_BTN = '#16a34a'
-const BUSY_BTN = '#ea580c'
-const FULL_BTN = '#dc2626'
 
 /** Defer success alerts so they run after notify spinner / state updates settle (avoids swallowed alerts and stuck alert chrome). */
 const NOTIFY_SUCCESS_ALERT_DELAY_MS = 300
@@ -58,17 +77,6 @@ function openMapsDirections(lat: number, lon: number) {
   Linking.openURL(url).catch(() => Linking.openURL(`https://maps.apple.com/?daddr=${lat},${lon}`))
 }
 
-function parseHoursLines(hours: string | null): string[] {
-  if (!hours?.trim()) return []
-  let lines = hours.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
-  if (lines.length === 1) {
-    const one = lines[0]
-    if (one.includes(';')) lines = one.split(';').map((s) => s.trim()).filter(Boolean)
-    else if (one.includes('|')) lines = one.split('|').map((s) => s.trim()).filter(Boolean)
-  }
-  return lines
-}
-
 function statusBadgeColors(status: CourtStatus): { bg: string; text: string } {
   switch (status) {
     case 'open': return { bg: '#DCFCE7', text: '#166534' }
@@ -82,41 +90,110 @@ function statusLabel(status: CourtStatus): string {
   switch (status) {
     case 'open': return 'Open'
     case 'busy': return 'Busy'
-    case 'full': return 'Full'
+    case 'full': return 'Busy'
     default: return 'Unknown'
   }
 }
 
-function StarRow({ rating, filledColor, emptyColor }: { rating: number; filledColor: string; emptyColor: string }) {
+type CourtPhoto = {
+  id: string
+  court_id: string
+  user_id: string
+  photo_url: string
+  created_at: string
+  uploader_name: string
+}
+
+/** Path inside bucket `court-photos` from a Storage public object URL. */
+function courtPhotoObjectPathFromPublicUrl(photoUrl: string): string | null {
+  const needle = '/storage/v1/object/public/court-photos/'
+  const i = photoUrl.indexOf(needle)
+  if (i === -1) return null
+  let path = photoUrl.slice(i + needle.length)
+  const q = path.indexOf('?')
+  if (q !== -1) path = path.slice(0, q)
+  try {
+    return decodeURIComponent(path)
+  } catch {
+    return path
+  }
+}
+
+function timeAgo(dateStr: string): string {
+  const diffMs = Date.now() - new Date(dateStr).getTime()
+  const mins = Math.floor(diffMs / 60000)
+  if (mins < 1) return 'just now'
+  if (mins < 60) return `${mins}m ago`
+  const hrs = Math.floor(mins / 60)
+  if (hrs < 24) return `${hrs}h ago`
+  const days = Math.floor(hrs / 24)
+  return `${days}d ago`
+}
+
+function StarRow({
+  rating,
+  filledColor,
+  emptyColor,
+  compact,
+  tiny,
+}: {
+  rating: number
+  filledColor: string
+  emptyColor: string
+  compact?: boolean
+  /** Smaller glyphs for dense single-line rows (e.g. court hero meta). */
+  tiny?: boolean
+}) {
   const filled = Math.min(5, Math.max(0, Math.round(rating)))
+  const glyphStyle = tiny ? styles.starGlyphTiny : compact ? styles.starGlyphCompact : styles.starGlyph
+  const numStyle = tiny ? styles.ratingNumTiny : compact ? styles.ratingNumCompact : styles.ratingNum
   return (
-    <View style={styles.starRow}>
+    <View style={[styles.starRow, compact && styles.starRowCompact, tiny && styles.starRowTiny]}>
       {[1, 2, 3, 4, 5].map((i) => (
-        <Text key={i} style={[styles.starGlyph, { color: i <= filled ? filledColor : emptyColor }]}>★</Text>
+        <Text key={i} style={[glyphStyle, { color: i <= filled ? filledColor : emptyColor }]}>
+          ★
+        </Text>
       ))}
-      <Text style={[styles.ratingNum, { color: filledColor }]}>{rating.toFixed(1)}</Text>
+      <Text style={[numStyle, { color: filledColor }]}>{rating.toFixed(1)}</Text>
     </View>
   )
 }
 
-function InfoTile({ label, value, isDark }: { label: string; value: string; isDark: boolean }) {
-  return (
-    <View style={[styles.infoTile, { backgroundColor: isDark ? 'rgba(255,255,255,0.04)' : '#F8FAFC', borderColor: isDark ? 'rgba(255,255,255,0.06)' : '#E2E8F0' }]}>
-      <Text style={[styles.infoTileLabel, { color: isDark ? '#94A3B8' : '#64748B' }]}>{label}</Text>
-      <Text style={[styles.infoTileValue, { color: isDark ? '#F1F5F9' : '#0F172A' }]} numberOfLines={2}>{value}</Text>
-    </View>
-  )
+function base64ToUint8Array(base64: string): Uint8Array {
+  const bin = globalThis.atob(base64)
+  const len = bin.length
+  const out = new Uint8Array(len)
+  for (let i = 0; i < len; i++) out[i] = bin.charCodeAt(i)
+  return out
 }
 
-type MaterialIconName = ComponentProps<typeof MaterialIcons>['name']
+function imageContentType(asset: ImagePicker.ImagePickerAsset, ext: string): string {
+  if (asset.mimeType) return asset.mimeType
+  switch (ext) {
+    case 'png':
+      return 'image/png'
+    case 'webp':
+      return 'image/webp'
+    case 'gif':
+      return 'image/gif'
+    case 'heic':
+    case 'heif':
+      return 'image/heic'
+    default:
+      return 'image/jpeg'
+  }
+}
 
-function AmenityChip({ icon, label, isDark }: { icon: MaterialIconName; label: string; isDark: boolean }) {
-  return (
-    <View style={[styles.amenityChip, { backgroundColor: isDark ? 'rgba(34,197,94,0.12)' : '#ECFDF5', borderColor: isDark ? 'rgba(34,197,94,0.25)' : '#BBF7D0' }]}>
-      <MaterialIcons name={icon} size={16} color="#16a34a" />
-      <Text style={[styles.amenityChipText, { color: isDark ? '#86EFAC' : '#166534' }]}>{label}</Text>
-    </View>
-  )
+/** Reads picked/captured photo bytes reliably on native (avoid fetch+blob empty bodies on RN). */
+async function uriImageBytes(uri: string): Promise<Uint8Array> {
+  if (Platform.OS === 'web') {
+    const r = await fetch(uri)
+    if (!r.ok) throw new Error(`Could not read image (${r.status})`)
+    const buf = await r.arrayBuffer()
+    return new Uint8Array(buf)
+  }
+  const b64 = await ExpoFSLegacy.readAsStringAsync(uri, { encoding: ExpoFSLegacy.EncodingType.Base64 })
+  return base64ToUint8Array(b64)
 }
 
 async function getPushToken(): Promise<string | null> {
@@ -143,6 +220,7 @@ export default function CourtDetailScreen() {
     }
   })()
   const router = useRouter()
+  const { width: windowW, height: windowH } = useWindowDimensions()
   const colorScheme = useColorScheme()
   const isDark = colorScheme === 'dark'
   const theme = Colors[colorScheme ?? 'light']
@@ -157,8 +235,13 @@ export default function CourtDetailScreen() {
   const [loadError, setLoadError] = useState<string | null>(null)
   const [userLat, setUserLat] = useState<number | null>(null)
   const [userLon, setUserLon] = useState<number | null>(null)
-  const [latest, setLatest] = useState<Map<number, ReportableStatus>>(new Map())
-  const [saving, setSaving] = useState<{ courtNum: number; status: ReportableStatus } | null>(null)
+  const [courtZones, setCourtZones] = useState<CourtZoneRow[]>([])
+  const [zoneReportsByZone, setZoneReportsByZone] = useState<
+    Map<string, { status: 'open' | 'busy'; reported_at: string }>
+  >(new Map())
+  const [zoneReportBusy, setZoneReportBusy] = useState<{ zoneId: string; status: 'open' | 'busy' } | null>(
+    null,
+  )
   const [isFavorite, setIsFavorite] = useState(false)
   const [favoriteReady, setFavoriteReady] = useState(false)
   const [favoriteBusy, setFavoriteBusy] = useState(false)
@@ -167,9 +250,34 @@ export default function CourtDetailScreen() {
   const [isCheckedIn, setIsCheckedIn] = useState(false)
   const [checkinBusy, setCheckinBusy] = useState(false)
   const [checkinCount, setCheckinCount] = useState(0)
+  const isOffline = useNetworkOffline()
+  const [photos, setPhotos] = useState<CourtPhoto[]>([])
+  const [photosLoading, setPhotosLoading] = useState(false)
+  const [photoUploading, setPhotoUploading] = useState(false)
+  const [photoDeletingId, setPhotoDeletingId] = useState<string | null>(null)
+  const [viewerUserId, setViewerUserId] = useState<string | null>(null)
+  const [selectedPhotoUrl, setSelectedPhotoUrl] = useState<string | null>(null)
   const [showRatingModal, setShowRatingModal] = useState(false)
   const [pendingRating, setPendingRating] = useState(0)
+  const [checkoutReviewText, setCheckoutReviewText] = useState('')
   const [ratingBusy, setRatingBusy] = useState(false)
+
+  const [reviewsPreview, setReviewsPreview] = useState<CourtReview[]>([])
+  const [reviewsTotal, setReviewsTotal] = useState(0)
+  const [reviewsLoading, setReviewsLoading] = useState(false)
+  const [screenBanner, setScreenBanner] = useState<string | null>(null)
+
+  const [showReviewComposer, setShowReviewComposer] = useState(false)
+  const [composerRating, setComposerRating] = useState(5)
+  const [composerText, setComposerText] = useState('')
+  const [composerBusy, setComposerBusy] = useState(false)
+  const [moreInfoExpanded, setMoreInfoExpanded] = useState(false)
+  const [recentWrittenReviews, setRecentWrittenReviews] = useState<CourtReview[]>([])
+  const [outdoorWeather, setOutdoorWeather] = useState<{
+    loading: boolean
+    error: string | null
+    data: CachedCourtWeather | null
+  }>({ loading: false, error: null, data: null })
 
   const notifySuccessAlertTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -190,12 +298,23 @@ export default function CourtDetailScreen() {
     }
   }, [])
 
+  useEffect(() => {
+    if (Platform.OS === 'android') {
+      UIManager.setLayoutAnimationEnabledExperimental?.(true)
+    }
+  }, [])
+
   const distanceKmUser = useMemo(() => {
     if (userLat == null || userLon == null || !court) return null
     return distanceKm(userLat, userLon, court.latitude, court.longitude)
   }, [userLat, userLon, court])
 
   const withinRadius = distanceKmUser != null && isWithinReportingRadius(distanceKmUser)
+
+  const fullscreenPhoto = useMemo(
+    () => (selectedPhotoUrl == null ? undefined : photos.find((p) => p.photo_url === selectedPhotoUrl)),
+    [photos, selectedPhotoUrl]
+  )
 
   const refreshLocation = useCallback(async () => {
     const { status } = await Location.getForegroundPermissionsAsync()
@@ -206,20 +325,49 @@ export default function CourtDetailScreen() {
   }, [])
 
   const loadCourt = useCallback(async () => {
-    if (!courtId) { setCourt(null); setLoadError('Missing court id'); return }
+    if (!courtId) {
+      setCourt(null)
+      setLoadError('This link does not include a court. Head back and pick a court from the map.')
+      return
+    }
     setLoadError(null)
     setCourt(undefined)
     const { data, error } = await supabase.from('courts').select('*').eq('id', courtId).maybeSingle()
-    if (error) { setLoadError(error.message); setCourt(null); return }
-    if (!data) { setCourt(null); setLoadError('Court not found'); return }
+    if (error) {
+      setLoadError(userFriendlyFromUnknown(error))
+      setCourt(null)
+      return
+    }
+    if (!data) {
+      setCourt(null)
+      setLoadError('We could not find this court. It may have been removed.')
+      return
+    }
     setCourt(courtDetailFromRow(data as Record<string, unknown>))
   }, [courtId])
 
-  const loadAvailability = useCallback(async () => {
-    if (!courtId) return
-    const map = await fetchLatestAvailabilityByCourt(courtId)
-    setLatest(map)
+  /** Reset zone UI when opening a different court (avoid stale rows briefly showing wrong venue). */
+  useEffect(() => {
+    setCourtZones([])
+    setZoneReportsByZone(new Map())
   }, [courtId])
+
+  const loadZonesAndReports = useCallback(async () => {
+    if (!courtId) return
+    const zones = await fetchZonesForCourt(courtId)
+    setCourtZones(zones)
+    if (zones.length === 0) {
+      setZoneReportsByZone(new Map())
+      return
+    }
+    const reps = await fetchLatestZoneReportsForCourt(courtId)
+    setZoneReportsByZone(reps)
+  }, [courtId])
+
+  useEffect(() => {
+    if (!courtId || isOffline) return
+    void loadZonesAndReports()
+  }, [courtId, isOffline, loadZonesAndReports])
 
   const loadCheckins = useCallback(async () => {
     if (!courtId) return
@@ -238,51 +386,260 @@ export default function CourtDetailScreen() {
     setIsCheckedIn(!!mine)
   }, [courtId])
 
-  const onToggleCheckin = useCallback(async () => {
-    if (!courtId || checkinBusy) return
-    setCheckinBusy(true)
+  const loadPhotos = useCallback(async () => {
+    if (!courtId) return
+    setPhotosLoading(true)
+    try {
+      const { data, error } = await supabase
+        .from('court_photos')
+        .select('id, court_id, user_id, photo_url, created_at')
+        .eq('court_id', courtId)
+        .order('created_at', { ascending: false })
+
+      if (error || !data) {
+        setPhotos([])
+        return
+      }
+
+      const userIds = Array.from(new Set(data.map((r) => String(r.user_id))))
+      let nameByUser = new Map<string, string>()
+      if (userIds.length > 0) {
+        const { data: players } = await supabase
+          .from('players')
+          .select('user_id, display_name')
+          .in('user_id', userIds)
+        nameByUser = new Map(
+          (players ?? []).map((p) => [String((p as { user_id: string }).user_id), String((p as { display_name?: string | null }).display_name ?? 'Player')])
+        )
+      }
+
+      setPhotos(
+        data.map((r) => ({
+          id: String(r.id),
+          court_id: String(r.court_id),
+          user_id: String(r.user_id),
+          photo_url: String(r.photo_url),
+          created_at: String(r.created_at),
+          uploader_name: nameByUser.get(String(r.user_id)) ?? 'Player',
+        }))
+      )
+    } finally {
+      setPhotosLoading(false)
+    }
+  }, [courtId])
+
+  const loadReviews = useCallback(async () => {
+    if (!courtId || isOffline) {
+      setReviewsPreview([])
+      setReviewsTotal(0)
+      setRecentWrittenReviews([])
+      return
+    }
+    setReviewsLoading(true)
     try {
       const gate = await ensureFavoritesUser()
-      if ('error' in gate) { Alert.alert('Error', gate.error); return }
+      const uid = 'error' in gate ? null : gate.userId
+      const [preview, writtenRecent] = await Promise.all([
+        fetchCourtReviewsPreview(courtId, uid),
+        fetchRecentWrittenCourtReviews(courtId, 2),
+      ])
+      setReviewsTotal(preview.total)
+      setReviewsPreview(preview.rows)
+      setRecentWrittenReviews(writtenRecent)
+    } finally {
+      setReviewsLoading(false)
+    }
+  }, [courtId, isOffline])
 
-      const { data: playerData } = await supabase
-        .from('players')
-        .select('display_name')
-        .eq('user_id', gate.userId)
-        .maybeSingle()
+  const toggleMoreInfo = useCallback(() => {
+    LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut)
+    setMoreInfoExpanded((v) => !v)
+    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light)
+  }, [])
 
-      const displayName = playerData?.display_name ?? 'Anonymous'
+  const uploadCourtPhoto = useCallback(async (asset: ImagePicker.ImagePickerAsset) => {
+    if (!courtId) return
+    setPhotoUploading(true)
+    try {
+      const gate = await ensureFavoritesUser()
+      if ('error' in gate) {
+        setScreenBanner(userFriendlyFromUnknown(gate.error))
+        return
+      }
 
+      let ext =
+        asset.fileName?.split('.').pop()?.toLowerCase()?.replace(/^\./, '')
+        ?? asset.mimeType?.split('/')[1]
+        ?? 'jpg'
+      if (ext.includes('jpeg')) ext = 'jpg'
+      const objectPath = `${gate.userId}/${courtId}/${Date.now()}.${ext}`
+
+      const bytes = await uriImageBytes(asset.uri)
+      if (bytes.byteLength === 0) {
+        setScreenBanner('That photo did not load. Try choosing another picture.')
+        return
+      }
+      const contentType = imageContentType(asset, ext)
+
+      const { error: uploadError } = await supabase.storage
+        .from('court-photos')
+        .upload(objectPath, bytes, { contentType, upsert: false })
+      if (uploadError) {
+        setScreenBanner(userFriendlyFromUnknown(uploadError))
+        return
+      }
+
+      const { data: pub } = supabase.storage.from('court-photos').getPublicUrl(objectPath)
+      const publicUrl = pub.publicUrl
+
+      const { error: insertError } = await supabase
+        .from('court_photos')
+        .insert({ court_id: courtId, user_id: gate.userId, photo_url: publicUrl })
+      if (insertError) {
+        setScreenBanner(userFriendlyFromUnknown(insertError))
+        return
+      }
+
+      await loadPhotos()
+    } catch (e) {
+      setScreenBanner(userFriendlyFromUnknown(e))
+    } finally {
+      setPhotoUploading(false)
+    }
+  }, [courtId, loadPhotos])
+
+  const deleteCourtPhoto = useCallback(
+    (photo: CourtPhoto) => {
+      Alert.alert('Delete photo?', 'This removes your photo from this court.', [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: () => {
+            void (async () => {
+              setPhotoDeletingId(photo.id)
+              try {
+                const gate = await ensureFavoritesUser()
+                if ('error' in gate) {
+                  setScreenBanner(userFriendlyFromUnknown(gate.error))
+                  return
+                }
+                if (gate.userId !== photo.user_id) {
+                  setScreenBanner('You can only remove photos you uploaded.')
+                  return
+                }
+
+                const { error: dbErr } = await supabase
+                  .from('court_photos')
+                  .delete()
+                  .eq('id', photo.id)
+                  .eq('user_id', gate.userId)
+                if (dbErr) {
+                  setScreenBanner(userFriendlyFromUnknown(dbErr))
+                  return
+                }
+
+                const objectPath = courtPhotoObjectPathFromPublicUrl(photo.photo_url)
+                if (objectPath) {
+                  const { error: storageErr } = await supabase.storage.from('court-photos').remove([objectPath])
+                  if (storageErr && __DEV__) {
+                    console.warn('court photo storage remove:', storageErr.message)
+                  }
+                }
+
+                setSelectedPhotoUrl((u) => (u === photo.photo_url ? null : u))
+                await loadPhotos()
+              } finally {
+                setPhotoDeletingId(null)
+              }
+            })()
+          },
+        },
+      ])
+    },
+    [loadPhotos]
+  )
+
+  const onAddPhoto = useCallback(async () => {
+    if (!courtId || photoUploading) return
+    const permission = await ImagePicker.requestMediaLibraryPermissionsAsync()
+    if (permission.status !== 'granted') {
+      alertOpenSettings(
+        'Photo library',
+        'To add a court photo, allow photo access in Settings — tap below to jump there.',
+      )
+      return
+    }
+
+    const picked = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      quality: 0.82,
+      allowsEditing: true,
+    })
+    if (picked.canceled || !picked.assets[0]) return
+    await uploadCourtPhoto(picked.assets[0])
+  }, [courtId, photoUploading, uploadCourtPhoto])
+
+  const onTakePhoto = useCallback(async () => {
+    if (!courtId || photoUploading) return
+    const permission = await ImagePicker.requestCameraPermissionsAsync()
+    if (permission.status !== 'granted') {
+      alertOpenSettings(
+        'Camera',
+        'To snap a court photo here, turn on camera access in Settings.',
+      )
+      return
+    }
+
+    const captured = await ImagePicker.launchCameraAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      quality: 0.82,
+      allowsEditing: true,
+    })
+    if (captured.canceled || !captured.assets[0]) return
+    await uploadCourtPhoto(captured.assets[0])
+  }, [courtId, photoUploading, uploadCourtPhoto])
+
+  const onToggleCheckin = useCallback(async () => {
+    if (!courtId || checkinBusy) return
+    if (isOffline) {
+      setScreenBanner('Reconnect to check in or check out.')
+      return
+    }
+    setCheckinBusy(true)
+    try {
       if (isCheckedIn) {
-        await supabase
-          .from('court_checkins')
-          .delete()
-          .eq('user_id', gate.userId)
-          .eq('court_id', courtId)
+        await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light)
+        const rm = await deleteCourtCheckIn(courtId)
+        if (!rm.ok) {
+          setScreenBanner(userFriendlyFromUnknown(rm.error ?? ''))
+          return
+        }
+        notifyManualCheckoutFromCourtDetail(courtId)
         setIsCheckedIn(false)
-        setCheckinCount(prev => Math.max(0, prev - 1))
+        await loadCheckins()
         setPendingRating(0)
+        setCheckoutReviewText('')
         setShowRatingModal(true)
       } else {
         if (!withinRadius) {
-          Alert.alert('Too far away', 'You need to be at the court to check in.')
+          setScreenBanner('Get a little closer to the court to check in.')
           return
         }
-        await supabase.from('court_checkins').upsert({
-          user_id: gate.userId,
-          court_id: courtId,
-          display_name: displayName,
-          checked_in_at: new Date().toISOString(),
-          expires_at: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(),
-        }, { onConflict: 'user_id,court_id' })
+        await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium)
+        const up = await upsertActiveCourtCheckIn(courtId)
+        if (!up.ok) {
+          setScreenBanner(userFriendlyFromUnknown(up.error ?? ''))
+          return
+        }
         setIsCheckedIn(true)
-        setCheckinCount(prev => prev + 1)
-        Alert.alert('Checked in! 🏓', `You're at ${court?.name}. Have a great game!`)
+        await loadCheckins()
+        Alert.alert('Checked in!', `You're at ${court?.name}. Have a great game!`)
       }
     } finally {
       setCheckinBusy(false)
     }
-  }, [courtId, checkinBusy, isCheckedIn, withinRadius, court])
+  }, [courtId, checkinBusy, isCheckedIn, withinRadius, court, isOffline, loadCheckins])
 
   const submitRating = useCallback(async (stars: number) => {
     if (!courtId || ratingBusy || stars < 1) return
@@ -290,18 +647,105 @@ export default function CourtDetailScreen() {
     try {
       const gate = await ensureFavoritesUser()
       if ('error' in gate) return
-      await supabase.from('court_ratings').insert({ court_id: courtId, user_id: gate.userId, rating: stars })
-      const { data } = await supabase.from('court_ratings').select('rating').eq('court_id', courtId)
-      if (data && data.length > 0) {
-        const avg = data.reduce((s, r) => s + r.rating, 0) / data.length
-        setCourt(prev => prev ? { ...prev, rating: Math.round(avg * 10) / 10 } : prev)
-      }
+      const { data: playerData } = await supabase
+        .from('players')
+        .select('display_name')
+        .eq('user_id', gate.userId)
+        .maybeSingle()
+      const displayName = playerData?.display_name ?? 'Anonymous'
+
+      const { error: revErr } = await upsertCourtReviewFromCheckout({
+        courtId,
+        userId: gate.userId,
+        displayName,
+        rating: stars,
+        checkoutNote: checkoutReviewText,
+      })
+      if (revErr) setScreenBanner(userFriendlyFromUnknown(revErr))
+
+      await loadCourt()
+      await loadReviews()
     } finally {
       setRatingBusy(false)
       setShowRatingModal(false)
       setPendingRating(0)
+      setCheckoutReviewText('')
     }
-  }, [courtId, ratingBusy])
+  }, [courtId, ratingBusy, checkoutReviewText, loadCourt, loadReviews])
+
+  const openReviewComposer = useCallback(() => {
+    if (isOffline) {
+      setScreenBanner('Reconnect to edit reviews.')
+      return
+    }
+    void ensureFavoritesUser().then((gate) => {
+      if ('error' in gate) {
+        setScreenBanner(userFriendlyFromUnknown(gate.error))
+        return
+      }
+      const mine = reviewsPreview.find((r) => r.user_id === gate.userId)
+      setComposerRating(mine?.rating != null ? Math.min(5, Math.max(1, mine.rating)) : 5)
+      setComposerText(mine?.review_text ?? '')
+      setShowReviewComposer(true)
+    })
+  }, [isOffline, reviewsPreview])
+
+  const submitComposer = useCallback(async () => {
+    if (!courtId || composerBusy || composerRating < 1) return
+    setComposerBusy(true)
+    try {
+      const gate = await ensureFavoritesUser()
+      if ('error' in gate) return
+      const { data: playerData } = await supabase
+        .from('players')
+        .select('display_name')
+        .eq('user_id', gate.userId)
+        .maybeSingle()
+      const displayName = playerData?.display_name ?? 'Anonymous'
+      const { error } = await upsertCourtReview({
+        courtId,
+        userId: gate.userId,
+        displayName,
+        rating: composerRating,
+        reviewText: composerText,
+      })
+      if (error) setScreenBanner(userFriendlyFromUnknown(error))
+      else {
+        setShowReviewComposer(false)
+        await loadCourt()
+        await loadReviews()
+      }
+    } finally {
+      setComposerBusy(false)
+    }
+  }, [courtId, composerBusy, composerRating, composerText, loadCourt, loadReviews])
+
+  const requestDeleteReview = useCallback(
+    (review: CourtReview) => {
+      if (!courtId) return
+      if (isOffline) {
+        setScreenBanner('Reconnect to change reviews.')
+        return
+      }
+      if (viewerUserId == null || review.user_id !== viewerUserId) return
+      Alert.alert('Remove review?', 'This removes your rating and any written notes you added for this court.', [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: async () => {
+            const { error } = await deleteCourtReview(courtId, viewerUserId)
+            if (error) setScreenBanner(userFriendlyFromUnknown(error))
+            else {
+              await loadCourt()
+              await loadReviews()
+            }
+          },
+        },
+      ])
+    },
+    [courtId, viewerUserId, isOffline, loadCourt, loadReviews],
+  )
 
   const checkSubscription = useCallback(async () => {
     if (!courtId) return
@@ -321,14 +765,23 @@ export default function CourtDetailScreen() {
     setNotifyBusy(true)
     try {
       const gate = await ensureFavoritesUser()
-      if ('error' in gate) { Alert.alert('Error', gate.error); return }
+      if ('error' in gate) {
+        setScreenBanner(userFriendlyFromUnknown(gate.error))
+        return
+      }
       if (isSubscribed) {
         await supabase.from('notification_subscriptions').delete().eq('user_id', gate.userId).eq('court_id', courtId)
         setIsSubscribed(false)
         scheduleNotifySuccessAlert('Notifications off', 'You will no longer receive alerts for this court.')
       } else {
         const token = await getPushToken()
-        if (!token) { Alert.alert('Permission needed', 'Enable notifications in Settings to get court alerts.'); return }
+        if (!token) {
+          alertOpenSettings(
+            'Notifications are off',
+            'Turn them on in Settings for Paddles Up — then tap the bell again.',
+          )
+          return
+        }
         await supabase.from('notification_tokens').upsert({ user_id: gate.userId, push_token: token }, { onConflict: 'user_id' })
         await supabase.from('notification_subscriptions').upsert({ user_id: gate.userId, court_id: courtId, push_token: token }, { onConflict: 'user_id,court_id' })
         setIsSubscribed(true)
@@ -341,12 +794,76 @@ export default function CourtDetailScreen() {
 
   useEffect(() => { loadCourt() }, [loadCourt])
 
-  useFocusEffect(useCallback(() => {
-    refreshLocation()
-    loadAvailability()
-    checkSubscription()
-    loadCheckins()
-  }, [refreshLocation, loadAvailability, checkSubscription, loadCheckins]))
+  useEffect(() => {
+    if (court === undefined || court === null) return
+    if (!courtHasOutdoorVenue(court.indoorOutdoor)) {
+      setOutdoorWeather({ loading: false, error: null, data: null })
+      return
+    }
+
+    const { id, latitude, longitude } = court
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+      setOutdoorWeather({
+        loading: false,
+        error: 'Weather needs a valid location for this court.',
+        data: null,
+      })
+      return
+    }
+
+    const cached = peekCourtWeatherCache(id)
+    setOutdoorWeather(
+      cached != null
+        ? { loading: false, error: null, data: cached }
+        : { loading: true, error: null, data: null }
+    )
+
+    let cancelled = false
+    fetchCourtWeatherCached(id, latitude, longitude)
+      .then((data) => {
+        if (!cancelled) setOutdoorWeather({ loading: false, error: null, data })
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setOutdoorWeather((prev) =>
+            prev.data != null
+              ? { loading: false, error: null, data: prev.data }
+              : {
+                  loading: false,
+                  error: 'Weather could not be loaded. Check your connection and try again.',
+                  data: null,
+                }
+          )
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [court])
+
+  useFocusEffect(
+    useCallback(() => {
+      refreshLocation()
+      void ensureFavoritesUser().then((gate) => {
+        setViewerUserId('error' in gate ? null : gate.userId)
+      })
+      if (!isOffline) {
+        loadCheckins()
+        loadZonesAndReports()
+      } else {
+        setCheckinCount(0)
+        setIsCheckedIn(false)
+      }
+      loadPhotos()
+      checkSubscription()
+      loadReviews()
+
+      return () => {
+        setMoreInfoExpanded(false)
+      }
+    }, [refreshLocation, loadZonesAndReports, checkSubscription, loadCheckins, loadPhotos, loadReviews, isOffline]),
+  )
 
   useEffect(() => { setFavoriteReady(false); setIsFavorite(false) }, [courtId])
 
@@ -367,11 +884,12 @@ export default function CourtDetailScreen() {
     try {
       if (isFavorite) {
         const { error } = await removeFavorite(courtId)
-        if (error) Alert.alert('Could not update', error.message)
+        if (error) setScreenBanner(userFriendlyFromUnknown(error.message))
         else setIsFavorite(false)
       } else {
+        await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium)
         const { error } = await addFavorite(courtId)
-        if (error) Alert.alert('Could not save', error.message)
+        if (error) setScreenBanner(userFriendlyFromUnknown(error.message))
         else setIsFavorite(true)
       }
     } finally {
@@ -379,68 +897,102 @@ export default function CourtDetailScreen() {
     }
   }, [courtId, favoriteReady, favoriteBusy, isFavorite])
 
-  const onReport = async (courtNumber: number, status: ReportableStatus) => {
-    if (!court || !courtId) return
-    const { status: perm } = await Location.getForegroundPermissionsAsync()
-    if (perm !== 'granted') { Alert.alert('Location needed', 'Allow location to verify you are at the venue before reporting.'); return }
-    setSaving({ courtNum: courtNumber, status })
-    try {
+  const onZoneReport = useCallback(
+    async (zoneId: string, status: 'open' | 'busy') => {
+      if (!court || !courtId) return
+      if (isOffline) {
+        setScreenBanner('Reconnect to submit a zone update.')
+        return
+      }
+      await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light)
+      const { status: perm } = await Location.getForegroundPermissionsAsync()
+      if (perm !== 'granted') {
+        alertOpenSettings(
+          'Location',
+          'Location access is needed for this feature — tap below to open Settings.',
+        )
+        return
+      }
       const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Highest })
       const d = distanceKm(pos.coords.latitude, pos.coords.longitude, court.latitude, court.longitude)
       if (!isWithinReportingRadius(d)) {
-        Alert.alert('Too far away', `Availability reports are only accepted within ${Math.round(REPORTING_RADIUS_KM * 1000)} meters of the venue.`)
+        setScreenBanner(
+          `Stand within about ${Math.round(REPORTING_RADIUS_KM * 1000)} meters of this court to submit a zone update.`,
+        )
         setUserLat(pos.coords.latitude)
         setUserLon(pos.coords.longitude)
         return
       }
       setUserLat(pos.coords.latitude)
       setUserLon(pos.coords.longitude)
-      const { error } = await insertAvailabilityReport({ court_id: courtId, court_number: courtNumber, status, reporter_lat: pos.coords.latitude, reporter_lng: pos.coords.longitude })
-      if (error) { Alert.alert('Could not save', error.message); return }
-      setLatest((prev) => { const next = new Map(prev); next.set(courtNumber, status); return next })
-      await loadAvailability()
-    } finally {
-      setSaving(null)
-    }
-  }
 
-  const headerStatus = useMemo(() => {
-    if (!court) return 'unknown' as CourtStatus
-    const live = aggregateVenueLiveStatus(latest)
-    return live !== 'unknown' ? live : court.status
-  }, [court, latest])
+      const gate = await ensureFavoritesUser()
+      if ('error' in gate) {
+        setScreenBanner(userFriendlyFromUnknown(gate.error))
+        return
+      }
 
-  const amenityList = useMemo(() => {
-    if (!court) return []
-    const a: CourtAmenities = court.amenities
-    const chips: { key: string; icon: MaterialIconName; label: string }[] = []
-    if (a.parking) chips.push({ key: 'p', icon: 'local-parking', label: 'Parking' })
-    if (a.restrooms) chips.push({ key: 'r', icon: 'wc', label: 'Restrooms' })
-    if (a.lighting) chips.push({ key: 'l', icon: 'flare', label: 'Lighting' })
-    return chips
-  }, [court])
+      setZoneReportBusy({ zoneId, status })
+      try {
+        const { error } = await insertZoneReport({
+          courtId,
+          zoneId,
+          userId: gate.userId,
+          status,
+        })
+        if (error) {
+          setScreenBanner(userFriendlyFromUnknown(error.message))
+          return
+        }
+        await loadZonesAndReports()
+      } finally {
+        setZoneReportBusy(null)
+      }
+    },
+    [court, courtId, isOffline, loadZonesAndReports],
+  )
 
   if (court === undefined) {
     return (
-      <View style={[styles.centered, { backgroundColor: screenBg }]}>
-        <ActivityIndicator size="large" color={theme.tint} />
+      <View style={{ flex: 1, backgroundColor: screenBg }}>
+        <SafeAreaView edges={['top']} style={[styles.topBar, { width: '100%' }]}>
+          <SkeletonBox width={44} height={44} borderRadius={14} />
+          <View style={{ flexDirection: 'row', gap: 10 }}>
+            <SkeletonBox width={44} height={44} borderRadius={14} />
+            <SkeletonBox width={44} height={44} borderRadius={14} />
+          </View>
+        </SafeAreaView>
+        <CourtDetailSkeleton screenBg={screenBg} cardBg={cardBg} cardBorder={cardBorder} />
       </View>
     )
   }
 
   if (!court || loadError) {
+    const bannerCopy = loadError ?? 'We could not find this court.'
     return (
-      <SafeAreaView style={[styles.centered, { backgroundColor: screenBg }]} edges={['top', 'bottom']}>
-        <Text style={[styles.errTitle, { color: theme.text }]}>{loadError ?? 'Court not found'}</Text>
-        <Pressable onPress={() => router.back()} style={({ pressed }) => [styles.primaryGhostBtn, { borderColor: isDark ? '#F1F5F9' : '#0F172A', opacity: pressed ? 0.75 : 1 }]}>
+      <SafeAreaView style={[styles.centered, { backgroundColor: screenBg, paddingHorizontal: 20 }]} edges={['top', 'bottom']}>
+        <ErrorBanner message={bannerCopy} autoDismissMs={0} onDismiss={() => router.back()} />
+        <Text style={[styles.errTitle, { color: theme.text, marginTop: 14 }]}>
+          Check your connection or try again.
+        </Text>
+        <Pressable
+          onPress={() => void loadCourt()}
+          style={({ pressed }) => [{ marginTop: 16, opacity: pressed ? 0.9 : 1, backgroundColor: '#1D9E75', paddingHorizontal: 28, paddingVertical: 14, borderRadius: 999 }]}>
+          <Text style={{ color: '#FFFFFF', fontSize: 16, fontWeight: '700' }}>Try again</Text>
+        </Pressable>
+        <Pressable
+          onPress={() => router.back()}
+          style={({ pressed }) => [styles.primaryGhostBtn, { borderColor: isDark ? '#F1F5F9' : '#0F172A', opacity: pressed ? 0.75 : 1, marginTop: 14 }]}>
           <Text style={[styles.primaryGhostBtnText, { color: isDark ? '#F1F5F9' : '#0F172A' }]}>Go back</Text>
         </Pressable>
       </SafeAreaView>
     )
   }
 
+  const headerStatus: CourtStatus = checkinCountToCourtStatus(checkinCount)
   const badge = statusBadgeColors(headerStatus)
-  const hoursLines = parseHoursLines(court.hours)
+  const playersHere = checkinBucketLabel(checkinCount)
+  const playersHereTone = checkinBucketTone(checkinCount, isDark)
   const titleFont = Fonts.rounded
 
   return (
@@ -474,49 +1026,103 @@ export default function CourtDetailScreen() {
         </View>
       </SafeAreaView>
 
+      {screenBanner ? (
+        <ErrorBanner message={screenBanner} onDismiss={() => setScreenBanner(null)} />
+      ) : null}
+
+      <ContentFadeIn show style={{ flex: 1 }}>
       <ScrollView style={{ flex: 1 }} contentContainerStyle={[styles.scrollContent, { paddingTop: 4 }]} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
 
         <View style={[styles.heroCard, { backgroundColor: cardBg, borderColor: cardBorder }, cardShadow]}>
-          <View style={styles.heroTitleRow}>
-            <Text style={[styles.heroTitle, { color: isDark ? '#F8FAFC' : '#0F172A' }, Platform.OS === 'ios' && titleFont ? { fontFamily: titleFont } : null]}>
-              {court.name}
-            </Text>
-            <View style={[styles.statusBadge, { backgroundColor: badge.bg }]}>
-              <View style={[styles.statusDot, { backgroundColor: STATUS_PIN_COLOR[headerStatus] }]} />
-              <Text style={[styles.statusBadgeText, { color: badge.text }]}>{statusLabel(headerStatus)}</Text>
-            </View>
-          </View>
-          <View style={styles.distanceRatingRow}>
-            <View style={styles.distanceBlock}>
-              <MaterialIcons name="near-me" size={20} color={muted} />
-              <Text style={[styles.distanceText, { color: subtle }]}>
-                {distanceKmUser != null ? formatDistanceDetail(distanceKmUser) : '—'}
+          <Text
+            style={[styles.heroTitleFull, { color: isDark ? '#F8FAFC' : '#0F172A' }, Platform.OS === 'ios' && titleFont ? { fontFamily: titleFont } : null]}
+            numberOfLines={2}>
+            {court.name}
+          </Text>
+          <View style={styles.heroMetaRow}>
+            <View style={[styles.statusBadge, styles.statusBadgeHero, { backgroundColor: badge.bg }]}>
+              <View style={[styles.statusDot, styles.statusDotHero, { backgroundColor: STATUS_PIN_COLOR[headerStatus] }]} />
+              <Text style={[styles.statusBadgeText, styles.statusBadgeTextHero, { color: badge.text }]}>
+                {statusLabel(headerStatus)}
               </Text>
             </View>
+            <Text style={[styles.heroMetaDot, { color: muted }]}>·</Text>
+            <Text style={[styles.heroMetaDistance, { color: subtle }]} numberOfLines={1}>
+              {distanceKmUser != null ? formatDistanceDetail(distanceKmUser) : '—'}
+            </Text>
+            <Text style={[styles.heroMetaDot, { color: muted }]}>·</Text>
             {court.rating != null ? (
-              <StarRow rating={court.rating} filledColor="#F59E0B" emptyColor={isDark ? '#334155' : '#E2E8F0'} />
+              <StarRow
+                rating={court.rating}
+                filledColor="#F59E0B"
+                emptyColor={isDark ? '#334155' : '#E2E8F0'}
+                compact
+                tiny
+              />
             ) : (
-              <Text style={[styles.noRating, { color: muted }]}>No rating</Text>
+              <Text style={[styles.heroNoRating, { color: muted }]} numberOfLines={1}>
+                No rating
+              </Text>
             )}
           </View>
-          {court.address ? (
-            <View style={[styles.addressRow, { borderTopColor: cardBorder }]}>
-              <MaterialIcons name="location-on" size={20} color="#0EA5E9" style={{ marginTop: 1 }} />
-              <Text style={[styles.addressText, { color: muted }]}>{court.address}</Text>
+          <View style={[styles.heroCardDivider, { backgroundColor: cardBorder }]} />
+          <View style={styles.heroCourtsDirectionsRow}>
+            <View
+              style={[
+                styles.heroCourtCountPillOutline,
+                {
+                  borderColor: isDark ? 'rgba(148,163,184,0.45)' : 'rgba(100,116,139,0.35)',
+                  backgroundColor: isDark ? 'rgba(255,255,255,0.03)' : 'transparent',
+                },
+              ]}>
+              <Text style={[styles.heroCourtCountPillText, { color: subtle }]}>
+                {court.courtCount} {court.courtCount === 1 ? 'court' : 'courts'}
+              </Text>
             </View>
-          ) : null}
+            <Pressable
+              onPress={() => openMapsDirections(court.latitude, court.longitude)}
+              accessibilityRole="button"
+              accessibilityLabel="Open directions to this court"
+              style={({ pressed }) => [styles.directionsChipCompact, { opacity: pressed ? 0.85 : 1 }]}>
+              <MaterialIcons name="directions" size={14} color="#FFFFFF" />
+              <Text style={styles.directionsChipTextCompact}>Directions</Text>
+            </Pressable>
+          </View>
         </View>
 
-        {/* Check in card */}
+        <Text style={[styles.availSectionTitle, { color: isDark ? '#F1F5F9' : '#0F172A' }]}>Live activity</Text>
+        <Text style={[styles.availSectionSub, { color: muted }]}>
+          Pin colors follow check-ins: quiet (green), picking up (amber), busy (red).
+        </Text>
+        {isOffline ? (
+          <Text style={[styles.offlineRealtimeNote, { color: isDark ? '#FCD34D' : '#92400E' }]}>Live data unavailable offline</Text>
+        ) : null}
+
+        <View
+          style={[
+            styles.playersHereCard,
+            {
+              backgroundColor: playersHereTone.bg,
+              borderColor: playersHereTone.border,
+            },
+            cardShadow,
+          ]}>
+          <Text style={[styles.playersHereTitle, { color: playersHereTone.title }]}>{playersHere.title}</Text>
+          <Text style={[styles.playersHereSubtitle, { color: playersHereTone.subtitle }]}>{playersHere.subtitle}</Text>
+          <Text style={[styles.playersHereHint, { color: playersHereTone.subtitle }]}>
+            Based on active check-ins · updates when players check in or leave
+          </Text>
+        </View>
+
         <Pressable
           onPress={onToggleCheckin}
-          disabled={checkinBusy}
+          disabled={checkinBusy || isOffline}
           style={({ pressed }) => [
-            styles.checkinCard,
+            styles.checkinCardCompact,
             {
               backgroundColor: isCheckedIn ? '#0F6E56' : cardBg,
               borderColor: isCheckedIn ? '#0F6E56' : cardBorder,
-              opacity: pressed ? 0.88 : 1,
+              opacity: isOffline ? 0.55 : pressed ? 0.88 : 1,
             },
             cardShadow,
           ]}>
@@ -524,146 +1130,479 @@ export default function CourtDetailScreen() {
             <ActivityIndicator color={isCheckedIn ? '#fff' : '#1D9E75'} />
           ) : (
             <>
-              <View style={styles.checkinLeft}>
+              <View style={styles.checkinLeftCompact}>
                 <MaterialIcons
                   name={isCheckedIn ? 'sports' : 'login'}
                   size={24}
                   color={isCheckedIn ? '#fff' : '#1D9E75'}
                 />
-                <View>
-                  <Text style={[styles.checkinTitle, { color: isCheckedIn ? '#fff' : theme.text }]}>
+                <View style={styles.checkinTextCol}>
+                  <Text style={[styles.checkinTitleCompact, { color: isCheckedIn ? '#fff' : theme.text }]}>
                     {isCheckedIn ? 'Checked in — tap to leave' : 'Check in'}
                   </Text>
-                  <Text style={[styles.checkinSub, { color: isCheckedIn ? 'rgba(255,255,255,0.75)' : muted }]}>
-                    {checkinCount > 0 ? `${checkinCount} player${checkinCount !== 1 ? 's' : ''} here now` : 'Be the first to check in'}
+                  <Text style={[styles.checkinSubCompact, { color: isCheckedIn ? 'rgba(255,255,255,0.75)' : muted }]}>
+                    {isCheckedIn
+                      ? 'You are included in the player count above.'
+                      : 'Tap when you arrive — you are counted toward the crowd level.'}
                   </Text>
                 </View>
               </View>
-              {!isCheckedIn && !withinRadius && (
-                <Text style={[styles.checkinHint, { color: muted }]}>Must be at court</Text>
-              )}
+              {!isCheckedIn && !withinRadius ? (
+                <Text style={[styles.checkinHintCompact, { color: muted }]}>Must be at court</Text>
+              ) : null}
             </>
           )}
         </Pressable>
 
-        <View style={[styles.sectionCard, { backgroundColor: cardBg, borderColor: cardBorder }, cardShadow]}>
-          <Text style={[styles.sectionHeading, { color: isDark ? '#E2E8F0' : '#0F172A' }]}>Details</Text>
-          <View style={styles.grid}>
-            <InfoTile label="Courts" value={String(court.courtCount)} isDark={isDark} />
-            <InfoTile label="Surface" value={court.surfaceType?.trim() ? court.surfaceType.charAt(0).toUpperCase() + court.surfaceType.slice(1) : '—'} isDark={isDark} />
-            <InfoTile label="Venue" value={court.indoorOutdoor?.trim() ? court.indoorOutdoor : '—'} isDark={isDark} />
-            <InfoTile label="Fee" value={court.fee?.trim() ? court.fee.charAt(0).toUpperCase() + court.fee.slice(1) : '—'} isDark={isDark} />
+        {courtZones.length > 0 ? (
+          <View style={styles.zoneSectionWrap}>
+            <Text style={[styles.zoneSectionHint, { color: muted }]}>
+              {`Optional · Open or Busy per court (${court.courtCount} ${court.courtCount === 1 ? 'court' : 'courts'} here)`}
+            </Text>
+            {!isOffline && !withinRadius && distanceKmUser != null ? (
+              <Text style={[styles.zoneSectionProximityHint, { color: muted }]}>
+                Open/Busy buttons activate within {Math.round(REPORTING_RADIUS_KM * 1000)} m of this venue.
+              </Text>
+            ) : null}
+            {courtZones.map((z) => {
+              const rep = zoneReportsByZone.get(z.id)
+              const highlightOpen = rep?.status === 'open'
+              const highlightBusy = rep?.status === 'busy'
+              const openSubmitting =
+                zoneReportBusy?.zoneId === z.id && zoneReportBusy?.status === 'open'
+              const busySubmitting =
+                zoneReportBusy?.zoneId === z.id && zoneReportBusy?.status === 'busy'
+              const zoneActionsDisabled = isOffline || !withinRadius
+              return (
+                <View
+                  key={z.id}
+                  style={[styles.zoneRowCompact, { backgroundColor: cardBg, borderColor: cardBorder }, cardShadow]}>
+                  <Text style={[styles.zoneNameCompact, { color: theme.text }]} numberOfLines={1}>
+                    {z.zone_name}
+                  </Text>
+                  <View style={styles.zoneTogglePair}>
+                    <Pressable
+                      disabled={zoneActionsDisabled || openSubmitting}
+                      onPress={() => void onZoneReport(z.id, 'open')}
+                      accessibilityLabel={`Report ${z.zone_name} as open`}
+                      accessibilityState={{ selected: highlightOpen, disabled: zoneActionsDisabled || openSubmitting }}
+                      style={({ pressed }) => [
+                        styles.zoneToggleBtn,
+                        highlightOpen ? styles.zoneToggleOpenOn : styles.zoneToggleNeutral,
+                        {
+                          borderColor: highlightOpen
+                            ? 'transparent'
+                            : isDark
+                              ? 'rgba(148,163,184,0.35)'
+                              : 'rgba(100,116,139,0.35)',
+                          opacity: zoneActionsDisabled ? 0.72 : pressed ? 0.88 : 1,
+                        },
+                      ]}>
+                      {openSubmitting ? (
+                        <ActivityIndicator size="small" color={highlightOpen ? '#166534' : muted} />
+                      ) : (
+                        <Text
+                          style={[
+                            styles.zoneToggleBtnText,
+                            highlightOpen ? styles.zoneToggleOpenOnText : { color: subtle },
+                          ]}>
+                          Open
+                        </Text>
+                      )}
+                    </Pressable>
+                    <Pressable
+                      disabled={zoneActionsDisabled || busySubmitting}
+                      onPress={() => void onZoneReport(z.id, 'busy')}
+                      accessibilityLabel={`Report ${z.zone_name} as busy`}
+                      accessibilityState={{ selected: highlightBusy, disabled: zoneActionsDisabled || busySubmitting }}
+                      style={({ pressed }) => [
+                        styles.zoneToggleBtn,
+                        highlightBusy ? styles.zoneToggleBusyOn : styles.zoneToggleNeutral,
+                        {
+                          borderColor: highlightBusy
+                            ? 'transparent'
+                            : isDark
+                              ? 'rgba(148,163,184,0.35)'
+                              : 'rgba(100,116,139,0.35)',
+                          opacity: zoneActionsDisabled ? 0.72 : pressed ? 0.88 : 1,
+                        },
+                      ]}>
+                      {busySubmitting ? (
+                        <ActivityIndicator size="small" color={highlightBusy ? '#B45309' : muted} />
+                      ) : (
+                        <Text
+                          style={[
+                            styles.zoneToggleBtnText,
+                            highlightBusy ? styles.zoneToggleBusyOnText : { color: subtle },
+                          ]}>
+                          Busy
+                        </Text>
+                      )}
+                    </Pressable>
+                  </View>
+                </View>
+              )
+            })}
           </View>
-        </View>
+        ) : null}
 
-        {amenityList.length > 0 ? (
-          <View style={[styles.sectionCard, { backgroundColor: cardBg, borderColor: cardBorder }, cardShadow]}>
-            <Text style={[styles.sectionHeading, { color: isDark ? '#E2E8F0' : '#0F172A' }]}>Amenities</Text>
-            <View style={styles.amenityRow}>
-              {amenityList.map((c) => <AmenityChip key={c.key} icon={c.icon} label={c.label} isDark={isDark} />)}
+        {!withinRadius && distanceKmUser != null ? (
+          <View style={[styles.proxBanner, { backgroundColor: isDark ? 'rgba(245,158,11,0.12)' : '#FFFBEB', borderColor: isDark ? 'rgba(245,158,11,0.35)' : '#FDE68A' }]}>
+            <MaterialIcons name="info-outline" size={20} color="#D97706" />
+            <Text style={[styles.proxBannerText, { color: isDark ? '#FCD34D' : '#92400E' }]}>
+              You are {formatDistanceDetail(distanceKmUser)} Move within {Math.round(REPORTING_RADIUS_KM * 1000)} m to check in or report zones.
+            </Text>
+          </View>
+        ) : null}
+
+        <Pressable
+          onPress={toggleMoreInfo}
+          style={({ pressed }) => [styles.moreInfoToggle, { opacity: pressed ? 0.82 : 1 }]}
+          accessibilityRole="button"
+          accessibilityLabel={moreInfoExpanded ? 'Collapse more court information' : 'Expand more court information'}
+          accessibilityState={{ expanded: moreInfoExpanded }}>
+          <Text style={styles.moreInfoToggleText}>More Info</Text>
+          <MaterialIcons
+            name={moreInfoExpanded ? 'expand-less' : 'expand-more'}
+            size={22}
+            color="#1D9E75"
+          />
+        </Pressable>
+
+        {moreInfoExpanded ? (
+          <View style={styles.moreInfoPanel}>
+            <View style={[styles.sectionCard, { backgroundColor: cardBg, borderColor: cardBorder }, cardShadow]}>
+              <View style={styles.moreInfoRatingHero}>
+                <Text style={[styles.moreInfoAvgRating, { color: isDark ? '#F8FAFC' : '#0F172A' }]}>
+                  {court.rating != null ? court.rating.toFixed(1) : '—'}
+                </Text>
+                <Text style={[styles.moreInfoStarGlyph, { color: '#F59E0B' }]}>★</Text>
+              </View>
+              <Text style={[styles.moreInfoReviewTotal, { color: muted }]}>
+                {reviewsTotal} review{reviewsTotal !== 1 ? 's' : ''}
+              </Text>
+              {reviewsLoading ? (
+                <ActivityIndicator size="small" color={theme.tint} style={{ marginVertical: 12 }} />
+              ) : recentWrittenReviews.length === 0 ? (
+                <Text style={[styles.moreInfoWrittenEmpty, { color: muted }]}>No written reviews yet.</Text>
+              ) : (
+                <View style={styles.moreInfoWrittenList}>
+                  {recentWrittenReviews.map((r, index) => {
+                    const isMine = viewerUserId != null && r.user_id === viewerUserId
+                    const isLast = index === recentWrittenReviews.length - 1
+                    return (
+                      <View
+                        key={r.id}
+                        style={[
+                          styles.moreInfoWrittenRow,
+                          { borderColor: cardBorder, borderBottomWidth: isLast ? 0 : StyleSheet.hairlineWidth },
+                        ]}>
+                        <View style={styles.reviewHeadingRow}>
+                          <Text style={[styles.reviewName, { color: isDark ? '#F8FAFC' : '#0F172A' }]} numberOfLines={1}>
+                            {r.display_name}
+                          </Text>
+                          {isMine ? (
+                            <View style={styles.reviewMineActions}>
+                              <Pressable onPress={openReviewComposer} hitSlop={8} accessibilityLabel="Edit your review">
+                                <Text style={styles.reviewEditText}>Edit</Text>
+                              </Pressable>
+                              <Pressable
+                                onPress={() => requestDeleteReview(r)}
+                                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                                accessibilityLabel="Delete your review">
+                                <MaterialIcons name="delete-outline" size={20} color="#E24B4A" />
+                              </Pressable>
+                            </View>
+                          ) : null}
+                        </View>
+                        <StarRow rating={r.rating} filledColor="#F59E0B" emptyColor={isDark ? '#334155' : '#E2E8F0'} compact />
+                        <Text style={[styles.reviewBody, { color: isDark ? '#CBD5E1' : '#475569' }]}>{r.review_text.trim()}</Text>
+                      </View>
+                    )
+                  })}
+                </View>
+              )}
+              <View style={styles.moreInfoReviewCtas}>
+                {viewerUserId != null && !reviewsPreview.some((r) => r.user_id === viewerUserId) ? (
+                  <Pressable
+                    onPress={openReviewComposer}
+                    style={({ pressed }) => [
+                      styles.reviewsPrimaryBtn,
+                      { backgroundColor: '#1D9E75', opacity: pressed ? 0.88 : 1 },
+                    ]}>
+                    <Text style={styles.reviewsPrimaryBtnText}>Write a review</Text>
+                  </Pressable>
+                ) : null}
+                {reviewsTotal > 0 ? (
+                  <Pressable
+                    onPress={() => router.push(`/court/reviews/${encodeURIComponent(courtId)}`)}
+                    style={({ pressed }) => [{ opacity: pressed ? 0.75 : 1 }]}>
+                    <Text style={styles.moreInfoSeeAllLink}>See all reviews</Text>
+                  </Pressable>
+                ) : null}
+              </View>
+            </View>
+
+            <View style={[styles.sectionCard, { backgroundColor: cardBg, borderColor: cardBorder, marginTop: 0 }, cardShadow]}>
+              {photosLoading ? (
+                <ActivityIndicator size="small" color={theme.tint} style={{ alignSelf: 'center', marginBottom: 10 }} />
+              ) : null}
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.photoStripMoreInfo}>
+                <Pressable
+                  onPress={onAddPhoto}
+                  disabled={photoUploading}
+                  style={({ pressed }) => [
+                    styles.moreInfoAddPhotoChip,
+                    { borderColor: cardBorder, backgroundColor: isDark ? '#1f1f22' : '#F0FAF6', opacity: photoUploading ? 0.6 : pressed ? 0.88 : 1 },
+                  ]}>
+                  {photoUploading ? (
+                    <ActivityIndicator size="small" color="#1D9E75" />
+                  ) : (
+                    <>
+                      <MaterialIcons name="add-photo-alternate" size={20} color="#1D9E75" />
+                      <Text style={styles.moreInfoAddPhotoChipText}>Add Photo</Text>
+                    </>
+                  )}
+                </Pressable>
+                {photos.map((photo) => {
+                  const isMine = viewerUserId != null && photo.user_id === viewerUserId
+                  const deleting = photoDeletingId === photo.id
+                  return (
+                    <View key={photo.id} style={styles.photoCard}>
+                      <Pressable onPress={() => setSelectedPhotoUrl(photo.photo_url)} disabled={deleting}>
+                        <Image source={{ uri: photo.photo_url }} style={styles.photoImage} />
+                      </Pressable>
+                      {isMine ? (
+                        <Pressable
+                          accessibilityLabel="Delete photo"
+                          onPress={() => deleteCourtPhoto(photo)}
+                          disabled={deleting || photoUploading}
+                          style={({ pressed }) => [
+                            styles.photoDeleteBtn,
+                            { opacity: deleting || photoUploading ? 0.45 : pressed ? 0.82 : 1 },
+                          ]}
+                          hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}>
+                          {deleting ? (
+                            <ActivityIndicator size="small" color="#FFFFFF" />
+                          ) : (
+                            <MaterialIcons name="delete-outline" size={18} color="#FFFFFF" />
+                          )}
+                        </Pressable>
+                      ) : null}
+                      <Text style={[styles.photoMetaName, { color: isDark ? '#E2E8F0' : '#0F172A' }]} numberOfLines={1}>
+                        {photo.uploader_name}
+                      </Text>
+                      <Text style={[styles.photoMetaTime, { color: muted }]}>{timeAgo(photo.created_at)}</Text>
+                    </View>
+                  )
+                })}
+              </ScrollView>
+              <View style={styles.photoActionsRowBelow}>
+                <Pressable
+                  onPress={onTakePhoto}
+                  disabled={photoUploading}
+                  style={({ pressed }) => [
+                    styles.photoActionBtn,
+                    { backgroundColor: '#0EA5E9', opacity: photoUploading ? 0.65 : pressed ? 0.85 : 1 },
+                  ]}>
+                  {photoUploading ? <ActivityIndicator size="small" color="#FFFFFF" /> : (
+                    <>
+                      <MaterialIcons name="photo-camera" size={15} color="#FFFFFF" />
+                      <Text style={styles.photoActionBtnText}>Take Photo</Text>
+                    </>
+                  )}
+                </Pressable>
+              </View>
+              {!photosLoading && photos.length === 0 ? (
+                <Text style={[styles.photoPlaceholderText, { color: muted, marginTop: 8 }]}>
+                  No photos yet — be the first to add one
+                </Text>
+              ) : null}
+            </View>
+
+            {court != null && courtHasOutdoorVenue(court.indoorOutdoor) ? (
+              <View style={[styles.moreInfoWeatherSlim, { backgroundColor: cardBg, borderColor: cardBorder }, cardShadow]}>
+                {outdoorWeather.loading && outdoorWeather.data == null ? (
+                  <View style={styles.moreInfoWeatherSlimInner}>
+                    <ActivityIndicator size="small" color={theme.tint} />
+                    <Text style={[styles.moreInfoWeatherMuted, { color: muted }]}>Weather…</Text>
+                  </View>
+                ) : outdoorWeather.error != null && outdoorWeather.data == null ? (
+                  <Text style={[styles.moreInfoWeatherMuted, { color: muted }]} numberOfLines={1}>
+                    {outdoorWeather.error}
+                  </Text>
+                ) : outdoorWeather.data != null ? (
+                  <View style={styles.moreInfoWeatherSlimInner}>
+                    <Text style={styles.moreInfoWeatherEmoji} accessibilityLabel={weatherShortLabel(outdoorWeather.data.weatherCode)}>
+                      {weatherEmoji(outdoorWeather.data.windMph, outdoorWeather.data.weatherCode)}
+                    </Text>
+                    <Text style={[styles.moreInfoWeatherTemp, { color: isDark ? '#F8FAFC' : '#0F172A' }]}>
+                      {Math.round(outdoorWeather.data.temperatureF)}°
+                    </Text>
+                    <Text style={[styles.moreInfoWeatherWord, { color: subtle }]} numberOfLines={1}>
+                      {(() => {
+                        const label = weatherShortLabel(outdoorWeather.data.weatherCode)
+                        const sp = label.indexOf(' ')
+                        return sp === -1 ? label : label.slice(0, sp)
+                      })()}
+                    </Text>
+                    <Text style={[styles.moreInfoWeatherWind, { color: muted }]}>{Math.round(outdoorWeather.data.windMph)} mph</Text>
+                  </View>
+                ) : null}
+              </View>
+            ) : null}
+
+            <View style={[styles.moreInfoHoursCard, { backgroundColor: cardBg, borderColor: cardBorder }, cardShadow]}>
+              <View style={styles.moreInfoHoursHeading}>
+                <MaterialIcons name="schedule" size={18} color={subtle} />
+                <Text style={[styles.moreInfoHoursTitle, { color: isDark ? '#F8FAFC' : '#0F172A' }]}>Hours</Text>
+              </View>
+              <Text style={[styles.moreInfoHoursBody, { color: isDark ? '#CBD5E1' : '#334155' }]}>
+                {court.hours?.trim() ? court.hours.trim() : 'Hours not listed'}
+              </Text>
             </View>
           </View>
         ) : null}
 
-        <View style={[styles.sectionCard, { backgroundColor: cardBg, borderColor: cardBorder }, cardShadow]}>
-          <Text style={[styles.sectionHeading, { color: isDark ? '#E2E8F0' : '#0F172A' }]}>Hours</Text>
-          {hoursLines.length > 0 ? (
-            <View style={styles.hoursList}>
-              {hoursLines.map((line, i) => (
-                <View key={i} style={[styles.hoursItem, i > 0 && { borderTopColor: cardBorder, borderTopWidth: StyleSheet.hairlineWidth }]}>
-                  <View style={[styles.hoursBullet, { backgroundColor: '#0EA5E9' }]} />
-                  <Text style={[styles.hoursLine, { color: isDark ? '#CBD5E1' : '#334155' }]}>{line}</Text>
-                </View>
-              ))}
-            </View>
-          ) : (
-            <Text style={[styles.hoursEmpty, { color: muted }]}>Hours not listed</Text>
-          )}
-        </View>
-
-        <Pressable
-          onPress={() => openMapsDirections(court.latitude, court.longitude)}
-          style={({ pressed }) => [styles.directionsCta, { backgroundColor: '#0F172A', opacity: pressed ? 0.9 : 1 }, cardShadow]}>
-          <MaterialIcons name="directions" size={22} color="#FFFFFF" />
-          <Text style={styles.directionsCtaText}>Directions</Text>
-        </Pressable>
-
-        <Text style={[styles.availSectionTitle, { color: isDark ? '#F1F5F9' : '#0F172A' }]}>Live availability</Text>
-        <Text style={[styles.availSectionSub, { color: muted }]}>
-          Per court · reporting enabled within {Math.round(REPORTING_RADIUS_KM * 1000)} m
-        </Text>
-
-        {!withinRadius && distanceKmUser != null && (
-          <View style={[styles.proxBanner, { backgroundColor: isDark ? 'rgba(245,158,11,0.12)' : '#FFFBEB', borderColor: isDark ? 'rgba(245,158,11,0.35)' : '#FDE68A' }]}>
-            <MaterialIcons name="info-outline" size={20} color="#D97706" />
-            <Text style={[styles.proxBannerText, { color: isDark ? '#FCD34D' : '#92400E' }]}>
-              You are {formatDistanceDetail(distanceKmUser)} Move within {Math.round(REPORTING_RADIUS_KM * 1000)} m to update.
-            </Text>
-          </View>
-        )}
-
-        {Array.from({ length: court.courtCount }, (_, i) => i + 1).map((num) => {
-          const current = latest.get(num)
-          return (
-            <View key={num} style={[styles.availCourtCard, { backgroundColor: cardBg, borderColor: cardBorder }, cardShadow]}>
-              <View style={styles.availCourtHeader}>
-                <Text style={[styles.availCourtTitle, { color: isDark ? '#F8FAFC' : '#0F172A' }]}>Court {num}</Text>
-                {current ? (
-                  <Text style={[styles.availCourtSub, { color: muted }]}>
-                    Last: <Text style={{ color: STATUS_PIN_COLOR[current], fontWeight: '700' }}>{current.charAt(0).toUpperCase() + current.slice(1)}</Text>
-                  </Text>
-                ) : (
-                  <Text style={[styles.availCourtSub, { color: muted }]}>No reports yet</Text>
-                )}
-              </View>
-              <View style={styles.availBtnRow}>
-                {(['open', 'busy', 'full'] as const).map((status) => {
-                  const busy = saving?.courtNum === num && saving?.status === status
-                  const disabled = !withinRadius || busy
-                  const bg = status === 'open' ? OPEN_BTN : status === 'busy' ? BUSY_BTN : FULL_BTN
-                  return (
-                    <Pressable
-                      key={status}
-                      disabled={disabled}
-                      onPress={() => onReport(num, status)}
-                      style={({ pressed }) => [styles.availPill, { backgroundColor: bg, opacity: disabled ? 0.36 : pressed ? 0.88 : 1 }]}>
-                      {busy ? <ActivityIndicator color="#fff" size="small" /> : (
-                        <Text style={styles.availPillText}>{status.charAt(0).toUpperCase() + status.slice(1)}</Text>
-                      )}
-                    </Pressable>
-                  )
-                })}
-              </View>
-            </View>
-          )
-        })}
-
-        <View style={{ height: 32 }} />
+        <View style={{ height: 24 }} />
       </ScrollView>
+      </ContentFadeIn>
 
-      <Modal visible={showRatingModal} transparent animationType="fade" onRequestClose={() => setShowRatingModal(false)}>
-        <View style={styles.modalOverlay}>
-          <View style={[styles.modalCard, { backgroundColor: cardBg, borderColor: cardBorder }, cardShadow]}>
-            <Text style={[styles.modalTitle, { color: isDark ? '#F8FAFC' : '#0F172A' }]}>How was {court.name}?</Text>
-            <Text style={[styles.modalSub, { color: muted }]}>Tap a star to rate this court</Text>
-            <View style={styles.modalStarRow}>
-              {[1, 2, 3, 4, 5].map((star) => (
-                <Pressable key={star} onPress={() => setPendingRating(star)} hitSlop={8}>
-                  <Text style={[styles.modalStar, { color: star <= pendingRating ? '#F59E0B' : isDark ? '#334155' : '#E2E8F0' }]}>★</Text>
-                </Pressable>
-              ))}
-            </View>
+      <Modal visible={selectedPhotoUrl != null} transparent animationType="fade" onRequestClose={() => setSelectedPhotoUrl(null)}>
+        <View style={styles.photoModalOverlay}>
+          {selectedPhotoUrl ? (
+            <Image
+              source={{ uri: selectedPhotoUrl }}
+              style={{
+                width: Math.max(0, windowW - 32),
+                height: Math.max(240, Math.round(windowH * 0.74)),
+              }}
+              resizeMode="contain"
+            />
+          ) : null}
+          {fullscreenPhoto != null && viewerUserId === fullscreenPhoto.user_id ? (
             <Pressable
-              onPress={() => submitRating(pendingRating)}
-              disabled={pendingRating === 0 || ratingBusy}
-              style={({ pressed }) => [styles.modalSubmitBtn, { opacity: pendingRating === 0 || ratingBusy ? 0.4 : pressed ? 0.85 : 1 }]}>
-              {ratingBusy ? <ActivityIndicator color="#fff" /> : <Text style={styles.modalSubmitText}>Submit Rating</Text>}
+              accessibilityLabel="Delete photo"
+              onPress={() => deleteCourtPhoto(fullscreenPhoto)}
+              disabled={photoDeletingId === fullscreenPhoto.id}
+              style={({ pressed }) => [
+                styles.photoModalDelete,
+                { opacity: photoDeletingId === fullscreenPhoto.id ? 0.45 : pressed ? 0.82 : 1 },
+              ]}>
+              {photoDeletingId === fullscreenPhoto.id ? (
+                <ActivityIndicator size="small" color="#FFFFFF" />
+              ) : (
+                <MaterialIcons name="delete-outline" size={24} color="#FFFFFF" />
+              )}
             </Pressable>
-            <Pressable onPress={() => setShowRatingModal(false)} style={({ pressed }) => ({ opacity: pressed ? 0.6 : 1 })}>
-              <Text style={[styles.modalSkip, { color: muted }]}>Skip</Text>
-            </Pressable>
-          </View>
+          ) : null}
+          <Pressable onPress={() => setSelectedPhotoUrl(null)} style={styles.photoModalClose}>
+            <MaterialIcons name="close" size={24} color="#FFFFFF" />
+          </Pressable>
         </View>
+      </Modal>
+
+      <Modal
+        visible={showRatingModal}
+        transparent
+        animationType="fade"
+        onRequestClose={() => {
+          setShowRatingModal(false)
+          setCheckoutReviewText('')
+        }}>
+        <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.modalKeyboardRoot}>
+          <View style={styles.modalCenterWrap}>
+            <Pressable
+              style={styles.modalBackdrop}
+              accessibilityLabel="Dismiss"
+              onPress={() => {
+                setShowRatingModal(false)
+                setCheckoutReviewText('')
+              }}
+            />
+            <View style={[styles.modalCardCompact, { backgroundColor: cardBg, borderColor: cardBorder }, cardShadow]}>
+              <Text style={[styles.modalTitleCompact, styles.modalCheckoutHeaderText, { color: isDark ? '#F8FAFC' : '#0F172A' }]}>
+                How was {court.name}?
+              </Text>
+              <Text style={[styles.modalSubCompact, styles.modalCheckoutHeaderText, { color: muted }]}>Tap a star to rate this court</Text>
+              <View style={styles.modalStarRowCompact}>
+                {[1, 2, 3, 4, 5].map((star) => (
+                  <Pressable key={star} onPress={() => setPendingRating(star)} hitSlop={8}>
+                    <Text style={[styles.modalStarCompact, { color: star <= pendingRating ? '#F59E0B' : isDark ? '#334155' : '#E2E8F0' }]}>★</Text>
+                  </Pressable>
+                ))}
+              </View>
+              <Text style={[styles.modalSubCompact, styles.modalCheckoutHeaderText, { color: muted, marginBottom: 8 }]}>
+                Add notes (optional)
+              </Text>
+              <TextInput
+                value={checkoutReviewText}
+                onChangeText={setCheckoutReviewText}
+                placeholder="Surface, nets, busy?"
+                placeholderTextColor={muted}
+                multiline
+                style={[styles.reviewComposerInputCompact, { color: isDark ? '#F8FAFC' : '#0F172A', borderColor: cardBorder }]}
+              />
+              <Pressable
+                onPress={() => submitRating(pendingRating)}
+                disabled={pendingRating === 0 || ratingBusy}
+                style={({ pressed }) => [styles.modalSubmitBtnCompact, { opacity: pendingRating === 0 || ratingBusy ? 0.4 : pressed ? 0.85 : 1 }]}>
+                {ratingBusy ? <ActivityIndicator color="#fff" /> : <Text style={styles.modalSubmitTextCompact}>Submit rating</Text>}
+              </Pressable>
+              <Pressable
+                onPress={() => {
+                  setShowRatingModal(false)
+                  setCheckoutReviewText('')
+                }}
+                style={({ pressed }) => ({ opacity: pressed ? 0.6 : 1 })}>
+                <Text style={[styles.modalSkipCompact, { color: muted }]}>Skip</Text>
+              </Pressable>
+            </View>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
+
+      <Modal visible={showReviewComposer} transparent animationType="fade" onRequestClose={() => setShowReviewComposer(false)}>
+        <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.modalKeyboardRoot}>
+          <View style={styles.modalCenterWrap}>
+            <Pressable style={styles.modalBackdrop} accessibilityLabel="Dismiss" onPress={() => setShowReviewComposer(false)} />
+            <View style={[styles.modalCardCompact, styles.modalCardReviewOnly, { backgroundColor: cardBg, borderColor: cardBorder }, cardShadow]}>
+              <View style={styles.modalReviewHeader}>
+                <Text style={[styles.modalTitleCompact, { color: isDark ? '#F8FAFC' : '#0F172A', flex: 1, marginBottom: 0 }]}>
+                  {reviewsPreview.some((r) => viewerUserId != null && r.user_id === viewerUserId) ? 'Your review' : 'Write a review'}
+                </Text>
+                <Pressable hitSlop={10} accessibilityLabel="Close" onPress={() => setShowReviewComposer(false)}>
+                  <MaterialIcons name="close" size={22} color={muted} />
+                </Pressable>
+              </View>
+              <Text style={[styles.modalSubCompact, { color: muted }]}>Stars + optional notes</Text>
+              <View style={styles.modalStarRowCompact}>
+                {[1, 2, 3, 4, 5].map((star) => (
+                  <Pressable key={star} onPress={() => setComposerRating(star)} hitSlop={8}>
+                    <Text style={[styles.modalStarCompact, { color: star <= composerRating ? '#F59E0B' : isDark ? '#334155' : '#E2E8F0' }]}>★</Text>
+                  </Pressable>
+                ))}
+              </View>
+              <TextInput
+                value={composerText}
+                onChangeText={setComposerText}
+                placeholder="Parking, restrooms, nets..."
+                placeholderTextColor={muted}
+                multiline
+                style={[styles.reviewComposerInputCompactTall, { color: isDark ? '#F8FAFC' : '#0F172A', borderColor: cardBorder }]}
+              />
+              <Pressable
+                onPress={() => void submitComposer()}
+                disabled={composerBusy}
+                style={({ pressed }) => [styles.modalSubmitBtnCompact, { opacity: composerBusy ? 0.5 : pressed ? 0.88 : 1 }]}>
+                {composerBusy ? <ActivityIndicator color="#fff" /> : <Text style={styles.modalSubmitTextCompact}>Save</Text>}
+              </Pressable>
+              <Pressable onPress={() => setShowReviewComposer(false)} style={({ pressed }) => ({ opacity: pressed ? 0.6 : 1 })}>
+                <Text style={[styles.modalSkipCompact, { color: muted }]}>Cancel</Text>
+              </Pressable>
+            </View>
+          </View>
+        </KeyboardAvoidingView>
       </Modal>
     </View>
   )
@@ -676,61 +1615,314 @@ const styles = StyleSheet.create({
   primaryGhostBtnText: { fontWeight: '700', fontSize: 15 },
   topBar: { paddingHorizontal: 16, paddingBottom: 4, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   backFab: { width: 44, height: 44, borderRadius: 14, alignItems: 'center', justifyContent: 'center', borderWidth: StyleSheet.hairlineWidth },
-  scrollContent: { paddingHorizontal: 18, paddingBottom: 24 },
-  heroCard: { borderRadius: 22, borderWidth: StyleSheet.hairlineWidth, padding: 22, marginBottom: 14 },
-  heroTitleRow: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12 },
-  heroTitle: { flex: 1, fontSize: 28, fontWeight: '700', letterSpacing: -0.6, lineHeight: 34 },
-  statusBadge: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 12, paddingVertical: 7, borderRadius: 999 },
-  statusDot: { width: 8, height: 8, borderRadius: 4 },
-  statusBadgeText: { fontSize: 13, fontWeight: '700', letterSpacing: 0.2 },
-  distanceRatingRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 18, paddingRight: 2 },
-  distanceBlock: { flexDirection: 'row', alignItems: 'center', gap: 8, flex: 1 },
-  distanceText: { fontSize: 16, fontWeight: '600' },
-  starRow: { flexDirection: 'row', alignItems: 'center', gap: 2 },
+  scrollContent: { paddingHorizontal: 16, paddingBottom: 20 },
+  heroCard: {
+    borderRadius: 16,
+    borderWidth: StyleSheet.hairlineWidth,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    marginBottom: 10,
+  },
+  heroTitleFull: {
+    alignSelf: 'stretch',
+    width: '100%',
+    fontSize: 24,
+    fontWeight: '700',
+    letterSpacing: -0.6,
+    lineHeight: 28,
+    marginBottom: 4,
+  },
+  /** Status · distance · rating — single line, small type */
+  heroMetaRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'nowrap',
+    marginTop: 2,
+    gap: 5,
+  },
+  heroMetaDot: { fontSize: 11, fontWeight: '700', marginTop: 1 },
+  heroMetaDistance: { fontSize: 12, fontWeight: '600', flexShrink: 1, minWidth: 0 },
+  heroNoRating: { fontSize: 12, fontWeight: '500', flexShrink: 0 },
+  heroCardDivider: {
+    alignSelf: 'stretch',
+    height: StyleSheet.hairlineWidth,
+    marginTop: 8,
+    marginBottom: 8,
+  },
+  heroCourtsDirectionsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+  },
+  heroCourtCountPillOutline: {
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+    borderRadius: 999,
+    borderWidth: StyleSheet.hairlineWidth,
+    flexShrink: 0,
+  },
+  heroCourtCountPillText: { fontSize: 11, fontWeight: '600', letterSpacing: 0.15 },
+  directionsChipCompact: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: '#0F172A',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    flexShrink: 0,
+  },
+  directionsChipTextCompact: { color: '#FFFFFF', fontSize: 11, fontWeight: '700' },
+  statusBadge: { flexDirection: 'row', alignItems: 'center', borderRadius: 999 },
+  statusBadgeHero: {
+    gap: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    flexShrink: 0,
+  },
+  statusDot: { width: 7, height: 7, borderRadius: 4 },
+  statusDotHero: { width: 6, height: 6, borderRadius: 3 },
+  statusBadgeText: { fontWeight: '700', letterSpacing: 0.15 },
+  statusBadgeTextHero: { fontSize: 11 },
+  starRow: { flexDirection: 'row', alignItems: 'center', gap: 1 },
+  starRowCompact: { flexShrink: 0, gap: 0 },
+  starRowTiny: { flexShrink: 0 },
   starGlyph: { fontSize: 18, lineHeight: 22 },
-  ratingNum: { marginLeft: 6, fontSize: 15, fontWeight: '700' },
-  noRating: { fontSize: 14, fontWeight: '500' },
-  addressRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 8, marginTop: 18, paddingTop: 16, borderTopWidth: StyleSheet.hairlineWidth },
-  addressText: { flex: 1, fontSize: 15, lineHeight: 22 },
-  checkinCard: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', borderRadius: 16, borderWidth: StyleSheet.hairlineWidth, padding: 16, marginBottom: 14 },
-  checkinLeft: { flexDirection: 'row', alignItems: 'center', gap: 12 },
-  checkinTitle: { fontSize: 15, fontWeight: '700' },
-  checkinSub: { fontSize: 13, marginTop: 2 },
-  checkinHint: { fontSize: 11 },
+  starGlyphCompact: { fontSize: 13, lineHeight: 16 },
+  starGlyphTiny: { fontSize: 11, lineHeight: 13 },
+  ratingNum: { marginLeft: 4, fontSize: 15, fontWeight: '700' },
+  ratingNumCompact: { marginLeft: 3, fontSize: 12, fontWeight: '700' },
+  ratingNumTiny: { marginLeft: 3, fontSize: 11, fontWeight: '700' },
+  moreInfoToggle: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    paddingVertical: 10,
+    marginTop: 4,
+    marginBottom: 2,
+  },
+  moreInfoToggleText: { fontSize: 15, fontWeight: '700', color: '#1D9E75' },
+  moreInfoPanel: { gap: 12 },
+  moreInfoRatingHero: { flexDirection: 'row', alignItems: 'flex-end', justifyContent: 'center', gap: 4, marginBottom: 6 },
+  moreInfoAvgRating: { fontSize: 42, fontWeight: '800', letterSpacing: -1.2, lineHeight: 46 },
+  moreInfoStarGlyph: { fontSize: 26, lineHeight: 32, paddingBottom: 2 },
+  moreInfoReviewTotal: { fontSize: 14, fontWeight: '600', textAlign: 'center', marginBottom: 14 },
+  moreInfoWrittenEmpty: { textAlign: 'center', paddingVertical: 6, marginBottom: 10, fontSize: 14 },
+  moreInfoWrittenList: { gap: 0 },
+  moreInfoWrittenRow: { paddingVertical: 12, borderBottomWidth: StyleSheet.hairlineWidth },
+  moreInfoReviewCtas: { marginTop: 14, gap: 12, alignSelf: 'stretch', alignItems: 'stretch' },
+  moreInfoSeeAllLink: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#1D9E75',
+    textDecorationLine: 'underline',
+    textAlign: 'center',
+  },
+  photoStripMoreInfo: { gap: 10, paddingVertical: 6, paddingRight: 8, alignItems: 'flex-start', flexGrow: 0 },
+  moreInfoAddPhotoChip: {
+    width: 100,
+    minHeight: 106,
+    borderRadius: 12,
+    borderWidth: StyleSheet.hairlineWidth,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    paddingHorizontal: 8,
+  },
+  moreInfoAddPhotoChipText: { fontSize: 11, fontWeight: '700', color: '#1D9E75', textAlign: 'center' },
+  photoActionsRowBelow: { flexDirection: 'row', gap: 8, marginTop: 10 },
+  moreInfoWeatherSlim: {
+    borderRadius: 12,
+    borderWidth: StyleSheet.hairlineWidth,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+  },
+  moreInfoWeatherSlimInner: { flexDirection: 'row', alignItems: 'center', gap: 10, flexWrap: 'nowrap' },
+  moreInfoWeatherEmoji: { fontSize: 21, lineHeight: 26 },
+  moreInfoWeatherTemp: { fontSize: 18, fontWeight: '700', letterSpacing: -0.3 },
+  moreInfoWeatherWord: { flex: 1, minWidth: 0, fontSize: 14, fontWeight: '600' },
+  moreInfoWeatherWind: { fontSize: 13, fontWeight: '600' },
+  moreInfoWeatherMuted: { fontSize: 13, fontWeight: '500', paddingVertical: 2 },
+  moreInfoHoursCard: {
+    borderRadius: 16,
+    borderWidth: StyleSheet.hairlineWidth,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+  },
+  moreInfoHoursHeading: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 10 },
+  moreInfoHoursTitle: { fontSize: 15, fontWeight: '700' },
+  moreInfoHoursBody: { fontSize: 14, lineHeight: 21, fontWeight: '500' },
+  checkinCardCompact: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    borderRadius: 14,
+    borderWidth: StyleSheet.hairlineWidth,
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+    marginBottom: 10,
+  },
+  checkinLeftCompact: { flexDirection: 'row', alignItems: 'center', gap: 10, flex: 1, minWidth: 0 },
+  checkinTextCol: { flex: 1, minWidth: 0 },
+  checkinTitleCompact: { fontSize: 14, fontWeight: '700' },
+  checkinSubCompact: { fontSize: 12, marginTop: 1 },
+  checkinHintCompact: { fontSize: 10, fontWeight: '600', marginLeft: 6 },
   sectionCard: { borderRadius: 20, borderWidth: StyleSheet.hairlineWidth, padding: 18, marginBottom: 14 },
-  sectionHeading: { fontSize: 12, fontWeight: '700', letterSpacing: 1.2, textTransform: 'uppercase', marginBottom: 14 },
-  grid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 },
-  infoTile: { width: '48%', flexGrow: 1, minWidth: '47%', borderRadius: 14, borderWidth: 1, paddingVertical: 12, paddingHorizontal: 12 },
-  infoTileLabel: { fontSize: 11, fontWeight: '600', letterSpacing: 0.6, textTransform: 'uppercase', marginBottom: 6 },
-  infoTileValue: { fontSize: 16, fontWeight: '600', lineHeight: 21 },
-  amenityRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 },
-  amenityChip: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 8, paddingHorizontal: 12, borderRadius: 999, borderWidth: 1 },
-  amenityChipText: { fontSize: 13, fontWeight: '600' },
-  hoursList: { borderRadius: 14, overflow: 'hidden' },
-  hoursItem: { flexDirection: 'row', alignItems: 'flex-start', gap: 12, paddingVertical: 12, paddingHorizontal: 4 },
-  hoursBullet: { width: 6, height: 6, borderRadius: 3, marginTop: 7 },
-  hoursLine: { flex: 1, fontSize: 15, lineHeight: 22, fontWeight: '500' },
-  hoursEmpty: { fontSize: 15, paddingVertical: 4 },
-  directionsCta: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 10, paddingVertical: 16, borderRadius: 16, marginBottom: 22 },
-  directionsCtaText: { color: '#FFFFFF', fontSize: 17, fontWeight: '700', letterSpacing: 0.2 },
-  availSectionTitle: { fontSize: 20, fontWeight: '700', letterSpacing: -0.3, marginBottom: 4 },
-  availSectionSub: { fontSize: 14, lineHeight: 20, marginBottom: 14 },
-  proxBanner: { flexDirection: 'row', alignItems: 'flex-start', gap: 10, padding: 14, borderRadius: 14, borderWidth: 1, marginBottom: 14 },
-  proxBannerText: { flex: 1, fontSize: 14, lineHeight: 20, fontWeight: '500' },
-  availCourtCard: { borderRadius: 20, borderWidth: StyleSheet.hairlineWidth, padding: 18, marginBottom: 12 },
-  availCourtHeader: { marginBottom: 14 },
-  availCourtTitle: { fontSize: 17, fontWeight: '700' },
-  availCourtSub: { marginTop: 4, fontSize: 14 },
-  availBtnRow: { flexDirection: 'row', gap: 10 },
-  availPill: { flex: 1, paddingVertical: 14, borderRadius: 14, alignItems: 'center', justifyContent: 'center', minHeight: 48 },
-  availPillText: { color: '#FFFFFF', fontSize: 14, fontWeight: '800', letterSpacing: 0.4 },
-  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.55)', justifyContent: 'center', alignItems: 'center', padding: 28 },
-  modalCard: { width: '100%', borderRadius: 24, borderWidth: StyleSheet.hairlineWidth, padding: 28, alignItems: 'center' },
-  modalTitle: { fontSize: 20, fontWeight: '700', letterSpacing: -0.4, textAlign: 'center', marginBottom: 6 },
-  modalSub: { fontSize: 14, textAlign: 'center', marginBottom: 24 },
-  modalStarRow: { flexDirection: 'row', gap: 10, marginBottom: 28 },
-  modalStar: { fontSize: 44 },
-  modalSubmitBtn: { backgroundColor: '#1D9E75', borderRadius: 16, paddingVertical: 16, paddingHorizontal: 40, marginBottom: 14, width: '100%', alignItems: 'center' },
-  modalSubmitText: { color: '#fff', fontSize: 16, fontWeight: '700' },
-  modalSkip: { fontSize: 14, fontWeight: '500', paddingVertical: 4 },
+  photoActionBtn: { flexDirection: 'row', alignItems: 'center', gap: 6, borderRadius: 999, paddingHorizontal: 10, paddingVertical: 8 },
+  photoActionBtnText: { color: '#FFFFFF', fontSize: 12, fontWeight: '700' },
+  photoPlaceholderText: { marginTop: 10, fontSize: 13 },
+  photoCard: { width: 142, position: 'relative' },
+  photoImage: { width: 142, height: 106, borderRadius: 12, backgroundColor: '#0f172a22' },
+  photoDeleteBtn: {
+    position: 'absolute',
+    top: 6,
+    right: 6,
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: 'rgba(15,23,42,0.72)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  photoMetaName: { marginTop: 8, fontSize: 13, fontWeight: '600' },
+  photoMetaTime: { marginTop: 2, fontSize: 12 },
+  availSectionTitle: { fontSize: 18, fontWeight: '700', letterSpacing: -0.3, marginBottom: 2 },
+  availSectionSub: { fontSize: 13, lineHeight: 18, marginBottom: 8 },
+  playersHereCard: {
+    borderRadius: 18,
+    borderWidth: 2,
+    paddingVertical: 20,
+    paddingHorizontal: 18,
+    marginBottom: 12,
+    alignItems: 'center',
+  },
+  playersHereTitle: { fontSize: 26, fontWeight: '800', letterSpacing: -0.6, textAlign: 'center' },
+  playersHereSubtitle: { fontSize: 17, fontWeight: '700', marginTop: 6, textAlign: 'center' },
+  playersHereHint: { fontSize: 12, marginTop: 12, textAlign: 'center', opacity: 0.92 },
+  zoneSectionWrap: { gap: 8, marginTop: 10, marginBottom: 4 },
+  zoneSectionHint: { fontSize: 12, fontWeight: '600', letterSpacing: 0.1 },
+  zoneSectionProximityHint: { fontSize: 11, lineHeight: 15, fontWeight: '500', marginTop: -2, marginBottom: 2 },
+  zoneRowCompact: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    borderRadius: 12,
+    borderWidth: StyleSheet.hairlineWidth,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+  },
+  zoneNameCompact: { flex: 1, minWidth: 0, fontSize: 15, fontWeight: '700', letterSpacing: -0.2 },
+  zoneTogglePair: { flexDirection: 'row', alignItems: 'center', gap: 8, flexShrink: 0 },
+  zoneToggleBtn: {
+    minWidth: 66,
+    paddingVertical: 7,
+    paddingHorizontal: 11,
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  zoneToggleBtnText: { fontSize: 12, fontWeight: '700' },
+  zoneToggleNeutral: {
+    backgroundColor: 'transparent',
+    borderWidth: StyleSheet.hairlineWidth,
+  },
+  zoneToggleOpenOn: {
+    backgroundColor: '#DCFCE7',
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: '#BBF7D0',
+  },
+  zoneToggleBusyOn: {
+    backgroundColor: '#FEF3C7',
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: '#FDE68A',
+  },
+  zoneToggleOpenOnText: { color: '#166534' },
+  zoneToggleBusyOnText: { color: '#B45309' },
+  offlineRealtimeNote: { fontSize: 12, fontWeight: '600', marginBottom: 8 },
+  proxBanner: { flexDirection: 'row', alignItems: 'flex-start', gap: 8, padding: 10, borderRadius: 12, borderWidth: 1, marginBottom: 8 },
+  proxBannerText: { flex: 1, fontSize: 13, lineHeight: 18, fontWeight: '500' },
+  photoModalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.92)', justifyContent: 'center', alignItems: 'center', padding: 16 },
+  photoModalDelete: { position: 'absolute', top: 56, left: 20, width: 40, height: 40, borderRadius: 20, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(127,29,29,0.65)' },
+  photoModalClose: { position: 'absolute', top: 56, right: 20, width: 40, height: 40, borderRadius: 20, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(15,23,42,0.55)' },
+  modalKeyboardRoot: { flex: 1 },
+  modalCheckoutHeaderText: { textAlign: 'center', alignSelf: 'stretch' },
+  modalCenterWrap: { flex: 1, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 28 },
+  modalBackdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.48)' },
+  modalCardCompact: {
+    alignSelf: 'center',
+    width: '100%',
+    maxWidth: 318,
+    borderRadius: 18,
+    borderWidth: StyleSheet.hairlineWidth,
+    paddingHorizontal: 16,
+    paddingVertical: 16,
+    alignItems: 'stretch',
+    zIndex: 1,
+    ...(Platform.OS === 'android' ? { elevation: 14 } : {}),
+  },
+  modalCardReviewOnly: { maxWidth: 300 },
+  modalReviewHeader: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 4 },
+  modalTitleCompact: {
+    fontSize: 17,
+    fontWeight: '700',
+    letterSpacing: -0.35,
+    textAlign: 'left',
+    marginBottom: 4,
+    lineHeight: 22,
+  },
+  modalSubCompact: { fontSize: 13, textAlign: 'left', marginBottom: 12, lineHeight: 18 },
+  modalStarRowCompact: { flexDirection: 'row', gap: 6, marginBottom: 12, justifyContent: 'center' },
+  modalStarCompact: { fontSize: 32, lineHeight: 38 },
+  modalSubmitBtnCompact: {
+    backgroundColor: '#1D9E75',
+    borderRadius: 12,
+    paddingVertical: 12,
+    paddingHorizontal: 24,
+    marginBottom: 10,
+    width: '100%',
+    alignItems: 'center',
+  },
+  modalSubmitTextCompact: { color: '#fff', fontSize: 15, fontWeight: '700' },
+  modalSkipCompact: { fontSize: 13, fontWeight: '500', paddingVertical: 6, alignSelf: 'center' },
+  reviewComposerInputCompact: {
+    alignSelf: 'stretch',
+    minHeight: 64,
+    maxHeight: 92,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderRadius: 11,
+    paddingHorizontal: 11,
+    paddingVertical: 8,
+    fontSize: 15,
+    textAlignVertical: 'top',
+    marginBottom: 12,
+    overflow: 'hidden',
+  },
+  reviewComposerInputCompactTall: {
+    alignSelf: 'stretch',
+    minHeight: 72,
+    maxHeight: 100,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderRadius: 11,
+    paddingHorizontal: 11,
+    paddingVertical: 8,
+    fontSize: 15,
+    textAlignVertical: 'top',
+    marginBottom: 12,
+    overflow: 'hidden',
+  },
+  reviewHeadingRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 4 },
+  reviewMineActions: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+  reviewName: { fontSize: 15, fontWeight: '700', flex: 1, minWidth: 0 },
+  reviewEditText: { fontSize: 14, fontWeight: '700', color: '#0EA5E9' },
+  reviewBody: { fontSize: 14, lineHeight: 20, marginTop: 8 },
+  reviewsPrimaryBtn: {
+    alignSelf: 'stretch',
+    paddingVertical: 11,
+    paddingHorizontal: 16,
+    borderRadius: 12,
+    alignItems: 'center',
+  },
+  reviewsPrimaryBtnText: { fontSize: 14, fontWeight: '700', color: '#fff' },
 })

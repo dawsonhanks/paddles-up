@@ -16,6 +16,7 @@ type PublicProfile = {
   display_name: string | null
   username: string | null
   avatar_url: string | null
+  skill_rating: number | null
   wins: number
   losses: number
 }
@@ -32,7 +33,7 @@ export default function PublicProfileScreen() {
     async function load() {
       const { data: player } = await supabase
         .from('players')
-        .select('user_id, display_name, username, avatar_url')
+        .select('user_id, display_name, username, avatar_url, skill_rating')
         .eq('username', username)
         .maybeSingle()
 
@@ -50,6 +51,7 @@ export default function PublicProfileScreen() {
         display_name: player.display_name,
         username: player.username,
         avatar_url: player.avatar_url,
+        skill_rating: player.skill_rating ?? null,
         wins,
         losses,
       })
@@ -74,7 +76,7 @@ export default function PublicProfileScreen() {
     return (
       <SafeAreaView style={styles.centered} edges={['top', 'bottom']}>
         <Text style={styles.notFoundTitle}>Player not found</Text>
-        <Text style={styles.notFoundSub}>@{username} doesn't exist on Paddles Up yet.</Text>
+        <Text style={styles.notFoundSub}>@{username} doesn&apos;t exist on Paddles Up yet.</Text>
         <Pressable onPress={() => router.back()} style={({ pressed }) => [styles.backBtn, { opacity: pressed ? 0.7 : 1 }]}>
           <Text style={styles.backBtnText}>Go back</Text>
         </Pressable>
@@ -96,13 +98,19 @@ export default function PublicProfileScreen() {
           <Image source={{ uri: profile.avatar_url }} style={styles.avatar} />
         ) : (
           <View style={styles.avatarPlaceholder}>
-            <Text style={styles.avatarEmoji}>🏓</Text>
+            <MaterialIcons name="person" size={46} color="#FFFFFF" />
           </View>
         )}
 
         <Text style={styles.displayName}>{profile.display_name ?? 'Anonymous'}</Text>
         {profile.username ? (
           <Text style={styles.username}>@{profile.username}</Text>
+        ) : null}
+        {profile.skill_rating != null ? (
+          <View style={styles.ratingBadge}>
+            <Image source={require('../../assets/images/icon.png')} style={styles.ratingLogo} />
+            <Text style={styles.ratingBadgeText}>{profile.skill_rating.toFixed(1)}</Text>
+          </View>
         ) : null}
 
         <View style={styles.statsRow}>
@@ -135,9 +143,20 @@ const styles = StyleSheet.create({
   card: { backgroundColor: '#fff', borderRadius: 24, padding: 32, alignItems: 'center', shadowColor: '#0f172a', shadowOffset: { width: 0, height: 8 }, shadowOpacity: 0.07, shadowRadius: 20, elevation: 6 },
   avatar: { width: 100, height: 100, borderRadius: 50, marginBottom: 16 },
   avatarPlaceholder: { width: 100, height: 100, borderRadius: 50, backgroundColor: '#0F6E56', alignItems: 'center', justifyContent: 'center', marginBottom: 16 },
-  avatarEmoji: { fontSize: 44 },
   displayName: { fontSize: 24, fontWeight: '700', color: '#0F172A', marginBottom: 4 },
   username: { fontSize: 15, color: '#64748B', marginBottom: 24 },
+  ratingBadge: {
+    backgroundColor: '#E1F5EE',
+    borderRadius: 14,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    marginBottom: 20,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  ratingBadgeText: { color: '#0F6E56', fontSize: 14, fontWeight: '700' },
+  ratingLogo: { width: 16, height: 16, borderRadius: 4 },
   statsRow: { flexDirection: 'row', alignItems: 'center' },
   statBlock: { alignItems: 'center', paddingHorizontal: 24 },
   statNum: { fontSize: 22, fontWeight: '700' },
