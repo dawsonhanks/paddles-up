@@ -3,7 +3,6 @@ import { StyleSheet, View } from 'react-native'
 import MapView, { Marker } from 'react-native-maps'
 import Svg, { Circle, Path } from 'react-native-svg'
 
-import { checkinCountToPinHex } from '@/lib/checkins'
 import { STATUS_PIN_COLOR, type Court } from '@/lib/courts'
 
 export type CourtMapProps = {
@@ -21,6 +20,7 @@ export type CourtMapProps = {
 }
 
 const NEIGHBORHOOD_DELTA = 0.06
+const MAP_BOTTOM_PADDING_PX = 300
 
 function PickleballFace({ color }: { color: string }) {
   return (
@@ -64,6 +64,7 @@ export function CourtMap({ userLat, userLon, courts, selectedId, onSelectCourt, 
     <MapView
       ref={mapRef}
       style={StyleSheet.absoluteFill}
+      mapPadding={{ top: 0, right: 0, bottom: MAP_BOTTOM_PADDING_PX, left: 0 }}
       initialRegion={{
         latitude: userLat,
         longitude: userLon,
@@ -87,13 +88,7 @@ export function CourtMap({ userLat, userLon, courts, selectedId, onSelectCourt, 
                 styles.dot,
                 selectedId === c.id && styles.dotSelected,
               ]}>
-              <PickleballFace
-                color={
-                  typeof c.liveCheckins === 'number'
-                    ? checkinCountToPinHex(c.liveCheckins)
-                    : STATUS_PIN_COLOR[c.status]
-                }
-              />
+              <PickleballFace color={STATUS_PIN_COLOR[c.status]} />
             </View>
           </View>
         </Marker>

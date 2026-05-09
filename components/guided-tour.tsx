@@ -35,7 +35,7 @@ export const GUIDED_TOUR_STEPS = [
   {
     id: 'tour-map',
     emoji: '🗺️',
-    text: 'Welcome to Paddles Up! This is your local court map — pin colors reflect how many players are checked in nearby',
+    text: 'Welcome to Paddles Up! This is your local court map — pin colors reflect recent availability reports from players at each venue (gray when none)',
   },
   {
     id: 'tour-courts-list',

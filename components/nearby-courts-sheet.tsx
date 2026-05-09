@@ -1,6 +1,7 @@
 import { ContentFadeIn } from '@/components/content-fade-in'
 import { SkeletonCourtSheetRow } from '@/components/skeleton-card'
-import { STATUS_PIN_COLOR, type Court, type CourtStatus } from '@/lib/courts'
+import { courtsAvailableToPinStatus } from '@/lib/availability'
+import { STATUS_PIN_COLOR, type Court } from '@/lib/courts'
 import { formatDistanceMiles } from '@/lib/geo'
 import { MaterialIcons } from '@expo/vector-icons'
 import BottomSheet, { BottomSheetFlatList } from '@gorhom/bottom-sheet'
@@ -43,26 +44,35 @@ const FILTER_OPTIONS: { key: ListFilter; label: string; icon?: 'favorite' }[] = 
   { key: 'indoor', label: 'Indoor' },
 ]
 
-function AvailabilityBadge({ status, isDark }: { status: CourtStatus; isDark: boolean }) {
-  if (status === 'unknown') {
+function CourtsOpenBadge({
+  liveCourtsAvailable,
+  courtCount,
+  isDark,
+}: {
+  liveCourtsAvailable: number | null | undefined
+  courtCount: number
+  isDark: boolean
+}) {
+  const total = Math.max(1, courtCount)
+  const raw =
+    liveCourtsAvailable != null && Number.isFinite(liveCourtsAvailable)
+      ? Math.floor(liveCourtsAvailable)
+      : null
+  if (raw === null) {
     return (
-      <View style={[styles.badgeUnknown, { backgroundColor: isDark ? '#374151' : '#E5E7EB' }]}>
-        <Text style={[styles.badgeUnknownMark, { color: isDark ? '#9CA3AF' : '#6B7280' }]}>?</Text>
+      <View style={[styles.badgeNoReport, { backgroundColor: isDark ? '#374151' : '#E5E7EB' }]}>
+        <Text style={[styles.badgeNoReportText, { color: isDark ? '#9CA3AF' : '#6B7280' }]} numberOfLines={1}>
+          No report
+        </Text>
       </View>
     )
   }
-  const bg = STATUS_PIN_COLOR[status]
-  const label =
-    status === 'open'
-      ? 'Open'
-      : status === 'busy'
-        ? 'Busy'
-        : status === 'full'
-          ? 'Busy'
-          : '—'
+  const clamped = Math.min(Math.max(0, raw), total)
+  const st = courtsAvailableToPinStatus(clamped, total)
+  const bg = STATUS_PIN_COLOR[st]
   return (
-    <View style={[styles.badgePill, { backgroundColor: bg }]}>
-      <Text style={styles.badgePillText}>{label}</Text>
+    <View style={[styles.badgePill, styles.badgePillShrink, { backgroundColor: bg }]}>
+      <Text style={styles.badgePillText} numberOfLines={1}>{`${clamped} of ${total} open`}</Text>
     </View>
   )
 }
@@ -151,7 +161,7 @@ function CourtRow({
           {formatDistanceMiles(item.distanceKm)} · {courtsLabel} · {venue}
         </Text>
       </View>
-      <AvailabilityBadge status={item.status} isDark={isDark} />
+      <CourtsOpenBadge liveCourtsAvailable={item.liveCourtsAvailable} courtCount={item.courtCount} isDark={isDark} />
     </Pressable>
   )
 }
@@ -172,7 +182,7 @@ type NearbyCourtsSheetProps = {
   listLoading?: boolean
 }
 
-const WEB_SHEET_MAX = Math.round(Dimensions.get('window').height * 0.46)
+const WEB_SHEET_MAX = Math.round(Dimensions.get('window').height * 0.52)
 
 export function NearbyCourtsSheet(props: NearbyCourtsSheetProps) {
   const {
@@ -188,7 +198,8 @@ export function NearbyCourtsSheet(props: NearbyCourtsSheetProps) {
     listLoading = false,
   } = props
   const insets = useSafeAreaInsets()
-  const snapPoints = useMemo(() => ['22%', '48%', '82%'], [])
+  // Start higher to cover Apple Maps watermark/legal area.
+  const snapPoints = useMemo(() => ['44%', '66%', '90%'], [])
 
   const renderCourtItem = useCallback(
     ({ item }: { item: CourtWithDistance }) => (
@@ -272,7 +283,8 @@ export function NearbyCourtsSheet(props: NearbyCourtsSheetProps) {
       index={0}
       snapPoints={snapPoints}
       enablePanDownToClose={false}
-      bottomInset={insets.bottom}
+      // Let the sheet sit flush against the tab bar (avoid a visible gap).
+      bottomInset={0}
       backgroundStyle={{
         backgroundColor: isDark ? '#18181B' : '#FFFFFF',
       }}
@@ -287,7 +299,7 @@ export function NearbyCourtsSheet(props: NearbyCourtsSheetProps) {
           keyExtractor={(item) => item}
           renderItem={renderSkeletonSheetItem}
           ListHeaderComponent={ListHeader}
-          contentContainerStyle={[styles.listPad, { paddingBottom: insets.bottom + 20 }]}
+          contentContainerStyle={[styles.listPad, { paddingBottom: 16 }]}
           ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
         />
       ) : (
@@ -299,7 +311,7 @@ export function NearbyCourtsSheet(props: NearbyCourtsSheetProps) {
             renderItem={renderCourtItem}
             ListHeaderComponent={ListHeader}
             ListEmptyComponent={EmptyList}
-            contentContainerStyle={[styles.listPad, { paddingBottom: insets.bottom + 20 }]}
+            contentContainerStyle={[styles.listPad, { paddingBottom: 16 }]}
             ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
             onRefresh={onRefresh}
             refreshing={refreshing}
@@ -409,22 +421,29 @@ const styles = StyleSheet.create({
     minWidth: 64,
     alignItems: 'center',
   },
+  badgePillShrink: {
+    minWidth: 0,
+    maxWidth: 118,
+    paddingHorizontal: 10,
+  },
   badgePillText: {
     color: '#FFFFFF',
-    fontSize: 12,
+    fontSize: 11,
     fontWeight: '800',
-    letterSpacing: 0.4,
+    letterSpacing: 0.25,
   },
-  badgeUnknown: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
+  badgeNoReport: {
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: 999,
     alignItems: 'center',
     justifyContent: 'center',
+    maxWidth: 118,
   },
-  badgeUnknownMark: {
-    fontSize: 18,
+  badgeNoReportText: {
+    fontSize: 11,
     fontWeight: '800',
+    letterSpacing: 0.2,
   },
   emptyText: {
     textAlign: 'center',

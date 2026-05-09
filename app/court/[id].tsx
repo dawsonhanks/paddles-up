@@ -4,7 +4,7 @@ import { CourtDetailSkeleton } from '@/components/court-detail-skeleton'
 import { SkeletonBox } from '@/components/skeleton-box'
 import { Colors, Fonts } from '@/constants/theme'
 import { useColorScheme } from '@/hooks/use-color-scheme'
-import { checkinBucketLabel, checkinBucketTone, checkinCountToCourtStatus } from '@/lib/checkins'
+import { checkinBucketLabel, checkinCountToCourtStatus } from '@/lib/checkins'
 import { courtDetailFromRow, STATUS_PIN_COLOR, type CourtDetail, type CourtStatus } from '@/lib/courts'
 import {
   courtHasOutdoorVenue,
@@ -27,6 +27,11 @@ import { addFavorite, ensureFavoritesUser, isCourtFavorite, removeFavorite } fro
 import { notifyManualCheckoutFromCourtDetail } from '@/lib/mapAutoCheckinCoordinator'
 import { alertOpenSettings } from '@/lib/alerts'
 import { userFriendlyFromUnknown } from '@/lib/errors'
+import {
+  courtsAvailabilityHeadlineColors,
+  fetchLatestCourtsAvailableReport,
+  insertCourtsAvailabilityReport,
+} from '@/lib/availability'
 import { fetchLatestZoneReportsForCourt, fetchZonesForCourt, insertZoneReport, type CourtZoneRow } from '@/lib/zones'
 import { distanceKm, formatDistanceDetail, isWithinReportingRadius, REPORTING_RADIUS_KM } from '@/lib/geo'
 import { MaterialIcons } from '@expo/vector-icons'
@@ -58,12 +63,15 @@ import {
   useWindowDimensions,
   View,
 } from 'react-native'
-import { SafeAreaView } from 'react-native-safe-area-context'
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context'
 
 import { supabase } from '@/supabase'
 
 /** Defer success alerts so they run after notify spinner / state updates settle (avoids swallowed alerts and stuck alert chrome). */
 const NOTIFY_SUCCESS_ALERT_DELAY_MS = 300
+
+/** Matches Record tab floating action button (`FAB_SIZE` there). */
+const DIRECTIONS_FAB_SIZE = 56
 
 const cardShadow =
   Platform.OS === 'ios'
@@ -209,6 +217,7 @@ async function getPushToken(): Promise<string | null> {
 }
 
 export default function CourtDetailScreen() {
+  const insets = useSafeAreaInsets()
   const { id: rawId } = useLocalSearchParams<{ id: string }>()
   const courtId = (() => {
     const v = Array.isArray(rawId) ? rawId[0] : rawId
@@ -225,7 +234,7 @@ export default function CourtDetailScreen() {
   const isDark = colorScheme === 'dark'
   const theme = Colors[colorScheme ?? 'light']
 
-  const screenBg = isDark ? '#0C0C0E' : '#E8EDF3'
+  const screenBg = isDark ? '#101418' : '#EBEEF2'
   const cardBg = isDark ? '#161618' : '#FFFFFF'
   const cardBorder = isDark ? 'rgba(255,255,255,0.07)' : 'rgba(15, 23, 42, 0.06)'
   const muted = isDark ? '#94A3B8' : '#64748B'
@@ -242,6 +251,12 @@ export default function CourtDetailScreen() {
   const [zoneReportBusy, setZoneReportBusy] = useState<{ zoneId: string; status: 'open' | 'busy' } | null>(
     null,
   )
+  const [latestCourtsAvail, setLatestCourtsAvail] = useState<{ courts_available: number; created_at: string } | null>(
+    null,
+  )
+  const [courtsAvailLoading, setCourtsAvailLoading] = useState(false)
+  const [courtsAvailSubmitBusy, setCourtsAvailSubmitBusy] = useState(false)
+  const [pendingCourtsAvailPick, setPendingCourtsAvailPick] = useState<number | null>(null)
   const [isFavorite, setIsFavorite] = useState(false)
   const [favoriteReady, setFavoriteReady] = useState(false)
   const [favoriteBusy, setFavoriteBusy] = useState(false)
@@ -350,7 +365,34 @@ export default function CourtDetailScreen() {
   useEffect(() => {
     setCourtZones([])
     setZoneReportsByZone(new Map())
+    setLatestCourtsAvail(null)
+    setPendingCourtsAvailPick(null)
   }, [courtId])
+
+  const loadCourtsAvailabilityReport = useCallback(async () => {
+    if (!courtId || isOffline) {
+      setLatestCourtsAvail(null)
+      return
+    }
+    setCourtsAvailLoading(true)
+    try {
+      const row = await fetchLatestCourtsAvailableReport(courtId)
+      setLatestCourtsAvail(row)
+    } finally {
+      setCourtsAvailLoading(false)
+    }
+  }, [courtId, isOffline])
+
+  useEffect(() => {
+    if (court == null || court === undefined) return
+    const total = Math.max(1, court.courtCount)
+    if (latestCourtsAvail === null) {
+      setPendingCourtsAvailPick(null)
+      return
+    }
+    const v = Math.min(Math.max(0, Math.floor(latestCourtsAvail.courts_available)), total)
+    setPendingCourtsAvailPick(v)
+  }, [latestCourtsAvail, court])
 
   const loadZonesAndReports = useCallback(async () => {
     if (!courtId) return
@@ -851,6 +893,7 @@ export default function CourtDetailScreen() {
       if (!isOffline) {
         loadCheckins()
         loadZonesAndReports()
+        void loadCourtsAvailabilityReport()
       } else {
         setCheckinCount(0)
         setIsCheckedIn(false)
@@ -862,7 +905,7 @@ export default function CourtDetailScreen() {
       return () => {
         setMoreInfoExpanded(false)
       }
-    }, [refreshLocation, loadZonesAndReports, checkSubscription, loadCheckins, loadPhotos, loadReviews, isOffline]),
+    }, [refreshLocation, loadZonesAndReports, loadCourtsAvailabilityReport, checkSubscription, loadCheckins, loadPhotos, loadReviews, isOffline]),
   )
 
   useEffect(() => { setFavoriteReady(false); setIsFavorite(false) }, [courtId])
@@ -896,6 +939,67 @@ export default function CourtDetailScreen() {
       setFavoriteBusy(false)
     }
   }, [courtId, favoriteReady, favoriteBusy, isFavorite])
+
+  const submitCourtsAvailability = useCallback(
+    async (count: number) => {
+      if (!court || !courtId || courtsAvailSubmitBusy || isOffline) return
+      await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light)
+      const { status: perm } = await Location.getForegroundPermissionsAsync()
+      if (perm !== 'granted') {
+        alertOpenSettings(
+          'Location',
+          'Location access is needed for this feature — tap below to open Settings.',
+        )
+        return
+      }
+      const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Highest })
+      const d = distanceKm(pos.coords.latitude, pos.coords.longitude, court.latitude, court.longitude)
+      if (!isWithinReportingRadius(d)) {
+        setScreenBanner(
+          `Stand within about ${Math.round(REPORTING_RADIUS_KM * 1000)} meters of this court to submit an availability update.`,
+        )
+        setUserLat(pos.coords.latitude)
+        setUserLon(pos.coords.longitude)
+        return
+      }
+      setUserLat(pos.coords.latitude)
+      setUserLon(pos.coords.longitude)
+
+      const gate = await ensureFavoritesUser()
+      if ('error' in gate) {
+        setScreenBanner(userFriendlyFromUnknown(gate.error))
+        return
+      }
+
+      const total = Math.max(1, court.courtCount)
+      const bounded = Math.min(Math.max(0, Math.floor(count)), total)
+
+      setCourtsAvailSubmitBusy(true)
+      try {
+        const { error } = await insertCourtsAvailabilityReport({
+          court_id: courtId,
+          courts_available: bounded,
+          reporter_lat: pos.coords.latitude,
+          reporter_lng: pos.coords.longitude,
+        })
+        if (error) {
+          setScreenBanner(userFriendlyFromUnknown(error.message))
+          return
+        }
+        setPendingCourtsAvailPick(bounded)
+        await loadCourtsAvailabilityReport()
+      } finally {
+        setCourtsAvailSubmitBusy(false)
+      }
+    },
+    [
+      court,
+      courtId,
+      courtsAvailSubmitBusy,
+      isOffline,
+      loadCourtsAvailabilityReport,
+    ],
+  )
 
   const onZoneReport = useCallback(
     async (zoneId: string, status: 'open' | 'busy') => {
@@ -962,7 +1066,7 @@ export default function CourtDetailScreen() {
             <SkeletonBox width={44} height={44} borderRadius={14} />
           </View>
         </SafeAreaView>
-        <CourtDetailSkeleton screenBg={screenBg} cardBg={cardBg} cardBorder={cardBorder} />
+        <CourtDetailSkeleton screenBg={screenBg} cardBorder={cardBorder} />
       </View>
     )
   }
@@ -992,7 +1096,6 @@ export default function CourtDetailScreen() {
   const headerStatus: CourtStatus = checkinCountToCourtStatus(checkinCount)
   const badge = statusBadgeColors(headerStatus)
   const playersHere = checkinBucketLabel(checkinCount)
-  const playersHereTone = checkinBucketTone(checkinCount, isDark)
   const titleFont = Fonts.rounded
 
   return (
@@ -1031,140 +1134,162 @@ export default function CourtDetailScreen() {
       ) : null}
 
       <ContentFadeIn show style={{ flex: 1 }}>
-      <ScrollView style={{ flex: 1 }} contentContainerStyle={[styles.scrollContent, { paddingTop: 4 }]} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
+      <ScrollView
+        style={{ flex: 1 }}
+        contentContainerStyle={[
+          styles.scrollContent,
+          {
+            paddingTop: 4,
+            paddingBottom: 20 + DIRECTIONS_FAB_SIZE + 28 + insets.bottom,
+          },
+        ]}
+        showsVerticalScrollIndicator={false}
+        keyboardShouldPersistTaps="handled">
 
-        <View style={[styles.heroCard, { backgroundColor: cardBg, borderColor: cardBorder }, cardShadow]}>
+        <View style={[styles.mainContentCard, { backgroundColor: cardBg, borderColor: cardBorder }, cardShadow]}>
+        {isOffline ? (
+          <Text style={[styles.dashOfflineNote, { color: isDark ? '#FCD34D' : '#92400E' }]}>
+            Live data unavailable offline
+          </Text>
+        ) : null}
+
+        <View style={styles.dashHeaderBlock}>
           <Text
-            style={[styles.heroTitleFull, { color: isDark ? '#F8FAFC' : '#0F172A' }, Platform.OS === 'ios' && titleFont ? { fontFamily: titleFont } : null]}
-            numberOfLines={2}>
+            style={[styles.dashCourtName, { color: isDark ? '#F8FAFC' : '#0F172A' }, Platform.OS === 'ios' && titleFont ? { fontFamily: titleFont } : null]}
+            numberOfLines={3}>
             {court.name}
           </Text>
-          <View style={styles.heroMetaRow}>
-            <View style={[styles.statusBadge, styles.statusBadgeHero, { backgroundColor: badge.bg }]}>
-              <View style={[styles.statusDot, styles.statusDotHero, { backgroundColor: STATUS_PIN_COLOR[headerStatus] }]} />
-              <Text style={[styles.statusBadgeText, styles.statusBadgeTextHero, { color: badge.text }]}>
-                {statusLabel(headerStatus)}
-              </Text>
-            </View>
-            <Text style={[styles.heroMetaDot, { color: muted }]}>·</Text>
-            <Text style={[styles.heroMetaDistance, { color: subtle }]} numberOfLines={1}>
-              {distanceKmUser != null ? formatDistanceDetail(distanceKmUser) : '—'}
+          <View style={[styles.dashStatusPill, { backgroundColor: badge.bg }]}>
+            <View style={[styles.dashStatusDot, { backgroundColor: STATUS_PIN_COLOR[headerStatus] }]} />
+            <Text style={[styles.dashStatusPillText, { color: badge.text }]}>{statusLabel(headerStatus)}</Text>
+          </View>
+          <View style={styles.dashMetaRow}>
+            <Text style={[styles.typeSecondaryMuted, { color: muted }]}>
+              {court.courtCount} {court.courtCount === 1 ? 'court' : 'courts'}
             </Text>
-            <Text style={[styles.heroMetaDot, { color: muted }]}>·</Text>
+            <Text style={[styles.dashMetaSep, { color: muted }]}>·</Text>
             {court.rating != null ? (
               <StarRow
                 rating={court.rating}
                 filledColor="#F59E0B"
-                emptyColor={isDark ? '#334155' : '#E2E8F0'}
+                emptyColor={isDark ? '#475569' : '#CBD5E1'}
                 compact
-                tiny
               />
             ) : (
-              <Text style={[styles.heroNoRating, { color: muted }]} numberOfLines={1}>
-                No rating
-              </Text>
+              <Text style={[styles.typeSecondaryMuted, { color: muted }]}>No rating</Text>
             )}
-          </View>
-          <View style={[styles.heroCardDivider, { backgroundColor: cardBorder }]} />
-          <View style={styles.heroCourtsDirectionsRow}>
-            <View
-              style={[
-                styles.heroCourtCountPillOutline,
-                {
-                  borderColor: isDark ? 'rgba(148,163,184,0.45)' : 'rgba(100,116,139,0.35)',
-                  backgroundColor: isDark ? 'rgba(255,255,255,0.03)' : 'transparent',
-                },
-              ]}>
-              <Text style={[styles.heroCourtCountPillText, { color: subtle }]}>
-                {court.courtCount} {court.courtCount === 1 ? 'court' : 'courts'}
-              </Text>
-            </View>
-            <Pressable
-              onPress={() => openMapsDirections(court.latitude, court.longitude)}
-              accessibilityRole="button"
-              accessibilityLabel="Open directions to this court"
-              style={({ pressed }) => [styles.directionsChipCompact, { opacity: pressed ? 0.85 : 1 }]}>
-              <MaterialIcons name="directions" size={14} color="#FFFFFF" />
-              <Text style={styles.directionsChipTextCompact}>Directions</Text>
-            </Pressable>
           </View>
         </View>
 
-        <Text style={[styles.availSectionTitle, { color: isDark ? '#F1F5F9' : '#0F172A' }]}>Live activity</Text>
-        <Text style={[styles.availSectionSub, { color: muted }]}>
-          Pin colors follow check-ins: quiet (green), picking up (amber), busy (red).
-        </Text>
-        {isOffline ? (
-          <Text style={[styles.offlineRealtimeNote, { color: isDark ? '#FCD34D' : '#92400E' }]}>Live data unavailable offline</Text>
-        ) : null}
+        <View style={styles.availHeroBlock}>
+          {courtsAvailLoading ? (
+            <ActivityIndicator size="large" color="#1D9E75" style={{ marginVertical: 24 }} />
+          ) : latestCourtsAvail === null ? (
+            <Text style={[styles.availHeroEmpty, { color: muted }]}>No reports yet — be the first to update</Text>
+          ) : (
+            (() => {
+              const venueTotal = Math.max(1, court.courtCount)
+              const shown = Math.min(
+                Math.max(0, Math.floor(latestCourtsAvail.courts_available)),
+                venueTotal,
+              )
+              const tone = courtsAvailabilityHeadlineColors(shown, venueTotal, isDark)
+              return (
+                <Text style={[styles.availHeroLine, { color: tone.text }]}>
+                  {`${shown} of ${venueTotal} courts open`}
+                </Text>
+              )
+            })()
+          )}
+          <Text style={[styles.typeMutedDetail, styles.availUpdateLabelPad, { color: muted }]}>Update availability</Text>
+          <View style={styles.availPillsRow}>
+            {Array.from({ length: Math.max(1, court.courtCount) + 1 }, (_, i) => i).map((n) => {
+              const selected = pendingCourtsAvailPick === n
+              const countBtnsDisabled = isOffline || !withinRadius || courtsAvailSubmitBusy
+              const divider = isDark ? 'rgba(255,255,255,0.12)' : 'rgba(15,23,42,0.12)'
+              return (
+                <Pressable
+                  key={n}
+                  disabled={countBtnsDisabled}
+                  onPress={() => void submitCourtsAvailability(n)}
+                  accessibilityLabel={`Report ${n} courts open`}
+                  accessibilityState={{ selected, disabled: countBtnsDisabled }}
+                  style={({ pressed }) => [
+                    styles.availPill,
+                    {
+                      backgroundColor: selected
+                        ? isDark
+                          ? 'rgba(34,197,94,0.22)'
+                          : '#DCFCE7'
+                        : 'transparent',
+                      borderColor: selected ? '#22c55e' : divider,
+                      opacity: countBtnsDisabled ? 0.45 : pressed ? 0.85 : 1,
+                    },
+                  ]}>
+                  <Text
+                    style={[
+                      styles.availPillDigit,
+                      { color: selected ? '#166534' : subtle },
+                    ]}>
+                    {n}
+                  </Text>
+                </Pressable>
+              )
+            })}
+          </View>
+          {courtsAvailSubmitBusy ? (
+            <ActivityIndicator size="small" color="#1D9E75" style={{ marginTop: 14 }} />
+          ) : null}
+          {!withinRadius && distanceKmUser != null ? (
+            <Text style={[styles.typeMutedDetail, styles.availHintPad, { color: muted }]}>
+              Reporting unlocks within {Math.round(REPORTING_RADIUS_KM * 1000)} m of this venue.
+            </Text>
+          ) : null}
+        </View>
 
-        <View
-          style={[
-            styles.playersHereCard,
-            {
-              backgroundColor: playersHereTone.bg,
-              borderColor: playersHereTone.border,
-            },
-            cardShadow,
-          ]}>
-          <Text style={[styles.playersHereTitle, { color: playersHereTone.title }]}>{playersHere.title}</Text>
-          <Text style={[styles.playersHereSubtitle, { color: playersHereTone.subtitle }]}>{playersHere.subtitle}</Text>
-          <Text style={[styles.playersHereHint, { color: playersHereTone.subtitle }]}>
-            Based on active check-ins · updates when players check in or leave
-          </Text>
+        <View style={styles.playersDashBlock}>
+          <Text style={[styles.typeSecondary, { color: isDark ? '#E2E8F0' : '#1E293B' }]}>{playersHere.title}</Text>
+          <Text style={[styles.typeMutedDetail, styles.playersDashSub, { color: muted }]}>{playersHere.subtitle}</Text>
         </View>
 
         <Pressable
           onPress={onToggleCheckin}
           disabled={checkinBusy || isOffline}
           style={({ pressed }) => [
-            styles.checkinCardCompact,
+            styles.checkinWide,
             {
-              backgroundColor: isCheckedIn ? '#0F6E56' : cardBg,
-              borderColor: isCheckedIn ? '#0F6E56' : cardBorder,
-              opacity: isOffline ? 0.55 : pressed ? 0.88 : 1,
+              backgroundColor: isCheckedIn ? '#0F6E56' : '#1D9E75',
+              opacity: isOffline ? 0.45 : pressed ? 0.9 : 1,
             },
-            cardShadow,
           ]}>
           {checkinBusy ? (
-            <ActivityIndicator color={isCheckedIn ? '#fff' : '#1D9E75'} />
+            <ActivityIndicator color="#FFFFFF" />
           ) : (
-            <>
-              <View style={styles.checkinLeftCompact}>
-                <MaterialIcons
-                  name={isCheckedIn ? 'sports' : 'login'}
-                  size={24}
-                  color={isCheckedIn ? '#fff' : '#1D9E75'}
-                />
-                <View style={styles.checkinTextCol}>
-                  <Text style={[styles.checkinTitleCompact, { color: isCheckedIn ? '#fff' : theme.text }]}>
-                    {isCheckedIn ? 'Checked in — tap to leave' : 'Check in'}
-                  </Text>
-                  <Text style={[styles.checkinSubCompact, { color: isCheckedIn ? 'rgba(255,255,255,0.75)' : muted }]}>
-                    {isCheckedIn
-                      ? 'You are included in the player count above.'
-                      : 'Tap when you arrive — you are counted toward the crowd level.'}
-                  </Text>
-                </View>
+            <View style={styles.checkinWideInner}>
+              <MaterialIcons name={isCheckedIn ? 'sports' : 'login'} size={22} color="#FFFFFF" />
+              <View style={styles.checkinWideTextCol}>
+                <Text style={styles.checkinWideTitle}>
+                  {isCheckedIn ? 'Checked in — tap to leave' : 'Check in'}
+                </Text>
+                <Text style={styles.checkinWideSub}>
+                  {isCheckedIn ? "You're on the court!" : "Let others know you're here"}
+                </Text>
               </View>
               {!isCheckedIn && !withinRadius ? (
-                <Text style={[styles.checkinHintCompact, { color: muted }]}>Must be at court</Text>
+                <Text style={styles.checkinWideHint}>Must be at court</Text>
               ) : null}
-            </>
+            </View>
           )}
         </Pressable>
 
         {courtZones.length > 0 ? (
-          <View style={styles.zoneSectionWrap}>
-            <Text style={[styles.zoneSectionHint, { color: muted }]}>
-              {`Optional · Open or Busy per court (${court.courtCount} ${court.courtCount === 1 ? 'court' : 'courts'} here)`}
-            </Text>
+          <View style={styles.zoneDashSection}>
             {!isOffline && !withinRadius && distanceKmUser != null ? (
-              <Text style={[styles.zoneSectionProximityHint, { color: muted }]}>
-                Open/Busy buttons activate within {Math.round(REPORTING_RADIUS_KM * 1000)} m of this venue.
+              <Text style={[styles.typeMutedDetail, { color: muted, marginBottom: 10 }]}>
+                Zone buttons work within {Math.round(REPORTING_RADIUS_KM * 1000)} m of this venue.
               </Text>
             ) : null}
-            {courtZones.map((z) => {
+            {courtZones.map((z, zoneIndex) => {
               const rep = zoneReportsByZone.get(z.id)
               const highlightOpen = rep?.status === 'open'
               const highlightBusy = rep?.status === 'busy'
@@ -1173,11 +1298,16 @@ export default function CourtDetailScreen() {
               const busySubmitting =
                 zoneReportBusy?.zoneId === z.id && zoneReportBusy?.status === 'busy'
               const zoneActionsDisabled = isOffline || !withinRadius
+              const zoneDivider = isDark ? 'rgba(255,255,255,0.08)' : 'rgba(15,23,42,0.08)'
+              const isLast = zoneIndex === courtZones.length - 1
               return (
                 <View
                   key={z.id}
-                  style={[styles.zoneRowCompact, { backgroundColor: cardBg, borderColor: cardBorder }, cardShadow]}>
-                  <Text style={[styles.zoneNameCompact, { color: theme.text }]} numberOfLines={1}>
+                  style={[
+                    styles.zoneRowFlat,
+                    { borderBottomColor: zoneDivider, borderBottomWidth: isLast ? 0 : StyleSheet.hairlineWidth },
+                  ]}>
+                  <Text style={[styles.zoneNameFlat, { color: isDark ? '#F8FAFC' : '#0F172A' }]} numberOfLines={1}>
                     {z.zone_name}
                   </Text>
                   <View style={styles.zoneTogglePair}>
@@ -1247,10 +1377,10 @@ export default function CourtDetailScreen() {
         ) : null}
 
         {!withinRadius && distanceKmUser != null ? (
-          <View style={[styles.proxBanner, { backgroundColor: isDark ? 'rgba(245,158,11,0.12)' : '#FFFBEB', borderColor: isDark ? 'rgba(245,158,11,0.35)' : '#FDE68A' }]}>
-            <MaterialIcons name="info-outline" size={20} color="#D97706" />
-            <Text style={[styles.proxBannerText, { color: isDark ? '#FCD34D' : '#92400E' }]}>
-              You are {formatDistanceDetail(distanceKmUser)} Move within {Math.round(REPORTING_RADIUS_KM * 1000)} m to check in or report zones.
+          <View style={styles.dashProxRow}>
+            <MaterialIcons name="info-outline" size={18} color={muted} />
+            <Text style={[styles.typeMutedDetail, styles.dashProxText, { color: muted }]}>
+              You are {formatDistanceDetail(distanceKmUser)} Move within {Math.round(REPORTING_RADIUS_KM * 1000)} m to check in, update availability, or report zones.
             </Text>
           </View>
         ) : null}
@@ -1464,9 +1594,25 @@ export default function CourtDetailScreen() {
           </View>
         ) : null}
 
-        <View style={{ height: 24 }} />
+          <View style={{ height: 8 }} />
+        </View>
       </ScrollView>
       </ContentFadeIn>
+
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel="Open directions to this court"
+        onPress={() => openMapsDirections(court.latitude, court.longitude)}
+        style={({ pressed }) => [
+          styles.directionsFab,
+          {
+            bottom: 16 + insets.bottom,
+            right: 16 + insets.right,
+            opacity: pressed ? 0.92 : 1,
+          },
+        ]}>
+        <MaterialIcons name="navigation" size={28} color="#FFFFFF" />
+      </Pressable>
 
       <Modal visible={selectedPhotoUrl != null} transparent animationType="fade" onRequestClose={() => setSelectedPhotoUrl(null)}>
         <View style={styles.photoModalOverlay}>
@@ -1615,76 +1761,130 @@ const styles = StyleSheet.create({
   primaryGhostBtnText: { fontWeight: '700', fontSize: 15 },
   topBar: { paddingHorizontal: 16, paddingBottom: 4, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   backFab: { width: 44, height: 44, borderRadius: 14, alignItems: 'center', justifyContent: 'center', borderWidth: StyleSheet.hairlineWidth },
-  scrollContent: { paddingHorizontal: 16, paddingBottom: 20 },
-  heroCard: {
-    borderRadius: 16,
+  scrollContent: { paddingHorizontal: 16 },
+  mainContentCard: {
+    borderRadius: 24,
     borderWidth: StyleSheet.hairlineWidth,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    marginBottom: 10,
+    paddingHorizontal: 20,
+    paddingVertical: 22,
   },
-  heroTitleFull: {
-    alignSelf: 'stretch',
-    width: '100%',
-    fontSize: 24,
-    fontWeight: '700',
-    letterSpacing: -0.6,
-    lineHeight: 28,
-    marginBottom: 4,
+  dashOfflineNote: { fontSize: 13, fontWeight: '600', marginBottom: 14, lineHeight: 18 },
+  dashHeaderBlock: { marginBottom: 8 },
+  dashCourtName: {
+    fontSize: 28,
+    fontWeight: '800',
+    letterSpacing: -0.8,
+    lineHeight: 34,
+    marginBottom: 12,
   },
-  /** Status · distance · rating — single line, small type */
-  heroMetaRow: {
+  dashStatusPill: {
     flexDirection: 'row',
     alignItems: 'center',
-    flexWrap: 'nowrap',
-    marginTop: 2,
-    gap: 5,
-  },
-  heroMetaDot: { fontSize: 11, fontWeight: '700', marginTop: 1 },
-  heroMetaDistance: { fontSize: 12, fontWeight: '600', flexShrink: 1, minWidth: 0 },
-  heroNoRating: { fontSize: 12, fontWeight: '500', flexShrink: 0 },
-  heroCardDivider: {
-    alignSelf: 'stretch',
-    height: StyleSheet.hairlineWidth,
-    marginTop: 8,
-    marginBottom: 8,
-  },
-  heroCourtsDirectionsRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: 10,
-  },
-  heroCourtCountPillOutline: {
-    paddingHorizontal: 9,
-    paddingVertical: 5,
-    borderRadius: 999,
-    borderWidth: StyleSheet.hairlineWidth,
-    flexShrink: 0,
-  },
-  heroCourtCountPillText: { fontSize: 11, fontWeight: '600', letterSpacing: 0.15 },
-  directionsChipCompact: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-    backgroundColor: '#0F172A',
-    paddingHorizontal: 10,
+    alignSelf: 'flex-start',
+    gap: 6,
+    paddingHorizontal: 11,
     paddingVertical: 6,
     borderRadius: 999,
-    flexShrink: 0,
+    marginBottom: 14,
   },
-  directionsChipTextCompact: { color: '#FFFFFF', fontSize: 11, fontWeight: '700' },
-  statusBadge: { flexDirection: 'row', alignItems: 'center', borderRadius: 999 },
-  statusBadgeHero: {
-    gap: 4,
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-    flexShrink: 0,
+  dashStatusDot: { width: 7, height: 7, borderRadius: 4 },
+  dashStatusPillText: { fontSize: 12, fontWeight: '700', letterSpacing: 0.2 },
+  dashMetaRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flexWrap: 'wrap',
+    gap: 6,
+    marginBottom: 6,
   },
-  statusDot: { width: 7, height: 7, borderRadius: 4 },
-  statusDotHero: { width: 6, height: 6, borderRadius: 3 },
-  statusBadgeText: { fontWeight: '700', letterSpacing: 0.15 },
-  statusBadgeTextHero: { fontSize: 11 },
+  dashMetaSep: { fontSize: 13, fontWeight: '600', opacity: 0.65 },
+  typeSecondaryMuted: { fontSize: 14, fontWeight: '500', letterSpacing: 0.05 },
+  typeSecondary: { fontSize: 17, fontWeight: '700', letterSpacing: -0.2 },
+  typeMutedDetail: { fontSize: 13, fontWeight: '500', lineHeight: 18 },
+  availHeroBlock: { marginTop: 12, marginBottom: 8, alignItems: 'center', alignSelf: 'stretch' },
+  availHeroLine: {
+    fontSize: 38,
+    fontWeight: '800',
+    letterSpacing: -1.2,
+    lineHeight: 44,
+    textAlign: 'center',
+    marginBottom: 6,
+  },
+  availHeroEmpty: {
+    fontSize: 22,
+    fontWeight: '700',
+    textAlign: 'center',
+    lineHeight: 28,
+    marginBottom: 8,
+    paddingHorizontal: 12,
+  },
+  availUpdateLabelPad: { alignSelf: 'center', marginTop: 14, marginBottom: 10 },
+  availPillsRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'center',
+    gap: 8,
+    alignSelf: 'stretch',
+  },
+  availPill: {
+    minWidth: 40,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 999,
+    borderWidth: StyleSheet.hairlineWidth,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  availPillDigit: { fontSize: 15, fontWeight: '800' },
+  availHintPad: { textAlign: 'center', marginTop: 12, paddingHorizontal: 8 },
+  playersDashBlock: { marginTop: 28, marginBottom: 14 },
+  playersDashSub: { marginTop: 4 },
+  checkinWide: {
+    borderRadius: 16,
+    paddingVertical: 16,
+    paddingHorizontal: 18,
+    marginBottom: 28,
+    alignSelf: 'stretch',
+  },
+  checkinWideInner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 14,
+    width: '100%',
+  },
+  checkinWideTextCol: { flex: 1, minWidth: 0 },
+  checkinWideTitle: { color: '#FFFFFF', fontSize: 17, fontWeight: '800', letterSpacing: -0.2 },
+  checkinWideSub: { color: 'rgba(255,255,255,0.82)', fontSize: 13, fontWeight: '500', marginTop: 4, lineHeight: 18 },
+  checkinWideHint: { color: 'rgba(255,255,255,0.95)', fontSize: 11, fontWeight: '700', maxWidth: 88, textAlign: 'right' },
+  zoneDashSection: { marginBottom: 12 },
+  zoneRowFlat: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingVertical: 16,
+    paddingHorizontal: 0,
+  },
+  zoneNameFlat: { flex: 1, minWidth: 0, fontSize: 16, fontWeight: '700', letterSpacing: -0.2 },
+  dashProxRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 10, paddingVertical: 12, marginBottom: 4 },
+  dashProxText: { flex: 1, lineHeight: 18 },
+  directionsFab: {
+    position: 'absolute',
+    width: DIRECTIONS_FAB_SIZE,
+    height: DIRECTIONS_FAB_SIZE,
+    borderRadius: DIRECTIONS_FAB_SIZE / 2,
+    backgroundColor: '#0F172A',
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 20,
+    ...Platform.select({
+      ios: {
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 4 },
+        shadowOpacity: 0.25,
+        shadowRadius: 6,
+      },
+      android: { elevation: 8 },
+    }),
+  },
   starRow: { flexDirection: 'row', alignItems: 'center', gap: 1 },
   starRowCompact: { flexShrink: 0, gap: 0 },
   starRowTiny: { flexShrink: 0 },
@@ -1699,9 +1899,9 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     gap: 6,
-    paddingVertical: 10,
-    marginTop: 4,
-    marginBottom: 2,
+    paddingVertical: 12,
+    marginTop: 12,
+    marginBottom: 0,
   },
   moreInfoToggleText: { fontSize: 15, fontWeight: '700', color: '#1D9E75' },
   moreInfoPanel: { gap: 12 },
@@ -1754,21 +1954,6 @@ const styles = StyleSheet.create({
   moreInfoHoursHeading: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 10 },
   moreInfoHoursTitle: { fontSize: 15, fontWeight: '700' },
   moreInfoHoursBody: { fontSize: 14, lineHeight: 21, fontWeight: '500' },
-  checkinCardCompact: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    borderRadius: 14,
-    borderWidth: StyleSheet.hairlineWidth,
-    paddingHorizontal: 12,
-    paddingVertical: 9,
-    marginBottom: 10,
-  },
-  checkinLeftCompact: { flexDirection: 'row', alignItems: 'center', gap: 10, flex: 1, minWidth: 0 },
-  checkinTextCol: { flex: 1, minWidth: 0 },
-  checkinTitleCompact: { fontSize: 14, fontWeight: '700' },
-  checkinSubCompact: { fontSize: 12, marginTop: 1 },
-  checkinHintCompact: { fontSize: 10, fontWeight: '600', marginLeft: 6 },
   sectionCard: { borderRadius: 20, borderWidth: StyleSheet.hairlineWidth, padding: 18, marginBottom: 14 },
   photoActionBtn: { flexDirection: 'row', alignItems: 'center', gap: 6, borderRadius: 999, paddingHorizontal: 10, paddingVertical: 8 },
   photoActionBtnText: { color: '#FFFFFF', fontSize: 12, fontWeight: '700' },
@@ -1788,32 +1973,6 @@ const styles = StyleSheet.create({
   },
   photoMetaName: { marginTop: 8, fontSize: 13, fontWeight: '600' },
   photoMetaTime: { marginTop: 2, fontSize: 12 },
-  availSectionTitle: { fontSize: 18, fontWeight: '700', letterSpacing: -0.3, marginBottom: 2 },
-  availSectionSub: { fontSize: 13, lineHeight: 18, marginBottom: 8 },
-  playersHereCard: {
-    borderRadius: 18,
-    borderWidth: 2,
-    paddingVertical: 20,
-    paddingHorizontal: 18,
-    marginBottom: 12,
-    alignItems: 'center',
-  },
-  playersHereTitle: { fontSize: 26, fontWeight: '800', letterSpacing: -0.6, textAlign: 'center' },
-  playersHereSubtitle: { fontSize: 17, fontWeight: '700', marginTop: 6, textAlign: 'center' },
-  playersHereHint: { fontSize: 12, marginTop: 12, textAlign: 'center', opacity: 0.92 },
-  zoneSectionWrap: { gap: 8, marginTop: 10, marginBottom: 4 },
-  zoneSectionHint: { fontSize: 12, fontWeight: '600', letterSpacing: 0.1 },
-  zoneSectionProximityHint: { fontSize: 11, lineHeight: 15, fontWeight: '500', marginTop: -2, marginBottom: 2 },
-  zoneRowCompact: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
-    borderRadius: 12,
-    borderWidth: StyleSheet.hairlineWidth,
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-  },
-  zoneNameCompact: { flex: 1, minWidth: 0, fontSize: 15, fontWeight: '700', letterSpacing: -0.2 },
   zoneTogglePair: { flexDirection: 'row', alignItems: 'center', gap: 8, flexShrink: 0 },
   zoneToggleBtn: {
     minWidth: 66,
@@ -1840,9 +1999,6 @@ const styles = StyleSheet.create({
   },
   zoneToggleOpenOnText: { color: '#166534' },
   zoneToggleBusyOnText: { color: '#B45309' },
-  offlineRealtimeNote: { fontSize: 12, fontWeight: '600', marginBottom: 8 },
-  proxBanner: { flexDirection: 'row', alignItems: 'flex-start', gap: 8, padding: 10, borderRadius: 12, borderWidth: 1, marginBottom: 8 },
-  proxBannerText: { flex: 1, fontSize: 13, lineHeight: 18, fontWeight: '500' },
   photoModalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.92)', justifyContent: 'center', alignItems: 'center', padding: 16 },
   photoModalDelete: { position: 'absolute', top: 56, left: 20, width: 40, height: 40, borderRadius: 20, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(127,29,29,0.65)' },
   photoModalClose: { position: 'absolute', top: 56, right: 20, width: 40, height: 40, borderRadius: 20, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(15,23,42,0.55)' },

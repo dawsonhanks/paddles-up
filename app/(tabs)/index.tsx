@@ -7,8 +7,9 @@ import {
 } from '@/components/nearby-courts-sheet'
 import { Colors } from '@/constants/theme'
 import { useColorScheme } from '@/hooks/use-color-scheme'
-import { fetchActiveCheckinCountsByCourtIds, checkinCountToCourtStatus } from '@/lib/checkins'
-import { courtFromRow, type Court } from '@/lib/courts'
+import { courtsAvailableToPinStatus, fetchLatestCourtsAvailableByCourtIds } from '@/lib/availability'
+import { fetchActiveCheckinCountsByCourtIds } from '@/lib/checkins'
+import { courtFromRow, type Court, type CourtStatus } from '@/lib/courts'
 import { deleteCourtCheckIn, upsertActiveCourtCheckIn } from '@/lib/courtPresenceCheckin'
 import { fetchFavoriteCourtIds } from '@/lib/favorites'
 import { distanceKm, REPORTING_RADIUS_KM } from '@/lib/geo'
@@ -231,14 +232,27 @@ export default function MapScreen() {
         .filter((c): c is Court => c != null)
 
       const ids = parsed.map((c) => c.id)
-      const countsByCourt = await fetchActiveCheckinCountsByCourtIds(ids)
+      const [countsByCourt, availByCourt] = await Promise.all([
+        fetchActiveCheckinCountsByCourtIds(ids),
+        fetchLatestCourtsAvailableByCourtIds(ids),
+      ])
       const nextAreaCourts = parsed.map((c) => {
         const key = String(c.id).trim()
         const n = countsByCourt.get(key) ?? 0
+        const reportedAvail = availByCourt.get(key)
+        const total = Math.max(1, c.courtCount)
+        let status: CourtStatus = 'unknown'
+        let liveCourtsAvailable: number | null = null
+        if (reportedAvail !== undefined) {
+          liveCourtsAvailable = reportedAvail
+          const clamped = Math.min(Math.max(0, reportedAvail), total)
+          status = courtsAvailableToPinStatus(clamped, total)
+        }
         return {
           ...c,
           liveCheckins: n,
-          status: checkinCountToCourtStatus(n),
+          liveCourtsAvailable,
+          status,
         }
       })
 

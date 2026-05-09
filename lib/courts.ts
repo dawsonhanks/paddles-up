@@ -6,8 +6,10 @@ export type Court = {
   latitude: number
   longitude: number
   status: CourtStatus
-  /** Active check-ins at venue when fetched for map/list (pins use this first). */
+  /** Active check-ins at venue when fetched for map/list. */
   liveCheckins?: number
+  /** Latest unexpired venue-wide availability report, when present. */
+  liveCourtsAvailable?: number | null
   /** Number of courts at the venue (for lists / pins). */
   courtCount: number
   /** Human-readable venue type, e.g. Indoor / Outdoor. */
