@@ -20,10 +20,12 @@ import {
   ActivityIndicator,
   FlatList,
   Image,
+  Keyboard,
   Modal,
   StyleSheet,
   Text,
   TextInput,
+  TouchableWithoutFeedback,
   TouchableOpacity,
   View,
 } from 'react-native'
@@ -210,6 +212,8 @@ export default function FriendsScreen() {
 
   return (
     <SafeAreaView style={[styles.root, { backgroundColor: theme.background }]} edges={['bottom']}>
+      <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
+        <View style={styles.root}>
       <ErrorBanner message={friendsBanner} onDismiss={() => setFriendsBanner(null)} />
       <View style={[styles.toolbar, { paddingHorizontal: 16, paddingVertical: 10 }]}>
         <View style={[styles.searchBar, { backgroundColor: cardBg, borderColor: cardBorder }]}>
@@ -250,6 +254,8 @@ export default function FriendsScreen() {
 
       <Modal visible={showAddFriends} animationType="slide" presentationStyle="pageSheet">
         <SafeAreaView style={[styles.modalRoot, { backgroundColor: theme.background }]} edges={['top']}>
+          <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
+            <View style={styles.modalRoot}>
           <View style={styles.modalHeader}>
             <Text style={[styles.modalTitle, { color: theme.text }]}>Add Friends</Text>
             <TouchableOpacity onPress={() => setShowAddFriends(false)}>
@@ -296,8 +302,12 @@ export default function FriendsScreen() {
             }
             contentContainerStyle={[styles.modalList, searching && searchResults.length === 0 ? { flexGrow: 1 } : undefined]}
           />
+          </View>
+          </TouchableWithoutFeedback>
         </SafeAreaView>
       </Modal>
+      </View>
+      </TouchableWithoutFeedback>
     </SafeAreaView>
   )
 }

@@ -36,7 +36,7 @@ import { fetchLatestZoneReportsForCourt, fetchZonesForCourt, insertZoneReport, t
 import { distanceKm, formatDistanceDetail, isWithinReportingRadius, REPORTING_RADIUS_KM } from '@/lib/geo'
 import { MaterialIcons } from '@expo/vector-icons'
 import { useNetworkOffline } from '@/contexts/network-status-context'
-import { useFocusEffect } from '@react-navigation/native'
+import { useFocusEffect, useIsFocused } from '@react-navigation/native'
 import * as Device from 'expo-device'
 import * as ExpoFSLegacy from 'expo-file-system/legacy'
 import * as Haptics from 'expo-haptics'
@@ -69,6 +69,7 @@ import { supabase } from '@/supabase'
 
 /** Defer success alerts so they run after notify spinner / state updates settle (avoids swallowed alerts and stuck alert chrome). */
 const NOTIFY_SUCCESS_ALERT_DELAY_MS = 300
+const DETAIL_LIVE_REFRESH_POLL_MS = 60000
 
 /** Matches Record tab floating action button (`FAB_SIZE` there). */
 const DIRECTIONS_FAB_SIZE = 56
@@ -229,6 +230,7 @@ export default function CourtDetailScreen() {
     }
   })()
   const router = useRouter()
+  const isCourtScreenFocused = useIsFocused()
   const { width: windowW, height: windowH } = useWindowDimensions()
   const colorScheme = useColorScheme()
   const isDark = colorScheme === 'dark'
@@ -369,17 +371,18 @@ export default function CourtDetailScreen() {
     setPendingCourtsAvailPick(null)
   }, [courtId])
 
-  const loadCourtsAvailabilityReport = useCallback(async () => {
+  const loadCourtsAvailabilityReport = useCallback(async (opts?: { background?: boolean }) => {
     if (!courtId || isOffline) {
       setLatestCourtsAvail(null)
       return
     }
-    setCourtsAvailLoading(true)
+    const background = opts?.background === true
+    if (!background) setCourtsAvailLoading(true)
     try {
       const row = await fetchLatestCourtsAvailableReport(courtId)
       setLatestCourtsAvail(row)
     } finally {
-      setCourtsAvailLoading(false)
+      if (!background) setCourtsAvailLoading(false)
     }
   }, [courtId, isOffline])
 
@@ -907,6 +910,46 @@ export default function CourtDetailScreen() {
       }
     }, [refreshLocation, loadZonesAndReports, loadCourtsAvailabilityReport, checkSubscription, loadCheckins, loadPhotos, loadReviews, isOffline]),
   )
+
+  useEffect(() => {
+    if (!isCourtScreenFocused || !courtId || isOffline) return
+
+    const refreshLive = () => {
+      void loadCheckins()
+      void loadCourtsAvailabilityReport({ background: true })
+    }
+
+    const channel = supabase
+      .channel(`court-detail-live-${courtId}`)
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'court_checkins',
+          filter: `court_id=eq.${courtId}`,
+        },
+        refreshLive
+      )
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'availability_reports',
+          filter: `court_id=eq.${courtId}`,
+        },
+        refreshLive
+      )
+      .subscribe()
+
+    const pollTimer = setInterval(refreshLive, DETAIL_LIVE_REFRESH_POLL_MS)
+
+    return () => {
+      clearInterval(pollTimer)
+      void supabase.removeChannel(channel)
+    }
+  }, [isCourtScreenFocused, courtId, isOffline, loadCheckins, loadCourtsAvailabilityReport])
 
   useEffect(() => { setFavoriteReady(false); setIsFavorite(false) }, [courtId])
 

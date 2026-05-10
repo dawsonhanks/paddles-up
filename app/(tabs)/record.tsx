@@ -17,6 +17,7 @@ import {
   ActivityIndicator,
   Alert,
   FlatList,
+  Keyboard,
   Modal,
   Platform,
   Pressable,
@@ -24,6 +25,7 @@ import {
   StyleSheet,
   Text,
   TextInput,
+  TouchableWithoutFeedback,
   TouchableOpacity,
   View,
 } from 'react-native'
@@ -702,6 +704,8 @@ export default function RecordScreen() {
 
   return (
     <SafeAreaView style={[styles.root, { backgroundColor: theme.background }]} edges={['top']}>
+      <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
+        <View style={styles.root}>
       <ErrorBanner message={recordBanner} onDismiss={() => setRecordBanner(null)} />
       <View style={styles.main}>
         <View style={styles.header}>
@@ -736,6 +740,7 @@ export default function RecordScreen() {
               style={{ flex: 1 }}
               data={matches}
               keyExtractor={(item) => item.id}
+              keyboardShouldPersistTaps="handled"
               contentContainerStyle={[styles.list, { paddingBottom: FAB_SIZE + 32 + insets.bottom }]}
               onRefresh={loadAll}
               refreshing={loading}
@@ -809,6 +814,8 @@ export default function RecordScreen() {
       {/* Log match modal */}
       <Modal visible={showModal} animationType="slide" presentationStyle="pageSheet">
         <SafeAreaView style={[styles.modal, { backgroundColor: theme.background }]} edges={['top']}>
+          <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
+            <View style={styles.modal}>
           <View style={styles.modalHeader}>
             <Text style={[styles.modalTitle, { color: theme.text }]}>Log a match</Text>
             <TouchableOpacity onPress={() => setShowModal(false)}>
@@ -890,12 +897,16 @@ export default function RecordScreen() {
             </TouchableOpacity>
             <View style={{ height: 40 }} />
           </ScrollView>
+          </View>
+          </TouchableWithoutFeedback>
         </SafeAreaView>
       </Modal>
 
       {/* Challenge modal */}
       <Modal visible={showChallengeModal} animationType="slide" presentationStyle="pageSheet">
         <SafeAreaView style={[styles.modal, { backgroundColor: theme.background }]} edges={['top']}>
+          <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
+            <View style={styles.modal}>
           <View style={styles.modalHeader}>
             <Text style={[styles.modalTitle, { color: theme.text }]}>Challenge a Player</Text>
             <TouchableOpacity onPress={() => setShowChallengeModal(false)}>
@@ -995,7 +1006,8 @@ export default function RecordScreen() {
             {showCourtPicker ? (
               <ScrollView
                 style={[styles.courtList, { backgroundColor: cardBg, borderColor: cardBorder }]}
-                nestedScrollEnabled>
+                nestedScrollEnabled
+                keyboardShouldPersistTaps="handled">
                 <TouchableOpacity
                   style={[styles.courtListItem, { borderBottomColor: cardBorder, borderBottomWidth: 0.5 }]}
                   onPress={() => { setChallengeCourtId(null); setChallengeCourtName(null); setShowCourtPicker(false) }}>
@@ -1024,6 +1036,8 @@ export default function RecordScreen() {
             </TouchableOpacity>
             <View style={{ height: 40 }} />
           </ScrollView>
+          </View>
+          </TouchableWithoutFeedback>
         </SafeAreaView>
       </Modal>
 
@@ -1032,7 +1046,8 @@ export default function RecordScreen() {
         transparent
         animationType="fade"
         onRequestClose={() => setScoreModalChallenge(null)}>
-        <View style={styles.scoreModalBackdrop}>
+        <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
+          <View style={styles.scoreModalBackdrop}>
           <View style={[styles.scoreModalCard, { backgroundColor: cardBg, borderColor: cardBorder }]}>
             <Text style={[styles.scoreModalTitle, { color: theme.text }]}>Submit score</Text>
             <Text style={[styles.scoreModalSubtitle, { color: theme.icon }]}>
@@ -1084,8 +1099,11 @@ export default function RecordScreen() {
               </TouchableOpacity>
             </View>
           </View>
-        </View>
+          </View>
+        </TouchableWithoutFeedback>
       </Modal>
+      </View>
+      </TouchableWithoutFeedback>
     </SafeAreaView>
   )
 }

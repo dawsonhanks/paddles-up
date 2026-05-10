@@ -7,6 +7,7 @@ export type CourtMapProps = {
   courts: Court[]
   selectedId: string | null
   onSelectCourt: (id: string) => void
+  onMapPress?: () => void
   onRegionChangeComplete?: (region: {
     latitude: number
     longitude: number

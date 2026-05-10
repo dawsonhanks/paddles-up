@@ -16,6 +16,7 @@ import {
   Alert,
   FlatList,
   Image,
+  Keyboard,
   Modal,
   Platform,
   Pressable,
@@ -24,6 +25,7 @@ import {
   StyleSheet,
   Text,
   TextInput,
+  TouchableWithoutFeedback,
   TouchableOpacity,
   View,
 } from 'react-native'
@@ -614,12 +616,16 @@ export default function PlayScreen() {
     Alert.alert(sess.court_name, 'Edit details or delete this session.', [
       {
         text: 'Edit',
-        onPress: () => openEditScheduledSession(sess),
+        onPress: () => {
+          Keyboard.dismiss()
+          openEditScheduledSession(sess)
+        },
       },
       {
         text: 'Delete',
         style: 'destructive',
         onPress: () => {
+          Keyboard.dismiss()
           Alert.alert(
             'Delete scheduled session?',
             'This removes the session and its reminder.',
@@ -629,6 +635,7 @@ export default function PlayScreen() {
                 text: 'Delete',
                 style: 'destructive',
                 onPress: async () => {
+                  Keyboard.dismiss()
                   const gate = await ensureFavoritesUser()
                   if ('error' in gate) return
                   const del = await deleteScheduledSessionById(sess.id, gate.userId, sess.notification_id)
@@ -978,9 +985,10 @@ export default function PlayScreen() {
         </View>
 
         <Pressable
-          onPress={() =>
+          onPress={() => {
+            Keyboard.dismiss()
             setExpandedPosts((prev) => ({ ...prev, [item.id]: !prev[item.id] }))
-          }
+          }}
           style={({ pressed }) => [
             styles.playersToggle,
             { borderColor: cardBorder, backgroundColor: isDark ? 'rgba(255,255,255,0.06)' : '#F8FAFC', opacity: pressed ? 0.85 : 1 },
@@ -1024,11 +1032,21 @@ export default function PlayScreen() {
           </View>
           {isMine ? (
             <View style={styles.cardActions}>
-              <TouchableOpacity onPress={() => openEditPost(item)} style={[styles.smallActionBtn, { borderColor: cardBorder }]}>
+              <TouchableOpacity
+                onPress={() => {
+                  Keyboard.dismiss()
+                  openEditPost(item)
+                }}
+                style={[styles.smallActionBtn, { borderColor: cardBorder }]}>
                 <MaterialIcons name="edit" size={15} color="#0EA5E9" />
                 <Text style={[styles.smallActionText, { color: '#0EA5E9' }]}>Edit</Text>
               </TouchableOpacity>
-              <TouchableOpacity onPress={() => promptDeletePost(item)} style={[styles.smallActionBtn, { borderColor: cardBorder }]}>
+              <TouchableOpacity
+                onPress={() => {
+                  Keyboard.dismiss()
+                  promptDeletePost(item)
+                }}
+                style={[styles.smallActionBtn, { borderColor: cardBorder }]}>
                 <MaterialIcons name="delete-outline" size={15} color="#E24B4A" />
                 <Text style={[styles.smallActionText, { color: '#E24B4A' }]}>Delete</Text>
               </TouchableOpacity>
@@ -1036,7 +1054,10 @@ export default function PlayScreen() {
           ) : acceptedPostIds.has(item.id) ? (
             <View style={styles.acceptedJoinedCol}>
               <TouchableOpacity
-                onPress={() => unacceptGamePost(item)}
+                onPress={() => {
+                  Keyboard.dismiss()
+                  unacceptGamePost(item)
+                }}
                 disabled={acceptBusyPostId === item.id}
                 style={[styles.joinedBadge, { borderColor: cardBorder, opacity: acceptBusyPostId === item.id ? 0.6 : 1 }]}>
                 {acceptBusyPostId === item.id ? (
@@ -1049,7 +1070,10 @@ export default function PlayScreen() {
                 )}
               </TouchableOpacity>
               <TouchableOpacity
-                onPress={() => void openScheduleFromJoinedGamePost(item)}
+                onPress={() => {
+                  Keyboard.dismiss()
+                  void openScheduleFromJoinedGamePost(item)
+                }}
                 style={[styles.addSessionInlineBtn, { borderColor: cardBorder, backgroundColor: isDark ? 'rgba(255,255,255,0.06)' : '#F0FDF7' }]}>
                 <MaterialIcons name="calendar-month" size={15} color="#1D9E75" />
                 <Text style={styles.addSessionInlineText}>Add to my sessions</Text>
@@ -1057,7 +1081,10 @@ export default function PlayScreen() {
             </View>
           ) : (
             <TouchableOpacity
-              onPress={() => acceptGamePost(item)}
+              onPress={() => {
+                Keyboard.dismiss()
+                acceptGamePost(item)
+              }}
               disabled={acceptBusyPostId != null || item.players_needed <= 0}
               style={[styles.acceptBtn, { opacity: acceptBusyPostId != null || item.players_needed <= 0 ? 0.55 : 1 }]}>
               {acceptBusyPostId === item.id ? (
@@ -1079,9 +1106,10 @@ export default function PlayScreen() {
       [
         { text: 'Cancel', style: 'cancel' },
         {
-          text: 'Delete',
-          style: 'destructive',
+        text: 'Delete',
+        style: 'destructive',
           onPress: async () => {
+            Keyboard.dismiss()
             const userId = currentUserId ?? await ensureCurrentUserId()
             if (!userId) { setPlayBanner('Give us a moment, then try that again.'); return }
             const { error } = await supabase
@@ -1108,8 +1136,14 @@ export default function PlayScreen() {
     const note = typeof row.notes === 'string' && row.notes.trim() ? row.notes.trim() : null
     return (
       <Pressable
-        onPress={() => router.push(`/court/${encodeURIComponent(row.court_id)}`)}
-        onLongPress={() => promptScheduledSessionActions(row)}
+        onPress={() => {
+          Keyboard.dismiss()
+          router.push(`/court/${encodeURIComponent(row.court_id)}`)
+        }}
+        onLongPress={() => {
+          Keyboard.dismiss()
+          promptScheduledSessionActions(row)
+        }}
         delayLongPress={500}
         style={({ pressed }) => [
           styles.sessionCard,
@@ -1178,6 +1212,7 @@ export default function PlayScreen() {
       style={styles.findGameFlex}
       data={browsePosts}
       keyExtractor={(item) => item.id}
+      keyboardShouldPersistTaps="handled"
       contentContainerStyle={[styles.list, { paddingBottom: findGamesListBottomPad }]}
       refreshControl={findGameRefreshControl}
       ListHeaderComponent={
@@ -1246,6 +1281,7 @@ export default function PlayScreen() {
       style={{ flex: 1 }}
       data={scheduledSessions}
       keyExtractor={(s) => s.id}
+      keyboardShouldPersistTaps="handled"
       contentContainerStyle={[styles.sessionsList, { paddingBottom: sessionsScheduleBtnBottomPad }]}
       refreshControl={sessionsRefreshControl}
       renderItem={({ item }) => <View style={styles.cardOuter}>{renderScheduledSessionCard(item)}</View>}
@@ -1272,6 +1308,7 @@ export default function PlayScreen() {
     )
 
   const handleScheduleCourtRowPress = (c: CourtPickerRow, fromComposer: boolean) => {
+    Keyboard.dismiss()
     if (fromComposer) {
       setComposeCourtId(c.id)
       setComposeCourtName(c.name)
@@ -1285,11 +1322,16 @@ export default function PlayScreen() {
 
   return (
     <SafeAreaView style={[styles.root, { backgroundColor: theme.background }]} edges={['top']}>
+      <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
+        <View style={styles.root}>
       <View style={styles.segmentOuter}>
         <View style={[styles.segmentTrack, { backgroundColor: isDark ? 'rgba(255,255,255,0.08)' : 'rgba(15,23,42,0.08)' }]}>
           <TouchableOpacity
             activeOpacity={0.9}
-            onPress={() => setPlaySection('sessions')}
+            onPress={() => {
+              Keyboard.dismiss()
+              setPlaySection('sessions')
+            }}
             style={[
               styles.segmentCell,
               playSection === 'sessions' && styles.segmentCellActive,
@@ -1299,7 +1341,10 @@ export default function PlayScreen() {
           </TouchableOpacity>
           <TouchableOpacity
             activeOpacity={0.9}
-            onPress={() => setPlaySection('find')}
+            onPress={() => {
+              Keyboard.dismiss()
+              setPlaySection('find')
+            }}
             style={[
               styles.segmentCell,
               playSection === 'find' && styles.segmentCellActive,
@@ -1332,7 +1377,10 @@ export default function PlayScreen() {
             accessibilityRole="button"
             accessibilityLabel="Schedule a session"
             style={[styles.scheduleSessionFabCenter, { bottom: 16 + insets.bottom }]}
-            onPress={() => openBlankScheduleComposer()}>
+            onPress={() => {
+              Keyboard.dismiss()
+              openBlankScheduleComposer()
+            }}>
             <View style={styles.scheduleSessionBottomBtn}>
               <MaterialIcons name="add" size={18} color="#fff" />
               <Text style={styles.scheduleSessionHeaderBtnText}>Schedule a Session</Text>
@@ -1360,6 +1408,7 @@ export default function PlayScreen() {
               },
             ]}
             onPress={async () => {
+              Keyboard.dismiss()
               await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light)
               openSkillRatingFilter()
             }}>
@@ -1377,6 +1426,7 @@ export default function PlayScreen() {
               },
             ]}
             onPress={async () => {
+              Keyboard.dismiss()
               await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium)
               openNewPostModal()
             }}>
@@ -1387,17 +1437,27 @@ export default function PlayScreen() {
 
       <Modal visible={showModal} animationType="slide" presentationStyle="pageSheet">
         <SafeAreaView style={[styles.modal, { backgroundColor: theme.background }]} edges={['top']}>
+          <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
+            <View style={styles.modal}>
           {courtPickOverlay === 'compose' ? (
             <>
               <View style={styles.modalHeaderTri}>
                 <TouchableOpacity
-                  onPress={() => setCourtPickOverlay(null)}
+                  onPress={() => {
+                    Keyboard.dismiss()
+                    setCourtPickOverlay(null)
+                  }}
                   hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
                   style={styles.modalHeaderSide}>
                   <MaterialIcons name="arrow-back" size={24} color={theme.icon} />
                 </TouchableOpacity>
                 <Text style={[styles.modalTitleCentered, { color: theme.text }]}>Pick a court</Text>
-                <TouchableOpacity onPress={closeComposer} style={styles.modalHeaderSide}>
+                <TouchableOpacity
+                  onPress={() => {
+                    Keyboard.dismiss()
+                    closeComposer()
+                  }}
+                  style={styles.modalHeaderSide}>
                   <MaterialIcons name="close" size={24} color={theme.icon} />
                 </TouchableOpacity>
               </View>
@@ -1433,7 +1493,11 @@ export default function PlayScreen() {
             <>
               <View style={styles.modalHeader}>
                 <Text style={[styles.modalTitle, { color: theme.text }]}>{editingPost ? 'Edit post' : 'Post a game'}</Text>
-                <TouchableOpacity onPress={closeComposer}>
+                <TouchableOpacity
+                  onPress={() => {
+                    Keyboard.dismiss()
+                    closeComposer()
+                  }}>
                   <MaterialIcons name="close" size={24} color={theme.icon} />
                 </TouchableOpacity>
               </View>
@@ -1453,7 +1517,10 @@ export default function PlayScreen() {
               {SKILL_LEVELS.map((s) => (
                 <TouchableOpacity
                   key={s}
-                  onPress={() => setSkill(s)}
+                  onPress={() => {
+                    Keyboard.dismiss()
+                    setSkill(s)
+                  }}
                   style={[styles.pill, { borderColor: skill === s ? '#1D9E75' : cardBorder, backgroundColor: skill === s ? '#E1F5EE' : cardBg }]}>
                   <Text style={[styles.pillText, { color: skill === s ? '#0F6E56' : theme.icon }]}>{s}</Text>
                 </TouchableOpacity>
@@ -1465,7 +1532,10 @@ export default function PlayScreen() {
               {CITIES.map((c) => (
                 <TouchableOpacity
                   key={c}
-                  onPress={() => setCity(c)}
+                  onPress={() => {
+                    Keyboard.dismiss()
+                    setCity(c)
+                  }}
                   style={[styles.cityPill, { borderColor: city === c ? '#1D9E75' : cardBorder, backgroundColor: city === c ? '#E1F5EE' : cardBg }]}>
                   <Text style={[styles.pillText, { color: city === c ? '#0F6E56' : theme.icon }]}>{c}</Text>
                 </TouchableOpacity>
@@ -1479,7 +1549,10 @@ export default function PlayScreen() {
                 return (
                   <TouchableOpacity
                     key={opt.key}
-                    onPress={() => setGameType(opt.key)}
+                    onPress={() => {
+                      Keyboard.dismiss()
+                      setGameType(opt.key)
+                    }}
                     activeOpacity={0.85}
                     style={[
                       styles.gameTypeOption,
@@ -1497,7 +1570,10 @@ export default function PlayScreen() {
               {PLAYERS_NEEDED_OPTIONS.map((n) => (
                 <TouchableOpacity
                   key={n}
-                  onPress={() => setPlayersNeeded(n)}
+                  onPress={() => {
+                    Keyboard.dismiss()
+                    setPlayersNeeded(n)
+                  }}
                   style={[styles.playersNeededPill, { borderColor: playersNeeded === n ? '#1D9E75' : cardBorder, backgroundColor: playersNeeded === n ? '#E1F5EE' : cardBg }]}>
                   <Text style={[styles.playersNeededPillText, { color: playersNeeded === n ? '#0F6E56' : theme.icon }]}>{n}</Text>
                 </TouchableOpacity>
@@ -1521,6 +1597,7 @@ export default function PlayScreen() {
             </Text>
             <TouchableOpacity
               onPress={() => {
+                Keyboard.dismiss()
                 setComposeCourtSearch('')
                 setCourtPickOverlay('compose')
                 void primeCourtPickList()
@@ -1534,6 +1611,7 @@ export default function PlayScreen() {
             </TouchableOpacity>
             <TouchableOpacity
               onPress={() => {
+                Keyboard.dismiss()
                 if (!(composeSessionStartsAt instanceof Date) || !Number.isFinite((composeSessionStartsAt as Date).getTime())) {
                   setComposeSessionStartsAt(defaultSuggestedSessionStart())
                 }
@@ -1552,6 +1630,7 @@ export default function PlayScreen() {
               <TouchableOpacity
                 style={styles.clearOptionalLink}
                 onPress={() => {
+                  Keyboard.dismiss()
                   setComposeCourtId(null)
                   setComposeCourtName('')
                   setComposeSessionStartsAt(null)
@@ -1598,6 +1677,7 @@ export default function PlayScreen() {
             <Text style={[styles.fieldLabel, { color: theme.icon }]}>Expiration</Text>
             <TouchableOpacity
               onPress={async () => {
+                Keyboard.dismiss()
                 const next = !expireAtMidnight
                 setExpireAtMidnight(next)
                 await AsyncStorage.setItem(PLAY_EXPIRE_AT_MIDNIGHT_KEY, next ? 'true' : 'false')
@@ -1621,7 +1701,10 @@ export default function PlayScreen() {
 
             <TouchableOpacity
               style={[styles.submitBtn, submitting && { opacity: 0.6 }]}
-              onPress={editingPost ? saveEditedPost : submitPost}
+              onPress={() => {
+                Keyboard.dismiss()
+                void (editingPost ? saveEditedPost() : submitPost())
+              }}
               disabled={submitting}
               activeOpacity={0.8}>
               {submitting ? (
@@ -1635,22 +1718,34 @@ export default function PlayScreen() {
               </ScrollView>
             </>
           )}
+          </View>
+          </TouchableWithoutFeedback>
         </SafeAreaView>
       </Modal>
 
       <Modal visible={showScheduleModal} animationType="slide" presentationStyle="pageSheet">
         <SafeAreaView style={[styles.modal, { backgroundColor: theme.background }]} edges={['top']}>
+          <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
+            <View style={styles.modal}>
           {courtPickOverlay === 'schedule' ? (
             <>
               <View style={styles.modalHeaderTri}>
                 <TouchableOpacity
-                  onPress={() => setCourtPickOverlay(null)}
+                  onPress={() => {
+                    Keyboard.dismiss()
+                    setCourtPickOverlay(null)
+                  }}
                   hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
                   style={styles.modalHeaderSide}>
                   <MaterialIcons name="arrow-back" size={24} color={theme.icon} />
                 </TouchableOpacity>
                 <Text style={[styles.modalTitleCentered, { color: theme.text }]}>Choose court</Text>
-                <TouchableOpacity onPress={closeScheduleComposer} style={styles.modalHeaderSide}>
+                <TouchableOpacity
+                  onPress={() => {
+                    Keyboard.dismiss()
+                    closeScheduleComposer()
+                  }}
+                  style={styles.modalHeaderSide}>
                   <MaterialIcons name="close" size={24} color={theme.icon} />
                 </TouchableOpacity>
               </View>
@@ -1688,7 +1783,11 @@ export default function PlayScreen() {
                 <Text style={[styles.modalTitle, { color: theme.text }]}>
                   {editingScheduledSessionId != null ? 'Edit session' : 'Schedule session'}
                 </Text>
-                <TouchableOpacity onPress={closeScheduleComposer}>
+                <TouchableOpacity
+                  onPress={() => {
+                    Keyboard.dismiss()
+                    closeScheduleComposer()
+                  }}>
                   <MaterialIcons name="close" size={24} color={theme.icon} />
                 </TouchableOpacity>
               </View>
@@ -1696,6 +1795,7 @@ export default function PlayScreen() {
             <Text style={[styles.fieldLabel, { color: theme.icon }]}>Court</Text>
             <TouchableOpacity
               onPress={() => {
+                Keyboard.dismiss()
                 setCourtPickSearch('')
                 setCourtPickOverlay('schedule')
                 void primeCourtPickList()
@@ -1714,14 +1814,20 @@ export default function PlayScreen() {
             ) : Platform.OS === 'android' ? (
               <View style={styles.scheduleAndroidPickers}>
                 <TouchableOpacity
-                  onPress={() => setAndroidDpMode('date')}
+                  onPress={() => {
+                    Keyboard.dismiss()
+                    setAndroidDpMode('date')
+                  }}
                   style={[styles.androidPickerBtn, { borderColor: cardBorder, backgroundColor: cardBg }]}>
                   <Text style={[styles.androidPickerBtnText, { color: theme.text }]}>
                     {scheduleSessionAt.toLocaleDateString()}
                   </Text>
                 </TouchableOpacity>
                 <TouchableOpacity
-                  onPress={() => setAndroidDpMode('time')}
+                  onPress={() => {
+                    Keyboard.dismiss()
+                    setAndroidDpMode('time')
+                  }}
                   style={[styles.androidPickerBtn, { borderColor: cardBorder, backgroundColor: cardBg }]}>
                   <Text style={[styles.androidPickerBtnText, { color: theme.text }]}>
                     {scheduleSessionAt.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}
@@ -1786,7 +1892,10 @@ export default function PlayScreen() {
               activeOpacity={0.85}
               style={[styles.submitBtn, scheduleSaving && { opacity: 0.65 }]}
               disabled={scheduleSaving}
-              onPress={() => void saveScheduledSessionDraft()}>
+              onPress={() => {
+                Keyboard.dismiss()
+                void saveScheduledSessionDraft()
+              }}>
               {scheduleSaving ? (
                 <ActivityIndicator color="#fff" />
               ) : (
@@ -1799,8 +1908,12 @@ export default function PlayScreen() {
               </ScrollView>
             </>
           )}
+          </View>
+          </TouchableWithoutFeedback>
         </SafeAreaView>
       </Modal>
+      </View>
+      </TouchableWithoutFeedback>
     </SafeAreaView>
   )
 }

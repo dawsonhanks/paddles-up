@@ -10,6 +10,7 @@ import { useCallback, useMemo } from 'react'
 import {
   Dimensions,
   FlatList,
+  Keyboard,
   Platform,
   Pressable,
   ScrollView,
@@ -25,6 +26,7 @@ export type ListFilter = 'all' | 'open' | 'outdoor' | 'indoor' | 'favorites'
 export type CourtWithDistance = Court & { distanceKm: number }
 
 const BRAND_GREEN = '#1D9E75'
+const COLLAPSED_SHEET_PEEK_PX = 210
 
 export function matchesListFilter(court: Court, filter: ListFilter, favoriteIds?: ReadonlySet<string>): boolean {
   if (filter === 'favorites') return favoriteIds?.has(court.id) ?? false
@@ -198,8 +200,9 @@ export function NearbyCourtsSheet(props: NearbyCourtsSheetProps) {
     listLoading = false,
   } = props
   const insets = useSafeAreaInsets()
-  // Start higher to cover Apple Maps watermark/legal area.
-  const snapPoints = useMemo(() => ['44%', '66%', '90%'], [])
+  // Keep collapsed state low so map has more vertical room while still
+  // covering the Apple Maps legal watermark area behind the sheet.
+  const snapPoints = useMemo(() => [COLLAPSED_SHEET_PEEK_PX, '66%', '90%'], [])
 
   const renderCourtItem = useCallback(
     ({ item }: { item: CourtWithDistance }) => (
@@ -267,6 +270,9 @@ export function NearbyCourtsSheet(props: NearbyCourtsSheetProps) {
               contentContainerStyle={styles.listPad}
               style={{ flex: 1 }}
               nestedScrollEnabled
+              keyboardShouldPersistTaps="handled"
+              keyboardDismissMode="on-drag"
+              onScrollBeginDrag={() => Keyboard.dismiss()}
               onRefresh={onRefresh}
               refreshing={refreshing}
               tintColor="#1D9E75"
@@ -313,6 +319,9 @@ export function NearbyCourtsSheet(props: NearbyCourtsSheetProps) {
             ListEmptyComponent={EmptyList}
             contentContainerStyle={[styles.listPad, { paddingBottom: 16 }]}
             ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
+            keyboardShouldPersistTaps="handled"
+            keyboardDismissMode="on-drag"
+            onScrollBeginDrag={() => Keyboard.dismiss()}
             onRefresh={onRefresh}
             refreshing={refreshing}
             tintColor="#1D9E75"

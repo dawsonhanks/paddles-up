@@ -33,6 +33,8 @@ import { Redirect, useRouter } from 'expo-router'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ActivityIndicator,
+  Animated,
+  Keyboard,
   Pressable,
   StyleSheet,
   Text,
@@ -57,6 +59,8 @@ const SIGNIFICANT_PAN_KM = 32.2 // ~20 miles
 const SEARCH_BUTTON_PAN_KM = 1.6 // ~1 mile
 const TOUR_START_DELAY_MS = 1000
 const CACHED_COURTS_KEY = 'cached_courts'
+const LIVE_REFRESH_POLL_MS = 60000
+const LIVE_REFRESH_DEBOUNCE_MS = 500
 
 export default function MapScreen() {
   const colorScheme = useColorScheme()
@@ -87,7 +91,10 @@ export default function MapScreen() {
   const [favoriteCourtIds, setFavoriteCourtIds] = useState<string[]>([])
   const [favoritesLoaded, setFavoritesLoaded] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
+  const [searchOverlayOpen, setSearchOverlayOpen] = useState(false)
   const [silentCheckInBanner, setSilentCheckInBanner] = useState<{ id: string; name: string } | null>(null)
+  const searchInputRef = useRef<TextInput>(null)
+  const searchSlideY = useRef(new Animated.Value(-120)).current
 
   const autoNavigated = useRef(false)
   const tourStarted = useRef(false)
@@ -114,6 +121,9 @@ export default function MapScreen() {
   }, [isOffline])
 
   const silentUpsertBusyRef = useRef(false)
+  const liveRefreshBusyRef = useRef(false)
+  const liveRefreshQueuedRef = useRef(false)
+  const liveRefreshDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const lastThinUserPosRef = useRef<{ lat: number; lon: number } | null>(null)
   /** Latest known user position without re-subscribing the location watcher each tick */
   const userPosLatestRef = useRef<{ lat: number; lon: number } | null>(null)
@@ -183,10 +193,11 @@ export default function MapScreen() {
 
   const loadCourtsWithLiveStatus = useCallback(async (
     center: { lat: number; lon: number },
-    opts?: { background?: boolean; force?: boolean }
+    opts?: { background?: boolean; force?: boolean; silent?: boolean }
   ) => {
     const background = opts?.background === true
     const force = opts?.force === true
+    const silent = opts?.silent === true
     const areaKey = areaKeyFor(center.lat, center.lon)
     const alreadyLoaded = loadedAreaKeysRef.current.has(areaKey)
 
@@ -196,7 +207,7 @@ export default function MapScreen() {
     }
 
     if (!background && courts.length === 0) setCourtsLoading(true)
-    if (background || courts.length > 0) setAreaLoading(true)
+    if ((background || courts.length > 0) && !silent) setAreaLoading(true)
     setCourtsError(null)
     try {
       if (isOffline) {
@@ -274,11 +285,52 @@ export default function MapScreen() {
       )
       setCachedCourtsAt(cachedAt)
     } finally {
-      setAreaLoading(false)
+      if (!silent) setAreaLoading(false)
       if (!background) setCourtsLoading(false)
       courtsHydratedRef.current = true
     }
   }, [areaKeyFor, courts.length, isOffline])
+
+  const refreshLiveCourtData = useCallback(async () => {
+    if (!isMapFocusedRef.current) return
+    if (isOfflineRef.current) return
+
+    if (liveRefreshBusyRef.current) {
+      liveRefreshQueuedRef.current = true
+      return
+    }
+
+    liveRefreshBusyRef.current = true
+    try {
+      do {
+        liveRefreshQueuedRef.current = false
+        const center =
+          pendingSearchCenter ??
+          lastFetchedCenterRef.current ??
+          userPosLatestRef.current ??
+          (userLat != null && userLon != null ? { lat: userLat, lon: userLon } : null)
+        if (!center) break
+
+        await loadCourtsWithLiveStatus(center, {
+          background: true,
+          force: true,
+          silent: true,
+        })
+      } while (liveRefreshQueuedRef.current)
+    } finally {
+      liveRefreshBusyRef.current = false
+    }
+  }, [loadCourtsWithLiveStatus, pendingSearchCenter, userLat, userLon])
+
+  const scheduleLiveCourtRefresh = useCallback(() => {
+    if (liveRefreshDebounceRef.current != null) {
+      clearTimeout(liveRefreshDebounceRef.current)
+    }
+    liveRefreshDebounceRef.current = setTimeout(() => {
+      liveRefreshDebounceRef.current = null
+      void refreshLiveCourtData()
+    }, LIVE_REFRESH_DEBOUNCE_MS)
+  }, [refreshLiveCourtData])
 
   const evaluateSilentPresence = useCallback(async (lat: number, lon: number) => {
     if (!isMapFocusedRef.current) return
@@ -441,6 +493,39 @@ export default function MapScreen() {
     }, [userLat, userLon, loadCourtsWithLiveStatus, loadFavoriteCourtIds])
   )
 
+  useEffect(() => {
+    if (!isMapScreenFocused || isOffline) return
+
+    const channel = supabase
+      .channel(`map-live-${Date.now()}`)
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'court_checkins' },
+        () => scheduleLiveCourtRefresh()
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'availability_reports' },
+        () => scheduleLiveCourtRefresh()
+      )
+      .subscribe()
+
+    const pollTimer = setInterval(() => {
+      void refreshLiveCourtData()
+    }, LIVE_REFRESH_POLL_MS)
+
+    void refreshLiveCourtData()
+
+    return () => {
+      clearInterval(pollTimer)
+      if (liveRefreshDebounceRef.current != null) {
+        clearTimeout(liveRefreshDebounceRef.current)
+        liveRefreshDebounceRef.current = null
+      }
+      void supabase.removeChannel(channel)
+    }
+  }, [isMapScreenFocused, isOffline, refreshLiveCourtData, scheduleLiveCourtRefresh])
+
   const onRefreshCourts = useCallback(async () => {
     if (userLat == null || userLon == null) return
     setRefreshing(true)
@@ -468,6 +553,7 @@ export default function MapScreen() {
     latitudeDelta: number
     longitudeDelta: number
   }) => {
+    Keyboard.dismiss()
     const center = { lat: region.latitude, lon: region.longitude }
     const lastCenter = lastFetchedCenterRef.current
     if (lastCenter) {
@@ -486,6 +572,35 @@ export default function MapScreen() {
       setShowSearchAreaButton(false)
     }
   }, [isOffline, areaLoading, loadCourtsWithLiveStatus])
+
+  const dismissKeyboard = useCallback(() => {
+    Keyboard.dismiss()
+  }, [])
+
+  const closeSearchOverlay = useCallback(() => {
+    Keyboard.dismiss()
+    Animated.timing(searchSlideY, {
+      toValue: -120,
+      duration: 220,
+      useNativeDriver: true,
+    }).start(({ finished }) => {
+      if (finished) setSearchOverlayOpen(false)
+    })
+  }, [searchSlideY])
+
+  useEffect(() => {
+    if (!searchOverlayOpen) return
+    searchSlideY.setValue(-120)
+    Animated.timing(searchSlideY, {
+      toValue: 0,
+      duration: 260,
+      useNativeDriver: true,
+    }).start()
+    const t = setTimeout(() => searchInputRef.current?.focus(), 280)
+    return () => clearTimeout(t)
+  }, [searchOverlayOpen, searchSlideY])
+
+  const searchFilterActive = searchQuery.trim().length > 0
 
   const courtsWithDistance: CourtWithDistance[] = useMemo(() => {
     if (userLat == null || userLon == null) return []
@@ -627,27 +742,6 @@ export default function MapScreen() {
                 </Pressable>
               </View>
             ) : null}
-            <View
-              style={[
-                styles.searchBar,
-                {
-                  backgroundColor: isDark ? '#1C1C1E' : '#FFFFFF',
-                  borderColor: isDark ? 'rgba(255,255,255,0.1)' : 'rgba(15,23,42,0.1)',
-                },
-              ]}>
-              <MaterialIcons name="search" size={22} color={theme.icon} />
-              <TextInput
-                value={searchQuery}
-                onChangeText={setSearchQuery}
-                placeholder="Search courts by name"
-                placeholderTextColor={theme.icon}
-                style={[styles.searchInput, { color: theme.text }]}
-                returnKeyType="search"
-                autoCorrect={false}
-                autoCapitalize="words"
-                clearButtonMode="while-editing"
-              />
-            </View>
             <View style={styles.mapArea}>
               {coordsReady ? (
                 <CourtMap
@@ -656,6 +750,7 @@ export default function MapScreen() {
                   courts={filteredCourts}
                   selectedId={selectedId}
                   onSelectCourt={openCourtDetail}
+                  onMapPress={dismissKeyboard}
                   onRegionChangeComplete={onMapRegionChangeComplete}
                 />
               ) : (
@@ -685,6 +780,61 @@ export default function MapScreen() {
                     <MaterialIcons name="search" size={16} color="#FFFFFF" />
                     <Text style={styles.searchAreaBtnText}>Search this area</Text>
                   </Pressable>
+                </View>
+              ) : null}
+              {!searchOverlayOpen ? (
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={
+                    searchFilterActive
+                      ? 'Search courts, filtered by name — tap to edit'
+                      : 'Search courts'
+                  }
+                  hitSlop={6}
+                  onPress={() => setSearchOverlayOpen(true)}
+                  style={({ pressed }) => [styles.mapSearchFab, { opacity: pressed ? 0.9 : 1 }]}>
+                  <MaterialIcons name="search" size={24} color={theme.icon} />
+                  {searchFilterActive ? <View style={styles.mapSearchFabDot} /> : null}
+                </Pressable>
+              ) : null}
+              {searchOverlayOpen ? (
+                <View style={styles.searchOverlayRoot} pointerEvents="box-none">
+                  <Pressable style={styles.searchOverlayBackdrop} onPress={closeSearchOverlay} />
+                  <Animated.View
+                    style={[
+                      styles.searchOverlaySheet,
+                      {
+                        backgroundColor: isDark ? '#1C1C1E' : '#FFFFFF',
+                        borderBottomColor: isDark ? 'rgba(255,255,255,0.1)' : 'rgba(15,23,42,0.1)',
+                        paddingTop: 12,
+                        transform: [{ translateY: searchSlideY }],
+                        shadowOpacity: isDark ? 0.35 : 0.12,
+                      },
+                    ]}>
+                    <View style={styles.searchOverlayRow}>
+                      <MaterialIcons name="search" size={22} color={theme.icon} />
+                      <TextInput
+                        ref={searchInputRef}
+                        value={searchQuery}
+                        onChangeText={setSearchQuery}
+                        placeholder="Search courts by name"
+                        placeholderTextColor={theme.icon}
+                        style={[styles.searchOverlayInput, { color: theme.text }]}
+                        returnKeyType="done"
+                        autoCorrect={false}
+                        autoCapitalize="words"
+                        clearButtonMode="while-editing"
+                        onSubmitEditing={closeSearchOverlay}
+                      />
+                      <Pressable
+                        hitSlop={10}
+                        onPress={closeSearchOverlay}
+                        accessibilityRole="button"
+                        accessibilityLabel="Cancel search">
+                        <Text style={[styles.searchOverlayCancel, { color: theme.tint }]}>Cancel</Text>
+                      </Pressable>
+                    </View>
+                  </Animated.View>
                 </View>
               ) : null}
             </View>
@@ -747,28 +897,76 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '700',
   },
-  searchBar: {
+  mapSearchFab: {
+    position: 'absolute',
+    top: 12,
+    right: 12,
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    backgroundColor: '#FFFFFF',
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: '#000',
+    shadowOpacity: 0.16,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 2 },
+    elevation: 5,
+    zIndex: 12,
+  },
+  mapSearchFabDot: {
+    position: 'absolute',
+    top: 9,
+    right: 9,
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    backgroundColor: '#1D9E75',
+    borderWidth: 2,
+    borderColor: '#FFFFFF',
+  },
+  searchOverlayRoot: {
+    ...StyleSheet.absoluteFillObject,
+    zIndex: 50,
+  },
+  searchOverlayBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0,0,0,0.2)',
+  },
+  searchOverlaySheet: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    top: 0,
+    paddingHorizontal: 12,
+    paddingBottom: 14,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    shadowColor: '#000',
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 8,
+  },
+  searchOverlayRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginHorizontal: 12,
-    marginTop: 6,
-    marginBottom: 8,
-    paddingHorizontal: 12,
-    height: 48,
-    borderRadius: 14,
-    borderWidth: StyleSheet.hairlineWidth,
+    gap: 8,
+    minHeight: 44,
   },
-  searchInput: {
+  searchOverlayInput: {
     flex: 1,
-    marginLeft: 8,
+    minWidth: 0,
     fontSize: 16,
-    paddingVertical: 0,
+    paddingVertical: 8,
+  },
+  searchOverlayCancel: {
+    fontSize: 17,
+    fontWeight: '600',
   },
   mapArea: { flex: 1 },
   mapLoadingPill: {
     position: 'absolute',
     top: 10,
-    right: 10,
+    left: 10,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 6,

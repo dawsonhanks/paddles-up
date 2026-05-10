@@ -11,6 +11,7 @@ export type CourtMapProps = {
   courts: Court[]
   selectedId: string | null
   onSelectCourt: (id: string) => void
+  onMapPress?: () => void
   onRegionChangeComplete?: (region: {
     latitude: number
     longitude: number
@@ -20,7 +21,7 @@ export type CourtMapProps = {
 }
 
 const NEIGHBORHOOD_DELTA = 0.06
-const MAP_BOTTOM_PADDING_PX = 300
+const MAP_BOTTOM_PADDING_PX = 210
 
 function PickleballFace({ color }: { color: string }) {
   return (
@@ -39,7 +40,15 @@ function PickleballFace({ color }: { color: string }) {
   )
 }
 
-export function CourtMap({ userLat, userLon, courts, selectedId, onSelectCourt, onRegionChangeComplete }: CourtMapProps) {
+export function CourtMap({
+  userLat,
+  userLon,
+  courts,
+  selectedId,
+  onSelectCourt,
+  onMapPress,
+  onRegionChangeComplete,
+}: CourtMapProps) {
   const mapRef = useRef<MapView>(null)
   const initialZoomDone = useRef(false)
 
@@ -72,6 +81,8 @@ export function CourtMap({ userLat, userLon, courts, selectedId, onSelectCourt, 
         longitudeDelta: NEIGHBORHOOD_DELTA,
       }}
       onRegionChangeComplete={onRegionChangeComplete}
+      onPress={onMapPress}
+      onPanDrag={onMapPress}
       showsUserLocation
       showsMyLocationButton={false}>
       {courts.map((c) => (

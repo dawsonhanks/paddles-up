@@ -11,20 +11,20 @@ import {
   normalizeUsername,
   sanitizeUsernameInput,
 } from '@/lib/profileValidation'
-import { celebrateStreakMilestonesIfNeeded } from '@/lib/streakMilestones'
 import { alertOpenSettings } from '@/lib/alerts'
 import { userFriendlyFromUnknown } from '@/lib/errors'
 import { MaterialIcons } from '@expo/vector-icons'
-import { LinearGradient } from 'expo-linear-gradient'
 import { useFocusEffect } from '@react-navigation/native'
 import * as ImagePicker from 'expo-image-picker'
 import * as Linking from 'expo-linking'
+import * as WebBrowser from 'expo-web-browser'
 import { useRouter } from 'expo-router'
 import { useCallback, useEffect, useState } from 'react'
 import {
   ActivityIndicator,
   Alert,
   Image,
+  Keyboard,
   Modal,
   RefreshControl,
   ScrollView,
@@ -32,6 +32,7 @@ import {
   StyleSheet,
   Text,
   TextInput,
+  TouchableWithoutFeedback,
   TouchableOpacity,
   View,
 } from 'react-native'
@@ -39,8 +40,11 @@ import { SafeAreaView } from 'react-native-safe-area-context'
 
 import { supabase } from '@/supabase'
 
+/** Matches App Store / Play metadata and GitHub Pages (`index.html` at repo root). */
+const PRIVACY_POLICY_URL = 'https://dawsonhanks.github.io/paddles-up-privacy/'
+
 const ITEMS = [
-  { id: 'privacy', label: 'Privacy Policy', icon: 'lock-outline', url: 'https://dawsonhanks.github.io/paddles-up-privacy/' },
+  { id: 'privacy', label: 'Privacy Policy', icon: 'lock-outline', url: PRIVACY_POLICY_URL },
   { id: 'suggest', label: 'Suggest a Court', icon: 'add-location-alt' },
   { id: 'feedback', label: 'Send Feedback', icon: 'chat-bubble-outline', url: 'mailto:paddlesupapp@gmail.com?subject=Paddles Up Feedback' },
 ]
@@ -54,12 +58,6 @@ type Profile = {
   pickup_skill_level: string | null
   wins: number
   losses: number
-}
-
-type StreakUi = {
-  current_streak: number
-  longest_streak: number
-  milestone_celebrated: string
 }
 
 const PICKUP_SKILL_LEVELS = ['Beginner', 'Intermediate', 'Advanced'] as const
@@ -88,11 +86,6 @@ export default function ProfileScreen() {
 
   // Profile state
   const [profile, setProfile] = useState<Profile | null>(null)
-  const [streak, setStreak] = useState<StreakUi>({
-    current_streak: 0,
-    longest_streak: 0,
-    milestone_celebrated: '',
-  })
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [showEdit, setShowEdit] = useState(false)
@@ -127,28 +120,13 @@ export default function ProfileScreen() {
 
   async function loadProfile() {
     setLoading(true)
-    let celebrate:
-      | {
-          userId: string
-          row: {
-            current_streak: number
-            longest_streak: number
-            milestone_celebrated: string | null
-          } | null
-        }
-      | undefined
     try {
       const gate = await ensureFavoritesUser()
       if ('error' in gate) return
 
-      const [{ data: playerData }, { data: matchData }, { data: streakData }] = await Promise.all([
+      const [{ data: playerData }, { data: matchData }] = await Promise.all([
         supabase.from('players').select('*').eq('user_id', gate.userId).maybeSingle(),
         supabase.from('matches').select('result').eq('user_id', gate.userId),
-        supabase
-          .from('streaks')
-          .select('current_streak, longest_streak, milestone_celebrated')
-          .eq('user_id', gate.userId)
-          .maybeSingle(),
       ])
 
       const wins = matchData?.filter(m => m.result === 'win').length ?? 0
@@ -165,34 +143,8 @@ export default function ProfileScreen() {
         wins,
         losses,
       })
-
-      const nextStreak: StreakUi = streakData
-        ? {
-            current_streak: streakData.current_streak ?? 0,
-            longest_streak: streakData.longest_streak ?? 0,
-            milestone_celebrated: streakData.milestone_celebrated ?? '',
-          }
-        : { current_streak: 0, longest_streak: 0, milestone_celebrated: '' }
-      setStreak(nextStreak)
-
-      celebrate = {
-        userId: gate.userId,
-        row: streakData
-          ? {
-              current_streak: streakData.current_streak ?? 0,
-              longest_streak: streakData.longest_streak ?? 0,
-              milestone_celebrated: streakData.milestone_celebrated,
-            }
-          : null,
-      }
     } finally {
       setLoading(false)
-    }
-
-    if (celebrate) {
-      await celebrateStreakMilestonesIfNeeded(celebrate.userId, celebrate.row, (merged) =>
-        setStreak((s) => ({ ...s, milestone_celebrated: merged })),
-      )
     }
   }
 
@@ -470,8 +422,11 @@ export default function ProfileScreen() {
 
   return (
     <SafeAreaView style={[styles.root, { backgroundColor: theme.background }]} edges={['top']}>
+      <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
+        <View style={styles.root}>
       <ScrollView
         contentContainerStyle={styles.container}
+        keyboardShouldPersistTaps="handled"
         refreshControl={
           <RefreshControl
             refreshing={refreshing}
@@ -545,37 +500,6 @@ export default function ProfileScreen() {
                 </View>
               </View>
 
-              <View style={styles.streakCardOuter}>
-                <LinearGradient
-                  colors={isDark ? ['#3D231C', '#261610'] : ['#FFF5EE', '#FFE4D4']}
-                  start={{ x: 0, y: 0 }}
-                  end={{ x: 1, y: 1 }}
-                  style={[
-                    styles.streakGradient,
-                    { borderColor: isDark ? 'rgba(255, 107, 53, 0.35)' : 'rgba(255, 107, 53, 0.5)' },
-                  ]}>
-                  <View style={styles.streakInner}>
-                    <Text style={styles.streakEmoji}>🔥</Text>
-                    <Text style={styles.streakNumber}>{streak.current_streak}</Text>
-                    <Text
-                      style={[
-                        styles.streakLabel,
-                        { color: isDark ? '#FCA5A5' : '#9A3412' },
-                      ]}>
-                      day streak
-                    </Text>
-                    <Text style={[styles.streakBest, { color: muted }]}>
-                      Best: {streak.longest_streak} days
-                    </Text>
-                    {streak.current_streak === 0 ? (
-                      <Text style={[styles.streakEncourage, { color: muted }]}>
-                        Start your streak — check in at a court today!
-                      </Text>
-                    ) : null}
-                  </View>
-                </LinearGradient>
-              </View>
-
               {hasProfile ? (
                 <View style={styles.profileBtnRow}>
                   <TouchableOpacity style={styles.editBtn} onPress={openEdit} activeOpacity={0.8}>
@@ -608,8 +532,17 @@ export default function ProfileScreen() {
               key={item.id}
               style={[styles.row, i < ITEMS.length - 1 && { borderBottomWidth: 0.5, borderBottomColor: cardBorder }]}
               onPress={() => {
-                if (item.id === 'suggest') { openSuggestCourt(); return }
-                if (item.url) Linking.openURL(item.url)
+                if (item.id === 'suggest') {
+                  openSuggestCourt()
+                  return
+                }
+                if (item.id === 'privacy' && item.url) {
+                  void WebBrowser.openBrowserAsync(item.url).catch(() =>
+                    Linking.openURL(item.url!)
+                  )
+                  return
+                }
+                if (item.url) void Linking.openURL(item.url)
               }}
               activeOpacity={0.7}>
               <MaterialIcons name={item.icon as any} size={22} color="#1D9E75" style={styles.rowIcon} />
@@ -633,6 +566,8 @@ export default function ProfileScreen() {
       {/* Edit profile modal */}
       <Modal visible={showEdit} animationType="slide" presentationStyle="pageSheet">
         <SafeAreaView style={[styles.modal, { backgroundColor: theme.background }]} edges={['top']}>
+          <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
+            <View style={styles.modal}>
           <View style={styles.modalHeader}>
             <Text style={[styles.modalTitle, { color: theme.text }]}>Edit Profile</Text>
             <TouchableOpacity onPress={() => setShowEdit(false)}>
@@ -750,12 +685,16 @@ export default function ProfileScreen() {
             </TouchableOpacity>
             <View style={{ height: 40 }} />
           </ScrollView>
+          </View>
+          </TouchableWithoutFeedback>
         </SafeAreaView>
       </Modal>
 
       {/* Suggest Court modal */}
       <Modal visible={showSuggestCourt} animationType="slide" presentationStyle="pageSheet" onRequestClose={() => setShowSuggestCourt(false)}>
         <SafeAreaView style={[styles.modal, { backgroundColor: theme.background }]} edges={['top']}>
+          <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
+            <View style={styles.modal}>
           <View style={styles.modalHeader}>
             <Text style={[styles.modalTitle, { color: theme.text }]}>Suggest a Court</Text>
             <TouchableOpacity onPress={() => setShowSuggestCourt(false)}>
@@ -823,12 +762,16 @@ export default function ProfileScreen() {
             </TouchableOpacity>
             <View style={{ height: 40 }} />
           </ScrollView>
+          </View>
+          </TouchableWithoutFeedback>
         </SafeAreaView>
       </Modal>
 
       {/* Create profile modal */}
       <Modal visible={showCreate} animationType="slide" presentationStyle="pageSheet" onRequestClose={() => setShowCreate(false)}>
         <SafeAreaView style={[styles.modal, { backgroundColor: theme.background }]} edges={['top']}>
+          <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
+            <View style={styles.modal}>
           <View style={styles.modalHeader}>
             <Text style={[styles.modalTitle, { color: theme.text }]}>Create Profile</Text>
             <TouchableOpacity onPress={() => setShowCreate(false)}>
@@ -903,8 +846,12 @@ export default function ProfileScreen() {
             </TouchableOpacity>
             <View style={{ height: 40 }} />
           </ScrollView>
+          </View>
+          </TouchableWithoutFeedback>
         </SafeAreaView>
       </Modal>
+      </View>
+      </TouchableWithoutFeedback>
     </SafeAreaView>
   )
 }
@@ -936,20 +883,6 @@ const styles = StyleSheet.create({
   statNum: { fontSize: 20, fontWeight: '700' },
   statLabel: { fontSize: 11, marginTop: 2 },
   statDivider: { width: 0.5 },
-  streakCardOuter: { alignSelf: 'center', marginBottom: 14, maxWidth: 200 },
-  streakGradient: { borderRadius: 12, paddingVertical: 10, paddingHorizontal: 14, borderWidth: 1 },
-  streakInner: { alignItems: 'center' },
-  streakEmoji: { fontSize: 26, lineHeight: 30 },
-  streakNumber: { fontSize: 22, fontWeight: '700', color: '#FF6B35', marginTop: 2 },
-  streakLabel: { fontSize: 11, fontWeight: '600', marginTop: 2, textAlign: 'center' },
-  streakBest: { fontSize: 10, marginTop: 4, textAlign: 'center' },
-  streakEncourage: {
-    fontSize: 10,
-    marginTop: 6,
-    fontStyle: 'italic',
-    lineHeight: 14,
-    textAlign: 'center',
-  },
   createProfileBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, marginTop: 4, marginBottom: 4, backgroundColor: '#1D9E75', paddingHorizontal: 24, paddingVertical: 12, borderRadius: 24, alignSelf: 'center', minWidth: 200 },
   createProfileBtnText: { color: '#fff', fontSize: 16, fontWeight: '700' },
   profileBtnRow: { flexDirection: 'row', gap: 10 },
