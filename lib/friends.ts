@@ -1,3 +1,4 @@
+import { fetchBlockedUserIds } from '@/lib/blockedUsers'
 import { ensureFavoritesUser } from '@/lib/favorites'
 import { supabase } from '@/supabase'
 
@@ -38,6 +39,8 @@ export async function fetchFriendsWithStats(): Promise<{ friends: FriendPlayerWi
   const ids = rows?.map(r => r.friend_id) ?? []
   if (ids.length === 0) return { friends: [] }
 
+  const blocked = new Set(await fetchBlockedUserIds())
+
   const [{ data: players, error: pErr }, { data: matchRows }] = await Promise.all([
     supabase
       .from('players')
@@ -49,12 +52,14 @@ export async function fetchFriendsWithStats(): Promise<{ friends: FriendPlayerWi
   if (pErr) return { friends: [], error: pErr.message }
 
   const wl = aggregateWinsLosses(matchRows as { user_id: string; result: string }[])
-  const friends: FriendPlayerWithRecord[] =
-    (players as FriendPlayer[])?.map((p) => ({
+  const friendRows = (players as FriendPlayer[]) ?? []
+  const friends: FriendPlayerWithRecord[] = friendRows
+    .filter((p) => !blocked.has(p.user_id))
+    .map((p) => ({
       ...p,
       wins: wl.get(p.user_id)?.wins ?? 0,
       losses: wl.get(p.user_id)?.losses ?? 0,
-    })) ?? []
+    }))
 
   return { friends }
 }
@@ -73,6 +78,25 @@ export async function removeFriendship(friendUserId: string): Promise<{ error?: 
     .delete()
     .eq('user_id', gate.userId)
     .eq('friend_id', friendUserId)
+  if (error) return { error: error.message }
+  return {}
+}
+
+/**
+ * Ensures a `friendships` row exists from the current user to `friendUserId`.
+ * Used after unblock when an older app version removed the friendship on block.
+ */
+export async function addFriendshipIfAbsent(friendUserId: string): Promise<{ error?: string }> {
+  const gate = await ensureFavoritesUser()
+  if ('error' in gate) return { error: gate.error }
+  const { data: existing } = await supabase
+    .from('friendships')
+    .select('friend_id')
+    .eq('user_id', gate.userId)
+    .eq('friend_id', friendUserId)
+    .maybeSingle()
+  if (existing) return {}
+  const { error } = await supabase.from('friendships').insert({ user_id: gate.userId, friend_id: friendUserId })
   if (error) return { error: error.message }
   return {}
 }
@@ -180,5 +204,8 @@ export async function searchPlayersFriendshipAware(
     return { ...p, linkStatus }
   })
 
-  return { results: enriched }
+  const blocked = new Set(await fetchBlockedUserIds())
+  const filtered = enriched.filter((p) => !blocked.has(p.user_id))
+
+  return { results: filtered }
 }

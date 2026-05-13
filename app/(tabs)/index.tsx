@@ -1,5 +1,6 @@
 import {
   MapTabGestureRoot,
+  MAP_NEARBY_SHEET_COLLAPSED_BASE_PX,
   matchesListFilter,
   NearbyCourtsSheet,
   type CourtWithDistance,
@@ -26,7 +27,7 @@ import { MaterialIcons } from '@expo/vector-icons'
 import { useFocusEffect, useIsFocused } from '@react-navigation/native'
 import { useNetworkOffline } from '@/contexts/network-status-context'
 import { userFriendlyFromUnknown } from '@/lib/errors'
-import { openAppSettings } from '@/lib/open-settings'
+import { openIOSAppSettingsDeepLink } from '@/lib/open-settings'
 import AsyncStorage from '@react-native-async-storage/async-storage'
 import * as Location from 'expo-location'
 import { Redirect, useRouter } from 'expo-router'
@@ -41,8 +42,13 @@ import {
   TextInput,
   View,
 } from 'react-native'
-import { SafeAreaView } from 'react-native-safe-area-context'
+import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context'
 import { ErrorScreen } from '@/components/error-screen'
+import { LocationPurposeModal } from '@/components/location-purpose-modal'
+import {
+  LOCATION_PURPOSE_DEFERRED_KEY,
+  LOCATION_PURPOSE_MODAL_SEEN_KEY,
+} from '@/lib/location-permissions'
 import { CourtMap } from '../../components/court-map'
 import { TOUR_COMPLETED_STORAGE_KEY, useGuidedTour } from '@/components/guided-tour'
 
@@ -62,7 +68,12 @@ const CACHED_COURTS_KEY = 'cached_courts'
 const LIVE_REFRESH_POLL_MS = 60000
 const LIVE_REFRESH_DEBOUNCE_MS = 500
 
+/** Utah County — map & court list fallback when GPS is unavailable. */
+const FALLBACK_MAP_LAT = 40.3916
+const FALLBACK_MAP_LON = -111.8533
+
 export default function MapScreen() {
+  const insets = useSafeAreaInsets()
   const colorScheme = useColorScheme()
   const theme = Colors[colorScheme ?? 'light']
   const isDark = colorScheme === 'dark'
@@ -72,7 +83,10 @@ export default function MapScreen() {
 
   const [onboarded, setOnboarded] = useState<boolean | null>(null)
   const [permissionDenied, setPermissionDenied] = useState(false)
+  const [showLocationPurposeModal, setShowLocationPurposeModal] = useState(false)
   const [locationLoading, setLocationLoading] = useState(true)
+  const [locationError, setLocationError] = useState<string | null>(null)
+  const [locationRetryKey, setLocationRetryKey] = useState(0)
   const [userLat, setUserLat] = useState<number | null>(null)
   const [userLon, setUserLon] = useState<number | null>(null)
 
@@ -142,9 +156,18 @@ export default function MapScreen() {
   }, [cachedCourtsAt])
 
   useEffect(() => {
-    AsyncStorage.getItem('onboarded').then((val) => {
-      setOnboarded(val === 'true')
-    })
+    let cancelled = false
+    void (async () => {
+      try {
+        const val = await AsyncStorage.getItem('onboarded')
+        if (!cancelled) setOnboarded(val === 'true')
+      } catch {
+        if (!cancelled) setOnboarded(false)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
   }, [])
 
   const openCourtDetail = useCallback(
@@ -161,35 +184,148 @@ export default function MapScreen() {
     return `${latBucket.toFixed(1)}:${lonBucket.toFixed(1)}`
   }, [])
 
-  useEffect(() => {
-    let cancelled = false
-
-    ;(async () => {
-      setLocationLoading(true)
+  const onLocationPurposeAllow = useCallback(async () => {
+    try {
+      await AsyncStorage.multiSet([
+        [LOCATION_PURPOSE_MODAL_SEEN_KEY, 'yes'],
+        [LOCATION_PURPOSE_DEFERRED_KEY, ''],
+      ])
+    } catch {
+      /* ignore */
+    }
+    setShowLocationPurposeModal(false)
+    setLocationLoading(true)
+    setLocationError(null)
+    try {
       const { status } = await Location.requestForegroundPermissionsAsync()
-      if (cancelled) return
-      if (status !== 'granted') {
-        setPermissionDenied(true)
-        setLocationLoading(false)
+      if (status !== Location.PermissionStatus.GRANTED) {
+        setPermissionDenied(status === Location.PermissionStatus.DENIED)
+        setUserLat(null)
+        setUserLon(null)
         return
       }
-
       const pos = await Location.getCurrentPositionAsync({
         accuracy: Location.Accuracy.Balanced,
       })
-      if (cancelled) return
       const initLat = pos.coords.latitude
       const initLon = pos.coords.longitude
       userPosLatestRef.current = { lat: initLat, lon: initLon }
       setUserLat(initLat)
       setUserLon(initLon)
+      setPermissionDenied(false)
+    } catch (e) {
+      setLocationError(userFriendlyFromUnknown(e))
+      setUserLat(null)
+      setUserLon(null)
+    } finally {
       setLocationLoading(false)
+    }
+  }, [])
+
+  const onLocationPurposeLater = useCallback(async () => {
+    try {
+      await AsyncStorage.multiSet([
+        [LOCATION_PURPOSE_MODAL_SEEN_KEY, 'yes'],
+        [LOCATION_PURPOSE_DEFERRED_KEY, 'yes'],
+      ])
+    } catch {
+      /* ignore */
+    }
+    setShowLocationPurposeModal(false)
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+
+    ;(async () => {
+      try {
+        setLocationLoading(true)
+        setLocationError(null)
+        setPermissionDenied(false)
+
+        let deferredStored = false
+        try {
+          deferredStored = (await AsyncStorage.getItem(LOCATION_PURPOSE_DEFERRED_KEY)) === 'yes'
+        } catch {
+          deferredStored = false
+        }
+        const perm = await Location.getForegroundPermissionsAsync()
+        if (cancelled) return
+
+        if (perm.status === Location.PermissionStatus.GRANTED) {
+          const pos = await Location.getCurrentPositionAsync({
+            accuracy: Location.Accuracy.Balanced,
+          })
+          if (cancelled) return
+          const initLat = pos.coords.latitude
+          const initLon = pos.coords.longitude
+          userPosLatestRef.current = { lat: initLat, lon: initLon }
+          setUserLat(initLat)
+          setUserLon(initLon)
+          setPermissionDenied(false)
+          return
+        }
+
+        if (perm.status === Location.PermissionStatus.DENIED) {
+          setPermissionDenied(true)
+          setUserLat(null)
+          setUserLon(null)
+          return
+        }
+
+        let seen = false
+        try {
+          seen = (await AsyncStorage.getItem(LOCATION_PURPOSE_MODAL_SEEN_KEY)) === 'yes'
+        } catch {
+          seen = false
+        }
+        if (!seen) {
+          setShowLocationPurposeModal(true)
+          setUserLat(null)
+          setUserLon(null)
+          return
+        }
+
+        if (deferredStored) {
+          setUserLat(null)
+          setUserLon(null)
+          return
+        }
+
+        const { status } = await Location.requestForegroundPermissionsAsync()
+        if (cancelled) return
+        if (status !== Location.PermissionStatus.GRANTED) {
+          setPermissionDenied(status === Location.PermissionStatus.DENIED)
+          setUserLat(null)
+          setUserLon(null)
+          return
+        }
+
+        const pos = await Location.getCurrentPositionAsync({
+          accuracy: Location.Accuracy.Balanced,
+        })
+        if (cancelled) return
+        const initLat = pos.coords.latitude
+        const initLon = pos.coords.longitude
+        userPosLatestRef.current = { lat: initLat, lon: initLon }
+        setUserLat(initLat)
+        setUserLon(initLon)
+        setPermissionDenied(false)
+      } catch (e) {
+        if (!cancelled) {
+          setLocationError(userFriendlyFromUnknown(e))
+          setUserLat(null)
+          setUserLon(null)
+        }
+      } finally {
+        if (!cancelled) setLocationLoading(false)
+      }
     })()
 
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [locationRetryKey])
 
   const loadCourtsWithLiveStatus = useCallback(async (
     center: { lat: number; lon: number },
@@ -284,6 +420,8 @@ export default function MapScreen() {
         })
       )
       setCachedCourtsAt(cachedAt)
+    } catch (e) {
+      setCourtsError(userFriendlyFromUnknown(e))
     } finally {
       if (!silent) setAreaLoading(false)
       if (!background) setCourtsLoading(false)
@@ -333,50 +471,54 @@ export default function MapScreen() {
   }, [refreshLiveCourtData])
 
   const evaluateSilentPresence = useCallback(async (lat: number, lon: number) => {
-    if (!isMapFocusedRef.current) return
-    if (isOfflineRef.current) return
-
-    const list = courtsRef.current
-    const R = REPORTING_RADIUS_KM
-
-    clearManualCheckoutSuppressIfOutsideGeofence(lat, lon, list)
-
-    const managed = getSilentManagedCourtId()
-    if (managed) {
-      const row = list.find((c) => c.id === managed)
-      if (
-        row != null &&
-        distanceKm(lat, lon, row.latitude, row.longitude) > R
-      ) {
-        const rm = await deleteCourtCheckIn(managed)
-        if (rm.ok) notifySilentCheckoutCompleted(managed)
-      }
-    }
-
-    let nearestId: string | null = null
-    let nearestName = ''
-    let best = Infinity
-    for (const c of list) {
-      const dk = distanceKm(lat, lon, c.latitude, c.longitude)
-      if (dk < best) {
-        best = dk
-        nearestId = c.id
-        nearestName = c.name
-      }
-    }
-    if (nearestId == null || best > R) return
-    if (shouldSkipSilentUpsert(nearestId)) return
-
-    if (silentUpsertBusyRef.current) return
-    silentUpsertBusyRef.current = true
     try {
-      const r = await upsertActiveCourtCheckIn(nearestId)
-      if (r.ok) {
-        silentAutoCheckInCommitted(nearestId)
-        setSilentCheckInBanner({ id: nearestId, name: nearestName })
+      if (!isMapFocusedRef.current) return
+      if (isOfflineRef.current) return
+
+      const list = courtsRef.current
+      const R = REPORTING_RADIUS_KM
+
+      clearManualCheckoutSuppressIfOutsideGeofence(lat, lon, list)
+
+      const managed = getSilentManagedCourtId()
+      if (managed) {
+        const row = list.find((c) => c.id === managed)
+        if (
+          row != null &&
+          distanceKm(lat, lon, row.latitude, row.longitude) > R
+        ) {
+          const rm = await deleteCourtCheckIn(managed)
+          if (rm.ok) notifySilentCheckoutCompleted(managed)
+        }
       }
-    } finally {
-      silentUpsertBusyRef.current = false
+
+      let nearestId: string | null = null
+      let nearestName = ''
+      let best = Infinity
+      for (const c of list) {
+        const dk = distanceKm(lat, lon, c.latitude, c.longitude)
+        if (dk < best) {
+          best = dk
+          nearestId = c.id
+          nearestName = c?.name ?? 'Court'
+        }
+      }
+      if (nearestId == null || best > R) return
+      if (shouldSkipSilentUpsert(nearestId)) return
+
+      if (silentUpsertBusyRef.current) return
+      silentUpsertBusyRef.current = true
+      try {
+        const r = await upsertActiveCourtCheckIn(nearestId)
+        if (r.ok) {
+          silentAutoCheckInCommitted(nearestId)
+          setSilentCheckInBanner({ id: nearestId, name: nearestName })
+        }
+      } finally {
+        silentUpsertBusyRef.current = false
+      }
+    } catch (e) {
+      if (__DEV__) console.warn('[Map] evaluateSilentPresence', e)
     }
   }, [])
 
@@ -417,6 +559,16 @@ export default function MapScreen() {
     })
   }, [userLat, userLon, loadCourtsWithLiveStatus])
 
+  useEffect(() => {
+    if (locationLoading) return
+    if (userLat != null && userLon != null) return
+    const target = { lat: FALLBACK_MAP_LAT, lon: FALLBACK_MAP_LON }
+    void loadCourtsWithLiveStatus(target, {
+      background: courtsHydratedRef.current,
+      force: !courtsHydratedRef.current,
+    })
+  }, [locationLoading, userLat, userLon, loadCourtsWithLiveStatus])
+
   const userCoordsReady = userLat != null && userLon != null
   useEffect(() => {
     if (!userCoordsReady || !isMapScreenFocused) return
@@ -425,34 +577,38 @@ export default function MapScreen() {
     let subscription: Location.LocationSubscription | undefined
 
     void (async () => {
-      const { status } = await Location.getForegroundPermissionsAsync()
-      if (cancelled || status !== Location.PermissionStatus.GRANTED) return
-      subscription = await Location.watchPositionAsync(
-        {
-          accuracy: Location.Accuracy.Balanced,
-          distanceInterval: 25,
-          timeInterval: 4000,
-        },
-        (pos) => {
-          const plat = pos.coords.latitude
-          const plon = pos.coords.longitude
-          userPosLatestRef.current = { lat: plat, lon: plon }
-          void evaluateSilentPresence(plat, plon)
+      try {
+        const { status } = await Location.getForegroundPermissionsAsync()
+        if (cancelled || status !== Location.PermissionStatus.GRANTED) return
+        subscription = await Location.watchPositionAsync(
+          {
+            accuracy: Location.Accuracy.Balanced,
+            distanceInterval: 25,
+            timeInterval: 4000,
+          },
+          (pos) => {
+            const plat = pos.coords.latitude
+            const plon = pos.coords.longitude
+            userPosLatestRef.current = { lat: plat, lon: plon }
+            void evaluateSilentPresence(plat, plon)
 
-          const prevThin = lastThinUserPosRef.current
-          const moved =
-            prevThin == null ||
-            distanceKm(prevThin.lat, prevThin.lon, plat, plon) >= USER_POSITION_UI_THROTTLE_KM
-          if (moved) {
-            lastThinUserPosRef.current = { lat: plat, lon: plon }
-            setUserLat(plat)
-            setUserLon(plon)
-          }
-        }
-      )
+            const prevThin = lastThinUserPosRef.current
+            const moved =
+              prevThin == null ||
+              distanceKm(prevThin.lat, prevThin.lon, plat, plon) >= USER_POSITION_UI_THROTTLE_KM
+            if (moved) {
+              lastThinUserPosRef.current = { lat: plat, lon: plon }
+              setUserLat(plat)
+              setUserLon(plon)
+            }
+          },
+        )
 
-      const boot = userPosLatestRef.current
-      if (!cancelled && boot != null) void evaluateSilentPresence(boot.lat, boot.lon)
+        const boot = userPosLatestRef.current
+        if (!cancelled && boot != null) void evaluateSilentPresence(boot.lat, boot.lon)
+      } catch (e) {
+        if (!cancelled) setLocationError(userFriendlyFromUnknown(e))
+      }
     })()
 
     return () => {
@@ -475,10 +631,10 @@ export default function MapScreen() {
   useEffect(() => {
     if (wasOfflineRef.current && !isOffline) {
       void loadFavoriteCourtIds()
-      if (userLat != null && userLon != null) {
-        const center = lastFetchedCenterRef.current ?? { lat: userLat, lon: userLon }
-        void loadCourtsWithLiveStatus(center, { background: true, force: true })
-      }
+      const lat = userLat ?? FALLBACK_MAP_LAT
+      const lon = userLon ?? FALLBACK_MAP_LON
+      const center = lastFetchedCenterRef.current ?? { lat, lon }
+      void loadCourtsWithLiveStatus(center, { background: true, force: true })
     }
     wasOfflineRef.current = isOffline
   }, [isOffline, loadFavoriteCourtIds, userLat, userLon, loadCourtsWithLiveStatus])
@@ -486,9 +642,10 @@ export default function MapScreen() {
   useFocusEffect(
     useCallback(() => {
       void loadFavoriteCourtIds()
-      if (userLat == null || userLon == null) return
       if (!courtsHydratedRef.current) return
-      const center = lastFetchedCenterRef.current ?? { lat: userLat, lon: userLon }
+      const lat = userLat ?? FALLBACK_MAP_LAT
+      const lon = userLon ?? FALLBACK_MAP_LON
+      const center = lastFetchedCenterRef.current ?? { lat, lon }
       void loadCourtsWithLiveStatus(center, { background: true })
     }, [userLat, userLon, loadCourtsWithLiveStatus, loadFavoriteCourtIds])
   )
@@ -603,11 +760,13 @@ export default function MapScreen() {
   const searchFilterActive = searchQuery.trim().length > 0
 
   const courtsWithDistance: CourtWithDistance[] = useMemo(() => {
-    if (userLat == null || userLon == null) return []
+    if (courts.length === 0) return []
+    const lat = userLat ?? FALLBACK_MAP_LAT
+    const lon = userLon ?? FALLBACK_MAP_LON
     return courts
       .map((c) => ({
         ...c,
-        distanceKm: distanceKm(userLat, userLon, c.latitude, c.longitude),
+        distanceKm: distanceKm(lat, lon, c.latitude, c.longitude),
       }))
       .sort((a, b) => a.distanceKm - b.distanceKm)
   }, [courts, userLat, userLon])
@@ -648,9 +807,13 @@ export default function MapScreen() {
   const showNoFavoritesYetHint =
     listFilter === 'favorites' && favoritesLoaded && favoriteCourtIds.length === 0
 
-  const blockingForLocation = locationLoading || userLat == null || userLon == null
+  const blockingForLocation = locationLoading
   const blockingForCourts = !blockingForLocation && courtsLoading
   const loading = blockingForLocation || blockingForCourts
+
+  const mapDisplayLat = userLat ?? FALLBACK_MAP_LAT
+  const mapDisplayLon = userLon ?? FALLBACK_MAP_LON
+  const hasRealUserGps = userLat != null && userLon != null
 
   useEffect(() => {
     if (!isMapScreenFocused) return
@@ -672,38 +835,49 @@ export default function MapScreen() {
     }
   }, [isMapScreenFocused, onboarded, loading, startTour])
 
-  if (onboarded === null) return null
-  if (!onboarded) return <Redirect href="/onboarding" />
-
-  if (permissionDenied) {
+  if (onboarded === null) {
     return (
       <SafeAreaView style={[styles.centered, { backgroundColor: theme.background }]} edges={['top']}>
-        <Pressable
-          onPress={() => openAppSettings()}
-          style={({ pressed }) => [styles.locationSettingsPress, { opacity: pressed ? 0.85 : 1 }]}>
-          <Text style={[styles.message, { color: theme.text }]}>
-            Location access is needed for this feature — tap here to open Settings.
-          </Text>
-        </Pressable>
+        <ActivityIndicator size="large" color={theme.tint} />
+        <Text style={[styles.bootHint, { color: theme.icon }]}>Loading…</Text>
       </SafeAreaView>
     )
   }
+  if (!onboarded) return <Redirect href="/onboarding" />
 
-  if (userLat != null && userLon != null && courtsError) {
+  if (locationError) {
+    return (
+      <ErrorScreen
+        emoji="📍"
+        title="Could not get your location"
+        subtitle={locationError}
+        onRetry={() => {
+          setLocationError(null)
+          setLocationRetryKey((k) => k + 1)
+        }}
+      />
+    )
+  }
+
+  if (!locationLoading && courtsError) {
+    const retryLat = userLat ?? FALLBACK_MAP_LAT
+    const retryLon = userLon ?? FALLBACK_MAP_LON
     return (
       <ErrorScreen
         emoji="🏓"
         title="Could not load courts — check your connection and try again."
         subtitle={userFriendlyFromUnknown(courtsError)}
         onRetry={() => {
-          void loadCourtsWithLiveStatus({ lat: userLat, lon: userLon }, { force: true })
+          void loadCourtsWithLiveStatus({ lat: retryLat, lon: retryLon }, { force: true })
         }}
       />
     )
   }
 
-  const coordsReady = userLat != null && userLon != null
+  const coordsReady = !locationLoading
   const sheetListLoading = loading
+  /** Align map insets (and Apple/Google legal watermark) with the collapsed bottom sheet + a sliver for the label. */
+  const mapBottomPadding = Math.round(MAP_NEARBY_SHEET_COLLAPSED_BASE_PX + insets.bottom + 14)
 
   return (
     <SafeAreaView style={[styles.root, { backgroundColor: theme.background }]} edges={['top']}>
@@ -742,14 +916,41 @@ export default function MapScreen() {
                 </Pressable>
               </View>
             ) : null}
+            {permissionDenied ? (
+              <View style={styles.silentBannerWrap}>
+                <Pressable
+                  onPress={() => {
+                    openIOSAppSettingsDeepLink()
+                    setLocationRetryKey((k) => k + 1)
+                  }}
+                  style={({ pressed }) => [
+                    styles.locationDeniedBanner,
+                    {
+                      backgroundColor: isDark ? 'rgba(251,191,36,0.12)' : 'rgba(251,191,36,0.2)',
+                      borderColor: isDark ? 'rgba(252,211,77,0.45)' : 'rgba(217,119,6,0.35)',
+                      opacity: pressed ? 0.88 : 1,
+                    },
+                  ]}
+                  accessibilityRole="button"
+                  accessibilityLabel="Open Settings to enable location for nearby courts">
+                  <MaterialIcons name="location-off" size={20} color={isDark ? '#FCD34D' : '#92400E'} />
+                  <Text style={[styles.locationDeniedBannerText, { color: isDark ? '#FDE68A' : '#78350F' }]}>
+                    Location access needed to show nearby courts — tap here to enable in Settings
+                  </Text>
+                  <MaterialIcons name="chevron-right" size={22} color={isDark ? '#FCD34D' : '#92400E'} />
+                </Pressable>
+              </View>
+            ) : null}
             <View style={styles.mapArea}>
               {coordsReady ? (
                 <CourtMap
-                  userLat={userLat!}
-                  userLon={userLon!}
+                  userLat={mapDisplayLat}
+                  userLon={mapDisplayLon}
+                  showUserLocation={hasRealUserGps}
                   courts={filteredCourts}
                   selectedId={selectedId}
                   onSelectCourt={openCourtDetail}
+                  mapBottomPadding={mapBottomPadding}
                   onMapPress={dismissKeyboard}
                   onRegionChangeComplete={onMapRegionChangeComplete}
                 />
@@ -853,6 +1054,11 @@ export default function MapScreen() {
           />
         </View>
       </MapTabGestureRoot>
+      <LocationPurposeModal
+        visible={showLocationPurposeModal}
+        onAllow={onLocationPurposeAllow}
+        onMaybeLater={onLocationPurposeLater}
+      />
     </SafeAreaView>
   )
 }
@@ -896,6 +1102,21 @@ const styles = StyleSheet.create({
   silentBannerAction: {
     fontSize: 12,
     fontWeight: '700',
+  },
+  locationDeniedBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 11,
+  },
+  locationDeniedBannerText: {
+    flex: 1,
+    fontSize: 13,
+    fontWeight: '600',
+    lineHeight: 18,
   },
   mapSearchFab: {
     position: 'absolute',
@@ -1008,6 +1229,10 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
     padding: 24,
+  },
+  bootHint: {
+    marginTop: 12,
+    fontSize: 15,
   },
   message: {
     fontSize: 16,

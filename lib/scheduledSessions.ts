@@ -39,10 +39,14 @@ export async function fetchCourtRowsForPicker(): Promise<CourtPickerRow[]> {
 }
 
 export async function ensureLocalNotificationPermissions(): Promise<boolean> {
-  const prev = await Notifications.getPermissionsAsync()
-  if (prev.granted) return true
-  const next = await Notifications.requestPermissionsAsync()
-  return !!next.granted
+  try {
+    const prev = await Notifications.getPermissionsAsync()
+    if (prev.granted) return true
+    const next = await Notifications.requestPermissionsAsync()
+    return !!next.granted
+  } catch {
+    return false
+  }
 }
 
 /** Expo local reminder 10 minutes before session. Returns identifier or null when skipped/failed/unavailable. */

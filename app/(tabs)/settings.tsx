@@ -12,6 +12,7 @@ import {
   sanitizeUsernameInput,
 } from '@/lib/profileValidation'
 import { alertOpenSettings } from '@/lib/alerts'
+import { invokeDeleteAccountEdge } from '@/lib/deleteAccount'
 import { userFriendlyFromUnknown } from '@/lib/errors'
 import { MaterialIcons } from '@expo/vector-icons'
 import { useFocusEffect } from '@react-navigation/native'
@@ -20,6 +21,7 @@ import * as Linking from 'expo-linking'
 import * as WebBrowser from 'expo-web-browser'
 import { useRouter } from 'expo-router'
 import { useCallback, useEffect, useState } from 'react'
+import AsyncStorage from '@react-native-async-storage/async-storage'
 import {
   ActivityIndicator,
   Alert,
@@ -117,11 +119,13 @@ export default function ProfileScreen() {
   const [suggestHours, setSuggestHours] = useState('')
   const [suggestNotes, setSuggestNotes] = useState('')
   const [profileBanner, setProfileBanner] = useState<string | null>(null)
+  const [deleteAccountLoading, setDeleteAccountLoading] = useState(false)
 
-  async function loadProfile() {
+  const loadProfile = useCallback(async (cancelledRef?: { current: boolean }) => {
     setLoading(true)
     try {
       const gate = await ensureFavoritesUser()
+      if (cancelledRef?.current) return
       if ('error' in gate) return
 
       const [{ data: playerData }, { data: matchData }] = await Promise.all([
@@ -129,8 +133,12 @@ export default function ProfileScreen() {
         supabase.from('matches').select('result').eq('user_id', gate.userId),
       ])
 
+      if (cancelledRef?.current) return
+
       const wins = matchData?.filter(m => m.result === 'win').length ?? 0
       const losses = matchData?.filter(m => m.result === 'loss').length ?? 0
+
+      if (cancelledRef?.current) return
 
       setProfile({
         display_name: playerData?.display_name ?? null,
@@ -146,11 +154,17 @@ export default function ProfileScreen() {
     } finally {
       setLoading(false)
     }
-  }
+  }, [])
 
-  useFocusEffect(useCallback(() => {
-    loadProfile()
-  }, []))
+  useFocusEffect(
+    useCallback(() => {
+      const cancelled = { current: false }
+      void loadProfile(cancelled)
+      return () => {
+        cancelled.current = true
+      }
+    }, [loadProfile]),
+  )
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true)
@@ -159,24 +173,28 @@ export default function ProfileScreen() {
     } finally {
       setRefreshing(false)
     }
-  }, [])
+  }, [loadProfile])
 
   async function pickImage() {
-    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync()
-    if (status !== 'granted') {
-      alertOpenSettings(
-        'Photo library',
-        'To choose a profile picture, allow photo access in Settings.',
-      )
-      return
+    try {
+      const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync()
+      if (status !== 'granted') {
+        alertOpenSettings(
+          'Photo library',
+          'To choose a profile picture, allow photo access in Settings.',
+        )
+        return
+      }
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        allowsEditing: true,
+        aspect: [1, 1],
+        quality: 0.7,
+      })
+      if (!result.canceled && result.assets[0]) setAvatarUri(result.assets[0].uri)
+    } catch (e) {
+      Alert.alert('Photos unavailable', userFriendlyFromUnknown(e))
     }
-    const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
-      allowsEditing: true,
-      aspect: [1, 1],
-      quality: 0.7,
-    })
-    if (!result.canceled && result.assets[0]) setAvatarUri(result.assets[0].uri)
   }
 
   function pickEditContactType(contact: string | null): 'email' | 'phone' {
@@ -349,6 +367,7 @@ export default function ProfileScreen() {
         setCreateUsernameStatus('idle')
         return
       }
+      if (cancelled) return
       setCreateUsernameStatus(taken && taken.user_id !== gate.userId ? 'taken' : 'available')
     }, 350)
 
@@ -417,6 +436,35 @@ export default function ProfileScreen() {
       Alert.alert("Thanks! We'll review your suggestion and add it soon.")
     } finally {
       setSuggestSubmitting(false)
+    }
+  }
+
+  function confirmDeleteAccount() {
+    Alert.alert(
+      'Delete Account',
+      'Are you sure you want to delete your account? This will permanently remove your profile, match history, friends, reviews and all other data. This cannot be undone.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Delete', style: 'destructive', onPress: () => void runDeleteAccount() },
+      ],
+    )
+  }
+
+  async function runDeleteAccount() {
+    setDeleteAccountLoading(true)
+    try {
+      const { error } = await invokeDeleteAccountEdge()
+      if (error) {
+        Alert.alert('Could not delete account', userFriendlyFromUnknown(error.message))
+        return
+      }
+      await supabase.auth.signOut()
+      await AsyncStorage.clear()
+      router.replace('/onboarding')
+    } catch (e) {
+      Alert.alert('Something went wrong', userFriendlyFromUnknown(e))
+    } finally {
+      setDeleteAccountLoading(false)
     }
   }
 
@@ -525,6 +573,15 @@ export default function ProfileScreen() {
           )}
         </View>
 
+        <TouchableOpacity
+          style={[styles.card, styles.blockedCard, { backgroundColor: cardBg, borderColor: cardBorder }]}
+          onPress={() => router.push('/blocked-players')}
+          activeOpacity={0.75}>
+          <MaterialIcons name="block" size={22} color="#64748B" style={styles.rowIcon} />
+          <Text style={[styles.rowLabel, { color: theme.text }]}>Blocked players</Text>
+          <MaterialIcons name="chevron-right" size={20} color={muted} />
+        </TouchableOpacity>
+
         {/* Settings links */}
         <View style={[styles.card, { backgroundColor: cardBg, borderColor: cardBorder }]}>
           {ITEMS.map((item, i) => (
@@ -561,6 +618,15 @@ export default function ProfileScreen() {
 
         <Text style={[styles.tagline, { color: muted }]}>Find your court. Play your game.</Text>
         <Text style={[styles.version, { color: muted }]}>Version 1.0.0</Text>
+
+        <TouchableOpacity
+          style={styles.deleteAccountBtn}
+          onPress={confirmDeleteAccount}
+          activeOpacity={0.65}
+          accessibilityRole="button"
+          accessibilityLabel="Delete account">
+          <Text style={styles.deleteAccountLabel}>Delete Account</Text>
+        </TouchableOpacity>
       </ScrollView>
 
       {/* Edit profile modal */}
@@ -850,6 +916,12 @@ export default function ProfileScreen() {
           </TouchableWithoutFeedback>
         </SafeAreaView>
       </Modal>
+      <Modal visible={deleteAccountLoading} transparent animationType="fade">
+        <View style={styles.deleteAccountOverlay}>
+          <ActivityIndicator size="large" color="#FFFFFF" />
+          <Text style={styles.deleteAccountOverlayText}>Deleting account…</Text>
+        </View>
+      </Modal>
       </View>
       </TouchableWithoutFeedback>
     </SafeAreaView>
@@ -893,6 +965,7 @@ const styles = StyleSheet.create({
   ratingLogoSm: { width: 16, height: 16, borderRadius: 4 },
   // Settings card
   card: { borderRadius: 14, borderWidth: 0.5, overflow: 'hidden', marginBottom: 32 },
+  blockedCard: { flexDirection: 'row', alignItems: 'center', padding: 16, marginBottom: 12 },
   row: { flexDirection: 'row', alignItems: 'center', padding: 16 },
   rowIcon: { marginRight: 14 },
   rowLabel: { flex: 1, fontSize: 15 },
@@ -900,6 +973,31 @@ const styles = StyleSheet.create({
   adminTestBtnText: { color: '#fff', fontSize: 14, fontWeight: '600' },
   tagline: { textAlign: 'center', fontSize: 13, marginBottom: 4 },
   version: { textAlign: 'center', fontSize: 12, marginBottom: 24 },
+  deleteAccountBtn: {
+    alignSelf: 'center',
+    paddingVertical: 14,
+    paddingHorizontal: 20,
+    marginBottom: 8,
+  },
+  deleteAccountLabel: {
+    color: '#DC2626',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  deleteAccountOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.45)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 24,
+  },
+  deleteAccountOverlayText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '600',
+    marginTop: 16,
+    textAlign: 'center',
+  },
   // Modals shared
   modal: { flex: 1 },
   modalHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 20, paddingVertical: 16 },

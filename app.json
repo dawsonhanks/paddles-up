@@ -11,6 +11,9 @@
     "privacy": "https://dawsonhanks.github.io/paddles-up-privacy/",
     "ios": {
       "supportsTablet": true,
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "Paddles Up uses your location to show nearby pickleball courts, verify you are at a court before checking in or reporting availability, and automatically check you in when you arrive at a court. Your location is only used while the app is open and is never stored or shared."
+      },
       "privacyManifests": {
         "NSPrivacyAccessedAPITypes": []
       },
@@ -41,7 +44,7 @@
       [
         "expo-location",
         {
-          "locationWhenInUsePermission": "Allow Paddles Up to use your location to find courts near you."
+          "locationWhenInUsePermission": "Paddles Up uses your location to show nearby pickleball courts, verify you are at a court before checking in or reporting availability, and automatically check you in when you arrive at a court. Your location is only used while the app is open and is never stored or shared."
         }
       ],
       [

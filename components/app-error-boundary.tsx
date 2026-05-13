@@ -2,7 +2,7 @@ import { Colors } from '@/constants/theme'
 import { useColorScheme } from '@/hooks/use-color-scheme'
 import * as Updates from 'expo-updates'
 import { Component, type ErrorInfo, type ReactNode } from 'react'
-import { Pressable, StyleSheet, Text, View } from 'react-native'
+import { Pressable, StyleSheet, Text, View, DevSettings } from 'react-native'
 
 type Props = {
   children: ReactNode
@@ -32,6 +32,12 @@ export class AppErrorBoundary extends Component<Props, State> {
     } catch {
       // fall through
     }
+    try {
+      DevSettings.reload()
+      return
+    } catch {
+      // last resort: clear error UI so user can try again without full reload
+    }
     this.setState({ hasError: false })
   }
 
@@ -50,9 +56,9 @@ function ErrorBoundaryFallback({ onRestart }: { onRestart: () => void }) {
       <Text style={styles.emoji} accessibilityRole="text">
         🏓
       </Text>
-      <Text style={[styles.title, { color: theme.text }]}>Oops! Something unexpected happened 🏓</Text>
+      <Text style={[styles.title, { color: theme.text }]}>Something went wrong — tap to restart</Text>
       <Text style={[styles.body, { color: theme.icon }]}>
-        The app hit a snag. Tap below to start fresh — your data in the cloud is safe.
+        We will reload the app. If this keeps happening, try again after a short break.
       </Text>
       <Pressable
         onPress={onRestart}
@@ -60,7 +66,8 @@ function ErrorBoundaryFallback({ onRestart }: { onRestart: () => void }) {
           styles.btn,
           { opacity: pressed ? 0.92 : 1, backgroundColor: '#1D9E75' },
         ]}
-        accessibilityRole="button">
+        accessibilityRole="button"
+        accessibilityLabel="Restart app">
         <Text style={styles.btnText}>Restart</Text>
       </Pressable>
     </View>

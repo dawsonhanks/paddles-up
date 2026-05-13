@@ -17,26 +17,30 @@ export default function TabLayout() {
   const [todaySessionsCount, setTodaySessionsCount] = useState(0)
 
   const loadUnreadCount = useCallback(async () => {
-    const gate = await ensureFavoritesUser()
-    if ('error' in gate) return
-    const userId = gate.userId
+    try {
+      const gate = await ensureFavoritesUser()
+      if ('error' in gate) return
+      const userId = gate.userId
 
-    const { data: conversations } = await supabase
-      .from('conversations')
-      .select('id')
-      .or(`player1_id.eq.${userId},player2_id.eq.${userId}`)
-    const ids = conversations?.map(c => c.id) ?? []
-    if (ids.length === 0) {
+      const { data: conversations } = await supabase
+        .from('conversations')
+        .select('id')
+        .or(`player1_id.eq.${userId},player2_id.eq.${userId}`)
+      const ids = conversations?.map(c => c.id) ?? []
+      if (ids.length === 0) {
+        setUnreadCount(0)
+        return
+      }
+      const { count } = await supabase
+        .from('messages')
+        .select('id', { count: 'exact', head: true })
+        .in('conversation_id', ids)
+        .eq('read', false)
+        .neq('sender_id', userId)
+      setUnreadCount(count ?? 0)
+    } catch {
       setUnreadCount(0)
-      return
     }
-    const { count } = await supabase
-      .from('messages')
-      .select('id', { count: 'exact', head: true })
-      .in('conversation_id', ids)
-      .eq('read', false)
-      .neq('sender_id', userId)
-    setUnreadCount(count ?? 0)
   }, [])
 
   const loadPlaySessionsBadge = useCallback(async () => {

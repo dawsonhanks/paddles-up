@@ -1,9 +1,13 @@
 import { FriendAvatar } from '@/components/friend-avatar'
+import { ReportReasonModal } from '@/components/report-reason-modal'
 import { Colors } from '@/constants/theme'
 import { useColorScheme } from '@/hooks/use-color-scheme'
+import { blockUser } from '@/lib/blockedUsers'
+import { ensureFavoritesUser } from '@/lib/favorites'
 import { fetchFriendProfileBundle, removeFriendship, type FriendPlayer } from '@/lib/friends'
 import { getOrCreateConversation } from '@/lib/messages'
 import { userFriendlyFromUnknown } from '@/lib/errors'
+import { showReportActionSheet } from '@/lib/showReportMenu'
 import { MaterialIcons } from '@expo/vector-icons'
 import { useLocalSearchParams, useRouter } from 'expo-router'
 import { useCallback, useEffect, useState } from 'react'
@@ -11,6 +15,7 @@ import {
   ActivityIndicator,
   Alert,
   Image,
+  Keyboard,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -60,6 +65,15 @@ export default function FriendProfileScreen() {
   >({ state: 'loading' })
 
   const [unfriendBusy, setUnfriendBusy] = useState(false)
+  const [blockBusy, setBlockBusy] = useState(false)
+  const [myUserId, setMyUserId] = useState<string | null>(null)
+  const [reportProfileOpen, setReportProfileOpen] = useState(false)
+
+  useEffect(() => {
+    void ensureFavoritesUser().then((g) => {
+      if (!('error' in g)) setMyUserId(g.userId)
+    })
+  }, [])
 
   const reload = useCallback(async () => {
     if (!id || typeof id !== 'string') {
@@ -97,6 +111,31 @@ export default function FriendProfileScreen() {
       const msg = userFriendlyFromUnknown(e instanceof Error ? e.message : '')
       Alert.alert('Messages unavailable', msg)
     }
+  }
+
+  function confirmBlock() {
+    if (bundle.state !== 'ok') return
+    const label = bundle.player.display_name ?? bundle.player.username ?? 'this player'
+    Alert.alert('Block player', `Block ${label}? You won’t see their posts or messages, and they’ll be hidden from your friends list and searches until you unblock them.`, [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Block',
+        style: 'destructive',
+        onPress: async () => {
+          setBlockBusy(true)
+          try {
+            const { error } = await blockUser(bundle.player.user_id)
+            if (error) {
+              Alert.alert('Could not block', userFriendlyFromUnknown(error.message))
+              return
+            }
+            router.back()
+          } finally {
+            setBlockBusy(false)
+          }
+        },
+      },
+    ])
   }
 
   function confirmUnfriend() {
@@ -172,37 +211,45 @@ export default function FriendProfileScreen() {
       </Pressable>
 
       <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={styles.scrollInner}>
-        <View style={[styles.heroCard, { backgroundColor: cardBg, borderColor: cardBorder }]}>
-          <View style={[styles.avatarRing, isDark ? { borderColor: 'rgba(255,255,255,0.06)' } : { borderColor: 'rgba(0,0,0,0.04)' }]}>
-            <FriendAvatar friend={player} size={120} />
-          </View>
-          <Text style={[styles.displayName, { color: theme.text }]}>{player.display_name ?? 'Player'}</Text>
-          {player.username ? <Text style={[styles.username, { color: muted }]}>@{player.username}</Text> : null}
+        <Pressable
+          onLongPress={() => {
+            if (!myUserId || player.user_id === myUserId) return
+            Keyboard.dismiss()
+            showReportActionSheet(() => setReportProfileOpen(true))
+          }}
+          delayLongPress={450}>
+          <View style={[styles.heroCard, { backgroundColor: cardBg, borderColor: cardBorder }]}>
+            <View style={[styles.avatarRing, isDark ? { borderColor: 'rgba(255,255,255,0.06)' } : { borderColor: 'rgba(0,0,0,0.04)' }]}>
+              <FriendAvatar friend={player} size={120} />
+            </View>
+            <Text style={[styles.displayName, { color: theme.text }]}>{player.display_name ?? 'Player'}</Text>
+            {player.username ? <Text style={[styles.username, { color: muted }]}>@{player.username}</Text> : null}
 
-          {player.skill_rating != null ? (
-            <View style={[styles.ratingBadge, isDark ? { backgroundColor: 'rgba(29, 158, 117, 0.2)' } : { backgroundColor: '#E1F5EE' }]}>
-              <Image source={require('../../assets/images/icon.png')} style={styles.ratingLogo} />
-              <Text style={styles.ratingBadgeText}>{player.skill_rating.toFixed(1)}</Text>
-            </View>
-          ) : null}
+            {player.skill_rating != null ? (
+              <View style={[styles.ratingBadge, isDark ? { backgroundColor: 'rgba(29, 158, 117, 0.2)' } : { backgroundColor: '#E1F5EE' }]}>
+                <Image source={require('../../assets/images/icon.png')} style={styles.ratingLogo} />
+                <Text style={styles.ratingBadgeText}>{player.skill_rating.toFixed(1)}</Text>
+              </View>
+            ) : null}
 
-          <View style={styles.statsRow}>
-            <View style={styles.statBlock}>
-              <Text style={[styles.statNum, { color: '#1D9E75' }]}>{wins}</Text>
-              <Text style={[styles.statLabel, { color: muted }]}>Wins</Text>
-            </View>
-            <View style={[styles.statDivider, { backgroundColor: cardBorder }]} />
-            <View style={styles.statBlock}>
-              <Text style={[styles.statNum, { color: '#E24B4A' }]}>{losses}</Text>
-              <Text style={[styles.statLabel, { color: muted }]}>Losses</Text>
-            </View>
-            <View style={[styles.statDivider, { backgroundColor: cardBorder }]} />
-            <View style={styles.statBlock}>
-              <Text style={[styles.statNum, { color: theme.text }]}>{winRate}</Text>
-              <Text style={[styles.statLabel, { color: muted }]}>Win rate</Text>
+            <View style={styles.statsRow}>
+              <View style={styles.statBlock}>
+                <Text style={[styles.statNum, { color: '#1D9E75' }]}>{wins}</Text>
+                <Text style={[styles.statLabel, { color: muted }]}>Wins</Text>
+              </View>
+              <View style={[styles.statDivider, { backgroundColor: cardBorder }]} />
+              <View style={styles.statBlock}>
+                <Text style={[styles.statNum, { color: '#E24B4A' }]}>{losses}</Text>
+                <Text style={[styles.statLabel, { color: muted }]}>Losses</Text>
+              </View>
+              <View style={[styles.statDivider, { backgroundColor: cardBorder }]} />
+              <View style={styles.statBlock}>
+                <Text style={[styles.statNum, { color: theme.text }]}>{winRate}</Text>
+                <Text style={[styles.statLabel, { color: muted }]}>Win rate</Text>
+              </View>
             </View>
           </View>
-        </View>
+        </Pressable>
 
         <Text style={[styles.sectionTitle, { color: theme.text }]}>Recent matches</Text>
         {recentMatches.length === 0 ? (
@@ -251,6 +298,14 @@ export default function FriendProfileScreen() {
         </View>
 
         <TouchableOpacity
+          style={[styles.blockBtn, blockBusy && { opacity: 0.6 }]}
+          onPress={confirmBlock}
+          disabled={blockBusy}
+          activeOpacity={0.85}>
+          {blockBusy ? <ActivityIndicator color={theme.text} /> : <Text style={[styles.blockTxt, { color: theme.text }]}>Block</Text>}
+        </TouchableOpacity>
+
+        <TouchableOpacity
           style={[styles.unfriendBtn, unfriendBusy && { opacity: 0.6 }]}
           onPress={confirmUnfriend}
           disabled={unfriendBusy}
@@ -258,6 +313,13 @@ export default function FriendProfileScreen() {
           {unfriendBusy ? <ActivityIndicator color="#E24B4A" /> : <Text style={styles.unfriendTxt}>Unfriend</Text>}
         </TouchableOpacity>
       </ScrollView>
+
+      <ReportReasonModal
+        visible={reportProfileOpen}
+        onClose={() => setReportProfileOpen(false)}
+        contentType="profile"
+        contentId={player.user_id}
+      />
     </SafeAreaView>
   )
 }
@@ -344,7 +406,18 @@ const styles = StyleSheet.create({
   },
   msgBtnTxt: { fontSize: 16, fontWeight: '600' },
 
-  unfriendBtn: { alignItems: 'center', justifyContent: 'center', paddingVertical: 14, marginTop: 4 },
+  blockBtn: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 14,
+    marginTop: 4,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: 'rgba(148,163,184,0.45)',
+  },
+  blockTxt: { fontSize: 16, fontWeight: '700' },
+
+  unfriendBtn: { alignItems: 'center', justifyContent: 'center', paddingVertical: 14, marginTop: 10 },
   unfriendTxt: { color: '#E24B4A', fontSize: 16, fontWeight: '700' },
 
   errTitle: { fontSize: 20, fontWeight: '700', marginBottom: 8, textAlign: 'center' },

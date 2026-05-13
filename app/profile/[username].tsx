@@ -28,7 +28,12 @@ export default function PublicProfileScreen() {
   const [profile, setProfile] = useState<PublicProfile | null | undefined>(undefined)
 
   useEffect(() => {
-    if (!username) { setProfile(null); return }
+    if (!username) {
+      setProfile(null)
+      return
+    }
+
+    let cancelled = false
 
     async function load() {
       const { data: player } = await supabase
@@ -37,15 +42,21 @@ export default function PublicProfileScreen() {
         .eq('username', username)
         .maybeSingle()
 
-      if (!player) { setProfile(null); return }
+      if (cancelled) return
+      if (!player) {
+        setProfile(null)
+        return
+      }
 
       const { data: matchData } = await supabase
         .from('matches')
         .select('result')
         .eq('user_id', player.user_id)
 
-      const wins = matchData?.filter(m => m.result === 'win').length ?? 0
-      const losses = matchData?.filter(m => m.result === 'loss').length ?? 0
+      if (cancelled) return
+
+      const wins = matchData?.filter((m) => m?.result === 'win').length ?? 0
+      const losses = matchData?.filter((m) => m?.result === 'loss').length ?? 0
 
       setProfile({
         display_name: player.display_name,
@@ -57,7 +68,10 @@ export default function PublicProfileScreen() {
       })
     }
 
-    load()
+    void load()
+    return () => {
+      cancelled = true
+    }
   }, [username])
 
   const winRate = profile && (profile.wins + profile.losses) > 0
@@ -94,7 +108,7 @@ export default function PublicProfileScreen() {
       </Pressable>
 
       <View style={styles.card}>
-        {profile.avatar_url ? (
+        {profile?.avatar_url ? (
           <Image source={{ uri: profile.avatar_url }} style={styles.avatar} />
         ) : (
           <View style={styles.avatarPlaceholder}>
@@ -102,11 +116,11 @@ export default function PublicProfileScreen() {
           </View>
         )}
 
-        <Text style={styles.displayName}>{profile.display_name ?? 'Anonymous'}</Text>
-        {profile.username ? (
+        <Text style={styles.displayName}>{profile?.display_name ?? 'Anonymous'}</Text>
+        {profile?.username ? (
           <Text style={styles.username}>@{profile.username}</Text>
         ) : null}
-        {profile.skill_rating != null ? (
+        {profile?.skill_rating != null ? (
           <View style={styles.ratingBadge}>
             <Image source={require('../../assets/images/icon.png')} style={styles.ratingLogo} />
             <Text style={styles.ratingBadgeText}>{profile.skill_rating.toFixed(1)}</Text>
@@ -115,12 +129,12 @@ export default function PublicProfileScreen() {
 
         <View style={styles.statsRow}>
           <View style={styles.statBlock}>
-            <Text style={[styles.statNum, { color: '#1D9E75' }]}>{profile.wins}</Text>
+            <Text style={[styles.statNum, { color: '#1D9E75' }]}>{profile?.wins ?? 0}</Text>
             <Text style={styles.statLabel}>Wins</Text>
           </View>
           <View style={styles.statDivider} />
           <View style={styles.statBlock}>
-            <Text style={[styles.statNum, { color: '#E24B4A' }]}>{profile.losses}</Text>
+            <Text style={[styles.statNum, { color: '#E24B4A' }]}>{profile?.losses ?? 0}</Text>
             <Text style={styles.statLabel}>Losses</Text>
           </View>
           <View style={styles.statDivider} />

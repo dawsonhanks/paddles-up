@@ -8,9 +8,13 @@ import { STATUS_PIN_COLOR, type Court } from '@/lib/courts'
 export type CourtMapProps = {
   userLat: number
   userLon: number
+  /** When false, hides the OS “you are here” dot (e.g. location permission denied). */
+  showUserLocation?: boolean
   courts: Court[]
   selectedId: string | null
   onSelectCourt: (id: string) => void
+  /** Bottom `mapPadding` so pins / camera clear overlays; also shifts Apple/Google legal toward the bottom edge. */
+  mapBottomPadding: number
   onMapPress?: () => void
   onRegionChangeComplete?: (region: {
     latitude: number
@@ -21,7 +25,6 @@ export type CourtMapProps = {
 }
 
 const NEIGHBORHOOD_DELTA = 0.06
-const MAP_BOTTOM_PADDING_PX = 210
 
 function PickleballFace({ color }: { color: string }) {
   return (
@@ -46,8 +49,10 @@ export function CourtMap({
   courts,
   selectedId,
   onSelectCourt,
+  mapBottomPadding,
   onMapPress,
   onRegionChangeComplete,
+  showUserLocation = true,
 }: CourtMapProps) {
   const mapRef = useRef<MapView>(null)
   const initialZoomDone = useRef(false)
@@ -73,7 +78,7 @@ export function CourtMap({
     <MapView
       ref={mapRef}
       style={StyleSheet.absoluteFill}
-      mapPadding={{ top: 0, right: 0, bottom: MAP_BOTTOM_PADDING_PX, left: 0 }}
+      mapPadding={{ top: 0, right: 0, bottom: mapBottomPadding, left: 0 }}
       initialRegion={{
         latitude: userLat,
         longitude: userLon,
@@ -83,7 +88,7 @@ export function CourtMap({
       onRegionChangeComplete={onRegionChangeComplete}
       onPress={onMapPress}
       onPanDrag={onMapPress}
-      showsUserLocation
+      showsUserLocation={showUserLocation}
       showsMyLocationButton={false}>
       {courts.map((c) => (
         <Marker

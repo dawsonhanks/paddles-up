@@ -1017,8 +1017,8 @@ export default function RecordScreen() {
                   <TouchableOpacity
                     key={court.id}
                     style={[styles.courtListItem, i < courts.length - 1 && { borderBottomColor: cardBorder, borderBottomWidth: 0.5 }]}
-                    onPress={() => { setChallengeCourtId(court.id); setChallengeCourtName(court.name); setShowCourtPicker(false) }}>
-                    <Text style={[styles.courtListItemText, { color: theme.text }]}>{court.name}</Text>
+                    onPress={() => { setChallengeCourtId(court.id); setChallengeCourtName(court?.name ?? ''); setShowCourtPicker(false) }}>
+                    <Text style={[styles.courtListItemText, { color: theme.text }]}>{court?.name ?? 'Court'}</Text>
                     {challengeCourtId === court.id
                       ? <MaterialIcons name="check" size={18} color="#1D9E75" />
                       : null}

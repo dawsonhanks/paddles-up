@@ -1,6 +1,7 @@
 import { ErrorBanner } from '@/components/error-banner'
 import { Colors } from '@/constants/theme'
 import { useColorScheme } from '@/hooks/use-color-scheme'
+import { fetchBlockedUserIds } from '@/lib/blockedUsers'
 import { userFriendlyFromUnknown } from '@/lib/errors'
 import { listConversations, type ConversationListItem } from '@/lib/messages'
 import { MaterialIcons } from '@expo/vector-icons'
@@ -38,8 +39,9 @@ export default function MessagesScreen() {
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      const data = await listConversations()
-      setRows(data)
+      const [data, blockedIds] = await Promise.all([listConversations(), fetchBlockedUserIds()])
+      const blocked = new Set(blockedIds)
+      setRows(data.filter((c) => !blocked.has(c.otherUserId)))
       setMessagesBanner(null)
     } catch (e) {
       setRows([])

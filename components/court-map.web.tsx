@@ -4,9 +4,13 @@ import { StyleSheet, Text, View } from 'react-native'
 export type CourtMapProps = {
   userLat: number
   userLon: number
+  /** Native only; ignored on web. */
+  showUserLocation?: boolean
   courts: Court[]
   selectedId: string | null
   onSelectCourt: (id: string) => void
+  /** Unused on web; kept for a shared `CourtMapProps` shape with native. */
+  mapBottomPadding?: number
   onMapPress?: () => void
   onRegionChangeComplete?: (region: {
     latitude: number

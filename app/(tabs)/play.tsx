@@ -1,6 +1,9 @@
 import { Colors } from '@/constants/theme'
 import { useColorScheme } from '@/hooks/use-color-scheme'
+import { fetchBlockedUserIds } from '@/lib/blockedUsers'
+import type { ContentReportType } from '@/lib/contentReports'
 import { ensureFavoritesUser } from '@/lib/favorites'
+import { showReportActionSheet } from '@/lib/showReportMenu'
 import { sendPushNotification } from '@/lib/push'
 import { MaterialIcons } from '@expo/vector-icons'
 import { useNetworkOffline } from '@/contexts/network-status-context'
@@ -10,7 +13,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage'
 import DateTimePicker from '@react-native-community/datetimepicker'
 import * as Haptics from 'expo-haptics'
 import { useRouter } from 'expo-router'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ActivityIndicator,
   Alert,
@@ -31,6 +34,7 @@ import {
 } from 'react-native'
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context'
 
+import { ReportReasonModal } from '@/components/report-reason-modal'
 import { ContentFadeIn } from '@/components/content-fade-in'
 import { ErrorBanner } from '@/components/error-banner'
 import { SkeletonGamePostCard, SkeletonSessionCard } from '@/components/skeleton-card'
@@ -133,7 +137,7 @@ function gameTypeBadge(gameType: string): string {
 
 function spotsLabel(post: GamePost, accepts: AcceptRow[]): string {
   const filled = accepts.length
-  const total = filled + Math.max(0, post.players_needed)
+  const total = filled + Math.max(0, post?.players_needed ?? 0)
   return `${filled} of ${total} spots filled`
 }
 
@@ -203,6 +207,7 @@ export default function PlayScreen() {
   const [currentUserId, setCurrentUserId] = useState<string | null>(null)
   const [acceptedPostIds, setAcceptedPostIds] = useState<Set<string>>(new Set())
   const [acceptBusyPostId, setAcceptBusyPostId] = useState<string | null>(null)
+  const [reportTarget, setReportTarget] = useState<{ type: ContentReportType; id: string } | null>(null)
 
   const [expireAtMidnight, setExpireAtMidnight] = useState(false)
 
@@ -248,6 +253,14 @@ export default function PlayScreen() {
   const [composeCourtSearch, setComposeCourtSearch] = useState('')
   const [showComposeDatetime, setShowComposeDatetime] = useState(false)
 
+  const deadRef = useRef(false)
+  useEffect(() => {
+    deadRef.current = false
+    return () => {
+      deadRef.current = true
+    }
+  }, [])
+
   useEffect(() => {
     const unsub = subscribePlayRatingFilter(() => {
       const next = getPlayRatingFilter()
@@ -276,13 +289,13 @@ export default function PlayScreen() {
   const filteredCourtPickForSchedule = useMemo(() => {
     const q = courtPickSearch.trim().toLowerCase()
     if (!q.length) return courtPickerRows
-    return courtPickerRows.filter((c) => c.name.toLowerCase().includes(q))
+    return courtPickerRows.filter((c) => (c?.name ?? '').toLowerCase().includes(q))
   }, [courtPickSearch, courtPickerRows])
 
   const filteredCourtPickForCompose = useMemo(() => {
     const q = composeCourtSearch.trim().toLowerCase()
     if (!q.length) return courtPickerRows
-    return courtPickerRows.filter((c) => c.name.toLowerCase().includes(q))
+    return courtPickerRows.filter((c) => (c?.name ?? '').toLowerCase().includes(q))
   }, [composeCourtSearch, courtPickerRows])
 
   useEffect(() => {
@@ -333,19 +346,25 @@ export default function PlayScreen() {
     return filteredPosts.filter((p) => !mine.has(p.id))
   }, [filteredPosts, myGames])
 
-  const loadPosts = useCallback(async (opts?: { pullToRefresh?: boolean }) => {
+  const loadPosts = useCallback(async (opts?: { pullToRefresh?: boolean; cancelledRef?: { current: boolean } }) => {
     const pullToRefresh = opts?.pullToRefresh === true
+    const cx = () => opts?.cancelledRef?.current === true
     if (pullToRefresh) setRefreshing(true)
     else setLoading(true)
     try {
       if (isOffline) {
         const raw = await AsyncStorage.getItem(CACHED_GAME_POSTS_KEY)
+        if (cx()) return
+        const blockedSet = new Set(await fetchBlockedUserIds())
+        if (cx()) return
         if (raw) {
           const parsed = JSON.parse(raw) as { posts?: GamePost[]; cachedAt?: string }
-          const hydrated = (parsed.posts ?? []).map((p) => ({
-            ...p,
-            game_type: (p.game_type as GamePost['game_type']) ?? 'open',
-          }))
+          const hydrated = (parsed.posts ?? [])
+            .map((p) => ({
+              ...p,
+              game_type: (p.game_type as GamePost['game_type']) ?? 'open',
+            }))
+            .filter((p) => !blockedSet.has(p.user_id))
           setPosts(hydrated)
           setCachedPostsAt(parsed.cachedAt ?? null)
         } else {
@@ -359,6 +378,7 @@ export default function PlayScreen() {
       }
 
       const gate = await ensureFavoritesUser()
+      if (cx()) return
       let uid: string | null = null
       if (!('error' in gate)) {
         uid = gate.userId
@@ -372,10 +392,14 @@ export default function PlayScreen() {
         .select('*')
         .gt('expires_at', new Date().toISOString())
         .order('created_at', { ascending: false })
-      const rawPostsPre = ((data ?? []) as GamePost[]).map((p) => ({
+      if (cx()) return
+      const blockedSet = new Set(await fetchBlockedUserIds())
+      if (cx()) return
+      const rawPostsPreAll = ((data ?? []) as GamePost[]).map((p) => ({
         ...p,
         game_type: (p.game_type as GamePost['game_type']) ?? 'open',
       }))
+      const rawPostsPre = rawPostsPreAll.filter((p) => !blockedSet.has(p.user_id))
       const courtIdsNeeded = [...new Set(
         rawPostsPre
           .map((p) => (typeof p.court_id === 'string' ? p.court_id.trim() : ''))
@@ -384,6 +408,7 @@ export default function PlayScreen() {
       let nameByCourtId: Record<string, string> = {}
       if (courtIdsNeeded.length > 0) {
         const { data: cnRows } = await supabase.from('courts').select('id, name').in('id', courtIdsNeeded)
+        if (cx()) return
         for (const r of (cnRows ?? []) as { id: string; name: string | null }[]) {
           const nm = typeof r.name === 'string' && r.name.trim() ? r.name.trim() : ''
           nameByCourtId[String(r.id)] = nm.length > 0 ? nm : 'Court'
@@ -397,6 +422,7 @@ export default function PlayScreen() {
         }
       })
       const nextPosts = rawPosts
+      if (cx()) return
       setPosts(nextPosts)
 
       const posterUserIds = nextPosts
@@ -407,6 +433,7 @@ export default function PlayScreen() {
           .from('players')
           .select('user_id, skill_rating')
           .in('user_id', posterUserIds)
+        if (cx()) return
         const ratingMap: Record<string, number | null> = {}
         for (const row of (ratingRows ?? []) as PlayerRatingRow[]) {
           ratingMap[row.user_id] = row.skill_rating ?? null
@@ -423,12 +450,17 @@ export default function PlayScreen() {
           .select('post_id, user_id, display_name, skill_level, created_at')
           .in('post_id', postIds)
           .order('created_at', { ascending: true })
+        if (cx()) return
         const buckets: Record<string, AcceptRow[]> = {}
         for (const id of postIds) buckets[id] = []
         for (const row of acceptRows ?? []) {
           const a = row as AcceptRow
           if (!buckets[a.post_id]) buckets[a.post_id] = []
           buckets[a.post_id].push(a)
+        }
+        for (const pid of postIds) {
+          const arr = buckets[pid] ?? []
+          buckets[pid] = arr.filter((a) => !blockedSet.has(a.user_id))
         }
         setAcceptsByPostId(buckets)
       } else {
@@ -439,17 +471,21 @@ export default function PlayScreen() {
         CACHED_GAME_POSTS_KEY,
         JSON.stringify({ cachedAt, posts: nextPosts })
       )
+      if (cx()) return
       setCachedPostsAt(cachedAt)
 
       if (uid) {
         const { data: acceptRows } = await supabase.from('accepts').select('post_id').eq('user_id', uid)
+        if (cx()) return
         setAcceptedPostIds(new Set((acceptRows ?? []).map((r) => r.post_id as string)))
       } else {
         setAcceptedPostIds(new Set())
       }
     } finally {
-      if (pullToRefresh) setRefreshing(false)
-      else setLoading(false)
+      if (!opts?.cancelledRef?.current) {
+        if (pullToRefresh) setRefreshing(false)
+        else setLoading(false)
+      }
     }
   }, [isOffline])
 
@@ -457,34 +493,42 @@ export default function PlayScreen() {
     setCourtPickLoading(true)
     try {
       const rows = await fetchCourtRowsForPicker()
+      if (deadRef.current) return
       setCourtPickerRows(rows)
     } catch {
-      setPlayBanner('We could not load the court list. Check your connection and try again.')
+      if (!deadRef.current) {
+        setPlayBanner('We could not load the court list. Check your connection and try again.')
+      }
     } finally {
-      setCourtPickLoading(false)
+      if (!deadRef.current) setCourtPickLoading(false)
     }
   }, [])
 
-  const loadScheduledSessions = useCallback(async (opts?: { refreshing?: boolean }) => {
+  const loadScheduledSessions = useCallback(async (opts?: { refreshing?: boolean; cancelledRef?: { current: boolean } }) => {
     if (opts?.refreshing === true) setSessionsRefreshing(true)
     else setSessionsLoading(true)
+    const cx = () => opts?.cancelledRef?.current === true
     try {
       if (isOffline) {
         setScheduledSessions([])
         return
       }
       const gate = await ensureFavoritesUser()
+      if (cx()) return
       if ('error' in gate) {
         setScheduledSessions([])
         return
       }
       const rows = await fetchUpcomingScheduledSessions(gate.userId)
+      if (cx()) return
       setScheduledSessions(rows)
     } catch {
-      setScheduledSessions([])
+      if (!opts?.cancelledRef?.current) setScheduledSessions([])
     } finally {
-      setSessionsRefreshing(false)
-      setSessionsLoading(false)
+      if (!opts?.cancelledRef?.current) {
+        setSessionsRefreshing(false)
+        setSessionsLoading(false)
+      }
     }
   }, [isOffline])
 
@@ -660,14 +704,22 @@ export default function PlayScreen() {
 
   useFocusEffect(
     useCallback(() => {
-      void loadPosts()
-      void loadScheduledSessions()
-    }, [loadPosts, loadScheduledSessions])
+      const cancelled = { current: false }
+      void loadPosts({ cancelledRef: cancelled })
+      void loadScheduledSessions({ cancelledRef: cancelled })
+      return () => {
+        cancelled.current = true
+      }
+    }, [loadPosts, loadScheduledSessions]),
   )
 
   useEffect(() => {
     if (isOffline) return
-    void loadPosts()
+    const cancelled = { current: false }
+    void loadPosts({ cancelledRef: cancelled })
+    return () => {
+      cancelled.current = true
+    }
   }, [isOffline, loadPosts])
 
   async function acceptGamePost(post: GamePost) {
@@ -914,22 +966,31 @@ export default function PlayScreen() {
   }
 
   function renderGameCard(item: GamePost) {
-    const sc = skillColor(item.skill_level)
-    const isMine = currentUserId != null && item.user_id === currentUserId
-    const accepts = acceptsByPostId[item.id] ?? []
-    const expanded = !!expandedPosts[item.id]
-    const gtLabel = gameTypeBadge(item.game_type)
-    const posterRating = ratingsByUserId[item.user_id] ?? null
+    const sc = skillColor(item?.skill_level ?? '')
+    const isMine = currentUserId != null && item?.user_id === currentUserId
+    const accepts = acceptsByPostId[item?.id ?? ''] ?? []
+    const expanded = !!expandedPosts[item?.id ?? '']
+    const gtLabel = gameTypeBadge(item?.game_type ?? '')
+    const posterRating = ratingsByUserId[item?.user_id ?? ''] ?? null
 
     return (
-      <View style={[styles.card, { backgroundColor: cardBg, borderColor: cardBorder }]}>
+      <Pressable
+        style={[styles.card, { backgroundColor: cardBg, borderColor: cardBorder }]}
+        onLongPress={() => {
+          if (isMine || !currentUserId) return
+          Keyboard.dismiss()
+          showReportActionSheet(() => {
+            setReportTarget({ type: 'post', id: item?.id ?? '' })
+          })
+        }}
+        delayLongPress={450}>
         <View style={styles.cardTop}>
           <View style={styles.avatarCircle}>
-            <Text style={styles.avatarText}>{item.display_name.charAt(0).toUpperCase()}</Text>
+            <Text style={styles.avatarText}>{(item?.display_name ?? '?').charAt(0).toUpperCase()}</Text>
           </View>
           <View style={styles.cardInfo}>
-            <Text style={[styles.cardName, { color: theme.text }]}>{item.display_name}</Text>
-            <Text style={[styles.cardMeta, { color: theme.icon }]}>{item.city} · {timeAgo(item.created_at)}</Text>
+            <Text style={[styles.cardName, { color: theme.text }]}>{item?.display_name ?? 'Player'}</Text>
+            <Text style={[styles.cardMeta, { color: theme.icon }]}>{item?.city ?? ''} · {item?.created_at ? timeAgo(item.created_at) : ''}</Text>
             <View style={styles.gameTypeBadgeRow}>
               <View style={[styles.gameTypePillSmall, { backgroundColor: isDark ? 'rgba(29,158,117,0.22)' : '#E1F5EE', borderColor: '#1D9E75' }]}>
                 <Text style={[styles.gameTypePillSmallText, { color: '#0F6E56' }]}>{gtLabel}</Text>
@@ -943,21 +1004,21 @@ export default function PlayScreen() {
             </View>
           </View>
           <View style={[styles.skillBadge, { backgroundColor: sc.bg }]}>
-            <Text style={[styles.skillText, { color: sc.text }]}>{item.skill_level}</Text>
+            <Text style={[styles.skillText, { color: sc.text }]}>{item?.skill_level ?? ''}</Text>
           </View>
         </View>
-        {item.message ? (
+        {item?.message ? (
           <Text style={[styles.cardMessage, { color: theme.text }]}>{item.message}</Text>
         ) : null}
-        {item.session_starts_at || item.resolved_court_name ? (
+        {item?.session_starts_at || item?.resolved_court_name ? (
           <View style={styles.gameMeetWrap}>
-            {item.session_starts_at ? (
+            {item?.session_starts_at ? (
               <Text style={[styles.gameMeetMeta, { color: theme.icon }]} numberOfLines={2}>
                 <Text style={{ fontWeight: '700', color: theme.text }}>Meet: </Text>
                 {formatSessionHumanDate(new Date(item.session_starts_at))}
               </Text>
             ) : null}
-            {item.resolved_court_name ? (
+            {item?.resolved_court_name ? (
               <Text style={[styles.gameMeetMeta, { color: theme.icon }]} numberOfLines={2}>
                 <Text style={{ fontWeight: '700', color: theme.text }}>Court: </Text>
                 {item.resolved_court_name}
@@ -969,9 +1030,9 @@ export default function PlayScreen() {
         <View style={styles.joinersBlock}>
           {accepts.length > 0 ? (
             <View style={styles.joinersAvatars}>
-              {accepts.slice(0, 8).map((a) => (
-                <View key={a.user_id} style={[styles.miniAvatar, { borderColor: cardBorder }]}>
-                  <Text style={styles.miniAvatarText}>{a.display_name.charAt(0).toUpperCase()}</Text>
+              {accepts.slice(0, 8).map((a, idx) => (
+                <View key={a?.user_id ?? `join-${idx}`} style={[styles.miniAvatar, { borderColor: cardBorder }]}>
+                  <Text style={styles.miniAvatarText}>{(a?.display_name ?? '?').charAt(0).toUpperCase()}</Text>
                 </View>
               ))}
             </View>
@@ -987,7 +1048,7 @@ export default function PlayScreen() {
         <Pressable
           onPress={() => {
             Keyboard.dismiss()
-            setExpandedPosts((prev) => ({ ...prev, [item.id]: !prev[item.id] }))
+            setExpandedPosts((prev) => ({ ...prev, [item?.id ?? '']: !prev[item?.id ?? ''] }))
           }}
           style={({ pressed }) => [
             styles.playersToggle,
@@ -1004,18 +1065,28 @@ export default function PlayScreen() {
             {accepts.length === 0 ? (
               <Text style={[styles.playersEmpty, { color: theme.icon }]}>No one has joined yet.</Text>
             ) : (
-              accepts.map((a) => (
-                <View key={a.user_id} style={[styles.playerRow, { borderBottomColor: cardBorder }]}>
+              accepts.map((a, idx) => (
+                <Pressable
+                  key={a?.user_id ?? `player-${idx}`}
+                  onLongPress={() => {
+                    if (!currentUserId || a?.user_id === currentUserId) return
+                    Keyboard.dismiss()
+                    showReportActionSheet(() => {
+                      setReportTarget({ type: 'profile', id: a?.user_id ?? '' })
+                    })
+                  }}
+                  delayLongPress={450}
+                  style={[styles.playerRow, { borderBottomColor: cardBorder }]}>
                   <View style={styles.avatarCircleSm}>
-                    <Text style={styles.avatarTextSm}>{a.display_name.charAt(0).toUpperCase()}</Text>
+                    <Text style={styles.avatarTextSm}>{(a?.display_name ?? '?').charAt(0).toUpperCase()}</Text>
                   </View>
                   <View style={{ flex: 1, minWidth: 0 }}>
-                    <Text style={[styles.playerName, { color: theme.text }]} numberOfLines={1}>{a.display_name}</Text>
+                    <Text style={[styles.playerName, { color: theme.text }]} numberOfLines={1}>{a?.display_name ?? 'Player'}</Text>
                     <Text style={[styles.playerSkill, { color: theme.icon }]}>
-                      Skill: {a.skill_level?.trim() ? a.skill_level : 'Not set'}
+                      Skill: {a?.skill_level?.trim() ? a.skill_level : 'Not set'}
                     </Text>
                   </View>
-                </View>
+                </Pressable>
               ))
             )}
           </View>
@@ -1023,7 +1094,7 @@ export default function PlayScreen() {
 
         <View style={[styles.cardFooter, { borderTopColor: cardBorder }]}>
           <View style={styles.cardFooterSpacer}>
-            {item.players_needed <= 0 ? (
+            {(item?.players_needed ?? 1) <= 0 ? (
               <View style={[styles.gameFullBadge, { borderColor: cardBorder, backgroundColor: isDark ? 'rgba(148,163,184,0.15)' : '#F1F5F9' }]}>
                 <MaterialIcons name="groups" size={16} color={isDark ? '#94A3B8' : '#64748B'} />
                 <Text style={[styles.gameFullBadgeText, { color: isDark ? '#94A3B8' : '#64748B' }]}>Game full</Text>
@@ -1051,16 +1122,16 @@ export default function PlayScreen() {
                 <Text style={[styles.smallActionText, { color: '#E24B4A' }]}>Delete</Text>
               </TouchableOpacity>
             </View>
-          ) : acceptedPostIds.has(item.id) ? (
+          ) : acceptedPostIds.has(item?.id ?? '') ? (
             <View style={styles.acceptedJoinedCol}>
               <TouchableOpacity
                 onPress={() => {
                   Keyboard.dismiss()
                   unacceptGamePost(item)
                 }}
-                disabled={acceptBusyPostId === item.id}
-                style={[styles.joinedBadge, { borderColor: cardBorder, opacity: acceptBusyPostId === item.id ? 0.6 : 1 }]}>
-                {acceptBusyPostId === item.id ? (
+                disabled={acceptBusyPostId === item?.id}
+                style={[styles.joinedBadge, { borderColor: cardBorder, opacity: acceptBusyPostId === item?.id ? 0.6 : 1 }]}>
+                {acceptBusyPostId === item?.id ? (
                   <ActivityIndicator size="small" color="#1D9E75" />
                 ) : (
                   <>
@@ -1085,9 +1156,9 @@ export default function PlayScreen() {
                 Keyboard.dismiss()
                 acceptGamePost(item)
               }}
-              disabled={acceptBusyPostId != null || item.players_needed <= 0}
-              style={[styles.acceptBtn, { opacity: acceptBusyPostId != null || item.players_needed <= 0 ? 0.55 : 1 }]}>
-              {acceptBusyPostId === item.id ? (
+              disabled={acceptBusyPostId != null || (item?.players_needed ?? 1) <= 0}
+              style={[styles.acceptBtn, { opacity: acceptBusyPostId != null || (item?.players_needed ?? 1) <= 0 ? 0.55 : 1 }]}>
+              {acceptBusyPostId === item?.id ? (
                 <ActivityIndicator size="small" color="#fff" />
               ) : (
                 <Text style={styles.acceptBtnText}>Accept</Text>
@@ -1095,7 +1166,7 @@ export default function PlayScreen() {
             </TouchableOpacity>
           )}
         </View>
-      </View>
+      </Pressable>
     )
   }
 
@@ -1130,19 +1201,19 @@ export default function PlayScreen() {
   }
 
   function renderScheduledSessionCard(row: ScheduledSessionRow) {
-    const when = new Date(row.session_date)
+    const when = new Date(row?.session_date ?? '')
     const rel = scheduledSessionRelativeLabel(when)
     const humanWhen = formatSessionHumanDate(when)
-    const note = typeof row.notes === 'string' && row.notes.trim() ? row.notes.trim() : null
+    const note = typeof row?.notes === 'string' && row.notes.trim() ? row.notes.trim() : null
     return (
       <Pressable
         onPress={() => {
           Keyboard.dismiss()
-          router.push(`/court/${encodeURIComponent(row.court_id)}`)
+          router.push(`/court/${encodeURIComponent(row?.court_id ?? '')}`)
         }}
         onLongPress={() => {
           Keyboard.dismiss()
-          promptScheduledSessionActions(row)
+          if (row) promptScheduledSessionActions(row)
         }}
         delayLongPress={500}
         style={({ pressed }) => [
@@ -1154,7 +1225,7 @@ export default function PlayScreen() {
           },
         ]}>
         <Text style={[styles.sessionCourtName, { color: theme.text }]} numberOfLines={2}>
-          {row.court_name}
+          {row?.court_name ?? 'Court'}
         </Text>
         <Text style={[styles.sessionHumanWhen, { color: theme.icon }]}>{humanWhen}</Text>
         <Text style={[styles.sessionCountdownLine, { color: '#1D9E75' }]}>{rel}</Text>
@@ -1211,7 +1282,7 @@ export default function PlayScreen() {
     <FlatList
       style={styles.findGameFlex}
       data={browsePosts}
-      keyExtractor={(item) => item.id}
+      keyExtractor={(item) => item?.id ?? ''}
       keyboardShouldPersistTaps="handled"
       contentContainerStyle={[styles.list, { paddingBottom: findGamesListBottomPad }]}
       refreshControl={findGameRefreshControl}
@@ -1220,7 +1291,7 @@ export default function PlayScreen() {
           <View style={styles.myGamesHeader}>
             <Text style={[styles.sectionTitle, { color: theme.text }]}>My games</Text>
             {myGames.map((p) => (
-              <View key={p.id} style={styles.myGameCardWrap}>
+              <View key={p?.id ?? ''} style={styles.myGameCardWrap}>
                 {renderGameCard(p)}
               </View>
             ))}
@@ -1280,7 +1351,7 @@ export default function PlayScreen() {
     <FlatList
       style={{ flex: 1 }}
       data={scheduledSessions}
-      keyExtractor={(s) => s.id}
+      keyExtractor={(s) => s?.id ?? ''}
       keyboardShouldPersistTaps="handled"
       contentContainerStyle={[styles.sessionsList, { paddingBottom: sessionsScheduleBtnBottomPad }]}
       refreshControl={sessionsRefreshControl}
@@ -1310,12 +1381,12 @@ export default function PlayScreen() {
   const handleScheduleCourtRowPress = (c: CourtPickerRow, fromComposer: boolean) => {
     Keyboard.dismiss()
     if (fromComposer) {
-      setComposeCourtId(c.id)
-      setComposeCourtName(c.name)
+      setComposeCourtId(c?.id ?? '')
+      setComposeCourtName(c?.name ?? '')
       setCourtPickOverlay(null)
     } else {
-      setScheduleCourtId(c.id)
-      setScheduleCourtName(c.name)
+      setScheduleCourtId(c?.id ?? '')
+      setScheduleCourtName(c?.name ?? '')
       setCourtPickOverlay(null)
     }
   }
@@ -1476,14 +1547,14 @@ export default function PlayScreen() {
                 <FlatList
                   style={{ flex: 1 }}
                   data={filteredCourtPickForCompose}
-                  keyExtractor={(c) => c.id}
+                  keyExtractor={(c) => c?.id ?? ''}
                   keyboardShouldPersistTaps="handled"
                   contentContainerStyle={styles.courtPickListInset}
                   renderItem={({ item }) => (
                     <TouchableOpacity
                       style={[styles.courtPickRow, { borderBottomColor: cardBorder }]}
                       onPress={() => handleScheduleCourtRowPress(item, true)}>
-                      <Text style={[styles.courtPickRowTitle, { color: theme.text }]} numberOfLines={2}>{item.name}</Text>
+                      <Text style={[styles.courtPickRowTitle, { color: theme.text }]} numberOfLines={2}>{item?.name ?? ''}</Text>
                     </TouchableOpacity>
                   )}
                 />
@@ -1765,13 +1836,13 @@ export default function PlayScreen() {
                   style={{ flex: 1 }}
                   data={filteredCourtPickForSchedule}
                   keyboardShouldPersistTaps="handled"
-                  keyExtractor={(c) => c.id}
+                  keyExtractor={(c) => c?.id ?? ''}
                   contentContainerStyle={styles.courtPickListInset}
                   renderItem={({ item }) => (
                     <TouchableOpacity
                       style={[styles.courtPickRow, { borderBottomColor: cardBorder }]}
                       onPress={() => handleScheduleCourtRowPress(item, false)}>
-                      <Text style={[styles.courtPickRowTitle, { color: theme.text }]} numberOfLines={2}>{item.name}</Text>
+                      <Text style={[styles.courtPickRowTitle, { color: theme.text }]} numberOfLines={2}>{item?.name ?? ''}</Text>
                     </TouchableOpacity>
                   )}
                 />
@@ -1914,6 +1985,12 @@ export default function PlayScreen() {
       </Modal>
       </View>
       </TouchableWithoutFeedback>
+      <ReportReasonModal
+        visible={reportTarget != null}
+        onClose={() => setReportTarget(null)}
+        contentType={reportTarget?.type ?? 'post'}
+        contentId={reportTarget?.id ?? ''}
+      />
     </SafeAreaView>
   )
 }

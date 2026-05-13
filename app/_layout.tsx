@@ -2,6 +2,7 @@ import { DarkTheme, DefaultTheme, ThemeProvider } from '@react-navigation/native
 import { AppErrorBoundary } from '@/components/app-error-boundary'
 import { PersistentOfflineBanner } from '@/components/persistent-offline-banner'
 import { NetworkStatusProvider } from '@/contexts/network-status-context'
+import { Colors } from '@/constants/theme'
 import { useColorScheme } from '@/hooks/use-color-scheme'
 import { supabase } from '@/supabase'
 import Constants from 'expo-constants'
@@ -10,7 +11,7 @@ import * as Notifications from 'expo-notifications'
 import { router, Stack } from 'expo-router'
 import { StatusBar } from 'expo-status-bar'
 import { useEffect } from 'react'
-import { Platform, StyleSheet, View } from 'react-native'
+import { AppState, Platform, StyleSheet, View } from 'react-native'
 import { SafeAreaProvider } from 'react-native-safe-area-context'
 import 'react-native-reanimated'
 
@@ -26,33 +27,37 @@ Notifications.setNotificationHandler({
 
 async function registerForPushNotifications() {
   if (!Device.isDevice) return null
+  try {
+    const { status: existingStatus } = await Notifications.getPermissionsAsync()
+    let finalStatus = existingStatus
 
-  const { status: existingStatus } = await Notifications.getPermissionsAsync()
-  let finalStatus = existingStatus
+    if (existingStatus !== 'granted') {
+      const { status } = await Notifications.requestPermissionsAsync()
+      finalStatus = status
+    }
 
-  if (existingStatus !== 'granted') {
-    const { status } = await Notifications.requestPermissionsAsync()
-    finalStatus = status
+    if (finalStatus !== 'granted') return null
+
+    const projectId =
+      (Constants.expoConfig?.extra as { eas?: { projectId?: string } } | undefined)?.eas?.projectId ??
+      Constants.easConfig?.projectId
+
+    const token = (
+      await Notifications.getExpoPushTokenAsync(projectId ? { projectId } : undefined)
+    ).data
+
+    if (Platform.OS === 'android') {
+      await Notifications.setNotificationChannelAsync('default', {
+        name: 'default',
+        importance: Notifications.AndroidImportance.MAX,
+      })
+    }
+
+    return token
+  } catch (e) {
+    if (__DEV__) console.warn('[RootLayout] registerForPushNotifications', e)
+    return null
   }
-
-  if (finalStatus !== 'granted') return null
-
-  const projectId =
-    (Constants.expoConfig?.extra as { eas?: { projectId?: string } } | undefined)?.eas?.projectId ??
-    Constants.easConfig?.projectId
-
-  const token = (
-    await Notifications.getExpoPushTokenAsync(projectId ? { projectId } : undefined)
-  ).data
-
-  if (Platform.OS === 'android') {
-    Notifications.setNotificationChannelAsync('default', {
-      name: 'default',
-      importance: Notifications.AndroidImportance.MAX,
-    })
-  }
-
-  return token
 }
 
 export const unstable_settings = {
@@ -61,18 +66,45 @@ export const unstable_settings = {
 
 export default function RootLayout() {
   const colorScheme = useColorScheme()
+  const theme = Colors[colorScheme ?? 'light']
 
   useEffect(() => {
-    registerForPushNotifications().then(async (token) => {
-      if (!token) return
-      const { data: sessionData } = await supabase.auth.getSession()
-      const userId = sessionData.session?.user?.id
-      if (!userId) return
-      await supabase.from('notification_tokens').upsert({
-        user_id: userId,
-        push_token: token,
-      }, { onConflict: 'user_id' })
+    const sub = AppState.addEventListener('change', (state) => {
+      try {
+        if (state === 'active') {
+          void supabase.auth.startAutoRefresh()
+        } else {
+          void supabase.auth.stopAutoRefresh()
+        }
+      } catch {
+        /* ignore */
+      }
     })
+    return () => sub.remove()
+  }, [])
+
+  useEffect(() => {
+    void registerForPushNotifications()
+      .then(async (token) => {
+        try {
+          if (!token) return
+          const { data: sessionData } = await supabase.auth.getSession()
+          const userId = sessionData.session?.user?.id
+          if (!userId) return
+          await supabase.from('notification_tokens').upsert(
+            {
+              user_id: userId,
+              push_token: token,
+            },
+            { onConflict: 'user_id' },
+          )
+        } catch (e) {
+          if (__DEV__) console.warn('[RootLayout] push token upsert', e)
+        }
+      })
+      .catch((e) => {
+        if (__DEV__) console.warn('[RootLayout] registerForPushNotifications', e)
+      })
   }, [])
 
   useEffect(() => {
@@ -87,14 +119,22 @@ export default function RootLayout() {
 
     let mounted = true
     void Notifications.getLastNotificationResponseAsync().then((last) => {
-      if (!mounted || !last?.notification) return
-      const data = last.notification.request.content.data as Record<string, unknown> | undefined
-      openCourtFromReminder(data)
+      try {
+        if (!mounted || !last?.notification) return
+        const data = last.notification.request.content.data as Record<string, unknown> | undefined
+        openCourtFromReminder(data)
+      } catch (e) {
+        if (__DEV__) console.warn('[RootLayout] last notification', e)
+      }
     })
 
     const sub = Notifications.addNotificationResponseReceivedListener((response) => {
-      const data = response.notification.request.content.data as Record<string, unknown> | undefined
-      openCourtFromReminder(data)
+      try {
+        const data = response.notification.request.content.data as Record<string, unknown> | undefined
+        openCourtFromReminder(data)
+      } catch (e) {
+        if (__DEV__) console.warn('[RootLayout] notification response', e)
+      }
     })
 
     return () => {
@@ -108,7 +148,7 @@ export default function RootLayout() {
       <SafeAreaProvider>
         <NetworkStatusProvider>
           <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
-            <View style={styles.root}>
+            <View style={[styles.root, { backgroundColor: theme.background }]}>
               <PersistentOfflineBanner />
               <View style={styles.stackWrap}>
                 <Stack>
@@ -119,6 +159,7 @@ export default function RootLayout() {
                   <Stack.Screen name="messages/index" options={{ headerShown: false }} />
                   <Stack.Screen name="messages/[id]" options={{ headerShown: false }} />
                   <Stack.Screen name="friends/[id]" options={{ headerShown: false }} />
+                  <Stack.Screen name="blocked-players" options={{ headerShown: false }} />
                   <Stack.Screen name="match/[id]" options={{ headerShown: false }} />
                   <Stack.Screen name="play/skill-filter" options={{ headerShown: false, presentation: 'modal' }} />
                   <Stack.Screen name="admin/submissions" options={{ title: 'Admin Submissions' }} />

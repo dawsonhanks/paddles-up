@@ -1,9 +1,14 @@
 import { ContentFadeIn } from '@/components/content-fade-in'
+import { ReportReasonModal } from '@/components/report-reason-modal'
+import { NotificationPurposeModal } from '@/components/notification-purpose-modal'
 import { ErrorBanner } from '@/components/error-banner'
 import { CourtDetailSkeleton } from '@/components/court-detail-skeleton'
 import { SkeletonBox } from '@/components/skeleton-box'
 import { Colors, Fonts } from '@/constants/theme'
 import { useColorScheme } from '@/hooks/use-color-scheme'
+import { fetchBlockedUserIds } from '@/lib/blockedUsers'
+import type { ContentReportType } from '@/lib/contentReports'
+import { showReportActionSheet } from '@/lib/showReportMenu'
 import { checkinBucketLabel, checkinCountToCourtStatus } from '@/lib/checkins'
 import { courtDetailFromRow, STATUS_PIN_COLOR, type CourtDetail, type CourtStatus } from '@/lib/courts'
 import {
@@ -27,6 +32,7 @@ import { addFavorite, ensureFavoritesUser, isCourtFavorite, removeFavorite } fro
 import { notifyManualCheckoutFromCourtDetail } from '@/lib/mapAutoCheckinCoordinator'
 import { alertOpenSettings } from '@/lib/alerts'
 import { userFriendlyFromUnknown } from '@/lib/errors'
+import { NOTIFICATION_PURPOSE_MODAL_SEEN_KEY } from '@/lib/location-permissions'
 import {
   courtsAvailabilityHeadlineColors,
   fetchLatestCourtsAvailableReport,
@@ -43,12 +49,14 @@ import * as Haptics from 'expo-haptics'
 import * as ImagePicker from 'expo-image-picker'
 import * as Location from 'expo-location'
 import * as Notifications from 'expo-notifications'
+import AsyncStorage from '@react-native-async-storage/async-storage'
 import { useLocalSearchParams, useRouter } from 'expo-router'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ActivityIndicator,
   Alert,
   Image,
+  Keyboard,
   KeyboardAvoidingView,
   LayoutAnimation,
   Linking,
@@ -65,6 +73,7 @@ import {
 } from 'react-native'
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context'
 
+import { openIOSAppSettingsDeepLink } from '@/lib/open-settings'
 import { supabase } from '@/supabase'
 
 /** Defer success alerts so they run after notify spinner / state updates settle (avoids swallowed alerts and stuck alert chrome). */
@@ -207,14 +216,19 @@ async function uriImageBytes(uri: string): Promise<Uint8Array> {
 
 async function getPushToken(): Promise<string | null> {
   if (!Device.isDevice) return null
-  const { status: existing } = await Notifications.getPermissionsAsync()
-  let finalStatus = existing
-  if (existing !== 'granted') {
-    const { status } = await Notifications.requestPermissionsAsync()
-    finalStatus = status
+  try {
+    const { status: existing } = await Notifications.getPermissionsAsync()
+    let finalStatus = existing
+    if (existing !== 'granted') {
+      const { status } = await Notifications.requestPermissionsAsync()
+      finalStatus = status
+    }
+    if (finalStatus !== 'granted') return null
+    return (await Notifications.getExpoPushTokenAsync({ projectId: '5b08d659-3160-45f5-b63f-3ecd0fe3eddc' })).data
+  } catch (e) {
+    Alert.alert('Notifications unavailable', userFriendlyFromUnknown(e))
+    return null
   }
-  if (finalStatus !== 'granted') return null
-  return (await Notifications.getExpoPushTokenAsync({ projectId: '5b08d659-3160-45f5-b63f-3ecd0fe3eddc' })).data
 }
 
 export default function CourtDetailScreen() {
@@ -264,6 +278,7 @@ export default function CourtDetailScreen() {
   const [favoriteBusy, setFavoriteBusy] = useState(false)
   const [isSubscribed, setIsSubscribed] = useState(false)
   const [notifyBusy, setNotifyBusy] = useState(false)
+  const [showNotificationPurposeModal, setShowNotificationPurposeModal] = useState(false)
   const [isCheckedIn, setIsCheckedIn] = useState(false)
   const [checkinBusy, setCheckinBusy] = useState(false)
   const [checkinCount, setCheckinCount] = useState(0)
@@ -273,6 +288,7 @@ export default function CourtDetailScreen() {
   const [photoUploading, setPhotoUploading] = useState(false)
   const [photoDeletingId, setPhotoDeletingId] = useState<string | null>(null)
   const [viewerUserId, setViewerUserId] = useState<string | null>(null)
+  const [reportTarget, setReportTarget] = useState<{ type: ContentReportType; id: string } | null>(null)
   const [selectedPhotoUrl, setSelectedPhotoUrl] = useState<string | null>(null)
   const [showRatingModal, setShowRatingModal] = useState(false)
   const [pendingRating, setPendingRating] = useState(0)
@@ -334,14 +350,18 @@ export default function CourtDetailScreen() {
   )
 
   const refreshLocation = useCallback(async () => {
-    const { status } = await Location.getForegroundPermissionsAsync()
-    if (status !== 'granted') return
-    const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High })
-    setUserLat(pos.coords.latitude)
-    setUserLon(pos.coords.longitude)
+    try {
+      const { status } = await Location.getForegroundPermissionsAsync()
+      if (status !== 'granted') return
+      const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High })
+      setUserLat(pos.coords.latitude)
+      setUserLon(pos.coords.longitude)
+    } catch (e) {
+      Alert.alert('Location unavailable', userFriendlyFromUnknown(e))
+    }
   }, [])
 
-  const loadCourt = useCallback(async () => {
+  const loadCourt = useCallback(async (cancelledRef?: { current: boolean }) => {
     if (!courtId) {
       setCourt(null)
       setLoadError('This link does not include a court. Head back and pick a court from the map.')
@@ -350,6 +370,7 @@ export default function CourtDetailScreen() {
     setLoadError(null)
     setCourt(undefined)
     const { data, error } = await supabase.from('courts').select('*').eq('id', courtId).maybeSingle()
+    if (cancelledRef?.current) return
     if (error) {
       setLoadError(userFriendlyFromUnknown(error))
       setCourt(null)
@@ -360,6 +381,7 @@ export default function CourtDetailScreen() {
       setLoadError('We could not find this court. It may have been removed.')
       return
     }
+    if (cancelledRef?.current) return
     setCourt(courtDetailFromRow(data as Record<string, unknown>))
   }, [courtId])
 
@@ -381,6 +403,8 @@ export default function CourtDetailScreen() {
     try {
       const row = await fetchLatestCourtsAvailableReport(courtId)
       setLatestCourtsAvail(row)
+    } catch {
+      setLatestCourtsAvail(null)
     } finally {
       if (!background) setCourtsAvailLoading(false)
     }
@@ -397,21 +421,33 @@ export default function CourtDetailScreen() {
     setPendingCourtsAvailPick(v)
   }, [latestCourtsAvail, court])
 
-  const loadZonesAndReports = useCallback(async () => {
+  const loadZonesAndReports = useCallback(async (cancelledRef?: { current: boolean }) => {
     if (!courtId) return
-    const zones = await fetchZonesForCourt(courtId)
-    setCourtZones(zones)
-    if (zones.length === 0) {
+    try {
+      const zones = await fetchZonesForCourt(courtId)
+      if (cancelledRef?.current) return
+      setCourtZones(zones)
+      if (zones.length === 0) {
+        setZoneReportsByZone(new Map())
+        return
+      }
+      const reps = await fetchLatestZoneReportsForCourt(courtId)
+      if (cancelledRef?.current) return
+      setZoneReportsByZone(reps)
+    } catch {
+      if (cancelledRef?.current) return
+      setCourtZones([])
       setZoneReportsByZone(new Map())
-      return
     }
-    const reps = await fetchLatestZoneReportsForCourt(courtId)
-    setZoneReportsByZone(reps)
   }, [courtId])
 
   useEffect(() => {
     if (!courtId || isOffline) return
-    void loadZonesAndReports()
+    const cancelled = { current: false }
+    void loadZonesAndReports(cancelled)
+    return () => {
+      cancelled.current = true
+    }
   }, [courtId, isOffline, loadZonesAndReports])
 
   const loadCheckins = useCallback(async () => {
@@ -424,10 +460,13 @@ export default function CourtDetailScreen() {
       .eq('court_id', courtId)
       .gt('expires_at', new Date().toISOString())
 
-    setCheckinCount(data?.length ?? 0)
+    const blocked = new Set(await fetchBlockedUserIds())
+    const rows = (data ?? []).filter((r) => !blocked.has(String((r as { user_id: string }).user_id)))
+
+    setCheckinCount(rows.length)
 
     if ('error' in gate) return
-    const mine = data?.find(r => r.user_id === gate.userId)
+    const mine = rows.find((r) => r.user_id === gate.userId)
     setIsCheckedIn(!!mine)
   }, [courtId])
 
@@ -607,42 +646,50 @@ export default function CourtDetailScreen() {
 
   const onAddPhoto = useCallback(async () => {
     if (!courtId || photoUploading) return
-    const permission = await ImagePicker.requestMediaLibraryPermissionsAsync()
-    if (permission.status !== 'granted') {
-      alertOpenSettings(
-        'Photo library',
-        'To add a court photo, allow photo access in Settings — tap below to jump there.',
-      )
-      return
-    }
+    try {
+      const permission = await ImagePicker.requestMediaLibraryPermissionsAsync()
+      if (permission.status !== 'granted') {
+        alertOpenSettings(
+          'Photo library',
+          'To add a court photo, allow photo access in Settings — tap below to jump there.',
+        )
+        return
+      }
 
-    const picked = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
-      quality: 0.82,
-      allowsEditing: true,
-    })
-    if (picked.canceled || !picked.assets[0]) return
-    await uploadCourtPhoto(picked.assets[0])
+      const picked = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        quality: 0.82,
+        allowsEditing: true,
+      })
+      if (picked.canceled || !picked.assets[0]) return
+      await uploadCourtPhoto(picked.assets[0])
+    } catch (e) {
+      Alert.alert('Photos unavailable', userFriendlyFromUnknown(e))
+    }
   }, [courtId, photoUploading, uploadCourtPhoto])
 
   const onTakePhoto = useCallback(async () => {
     if (!courtId || photoUploading) return
-    const permission = await ImagePicker.requestCameraPermissionsAsync()
-    if (permission.status !== 'granted') {
-      alertOpenSettings(
-        'Camera',
-        'To snap a court photo here, turn on camera access in Settings.',
-      )
-      return
-    }
+    try {
+      const permission = await ImagePicker.requestCameraPermissionsAsync()
+      if (permission.status !== 'granted') {
+        alertOpenSettings(
+          'Camera',
+          'To snap a court photo here, turn on camera access in Settings.',
+        )
+        return
+      }
 
-    const captured = await ImagePicker.launchCameraAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
-      quality: 0.82,
-      allowsEditing: true,
-    })
-    if (captured.canceled || !captured.assets[0]) return
-    await uploadCourtPhoto(captured.assets[0])
+      const captured = await ImagePicker.launchCameraAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        quality: 0.82,
+        allowsEditing: true,
+      })
+      if (captured.canceled || !captured.assets[0]) return
+      await uploadCourtPhoto(captured.assets[0])
+    } catch (e) {
+      Alert.alert('Photos unavailable', userFriendlyFromUnknown(e))
+    }
   }, [courtId, photoUploading, uploadCourtPhoto])
 
   const onToggleCheckin = useCallback(async () => {
@@ -728,7 +775,7 @@ export default function CourtDetailScreen() {
         setScreenBanner(userFriendlyFromUnknown(gate.error))
         return
       }
-      const mine = reviewsPreview.find((r) => r.user_id === gate.userId)
+      const mine = reviewsPreview.find((r) => r?.user_id === gate.userId)
       setComposerRating(mine?.rating != null ? Math.min(5, Math.max(1, mine.rating)) : 5)
       setComposerText(mine?.review_text ?? '')
       setShowReviewComposer(true)
@@ -805,6 +852,72 @@ export default function CourtDetailScreen() {
     setIsSubscribed(!!data)
   }, [courtId])
 
+  const subscribeCourtPushNotifications = useCallback(
+    async (gate: { userId: string }) => {
+      const token = await getPushToken()
+      if (!token) {
+        const permAfter = await Notifications.getPermissionsAsync()
+        if (permAfter.status === 'denied') {
+          Alert.alert(
+            'Notifications are turned off — tap here to enable them in Settings',
+            undefined,
+            [
+              { text: 'Cancel', style: 'cancel' },
+              { text: 'Open Settings', onPress: () => openIOSAppSettingsDeepLink() },
+            ],
+          )
+          return
+        }
+        alertOpenSettings(
+          'Notifications are off',
+          'Turn them on in Settings for Paddles Up — then tap the bell again.',
+        )
+        return
+      }
+      try {
+        await supabase.from('notification_tokens').upsert({ user_id: gate.userId, push_token: token }, { onConflict: 'user_id' })
+        await supabase.from('notification_subscriptions').upsert({ user_id: gate.userId, court_id: courtId, push_token: token }, { onConflict: 'user_id,court_id' })
+      } catch (e) {
+        Alert.alert('Notifications unavailable', userFriendlyFromUnknown(e))
+        return
+      }
+      setIsSubscribed(true)
+      scheduleNotifySuccessAlert('Notifications on! 🔔', "We'll let you know when this court opens up.")
+    },
+    [courtId, scheduleNotifySuccessAlert],
+  )
+
+  const onNotificationPurposeAllow = useCallback(async () => {
+    try {
+      await AsyncStorage.setItem(NOTIFICATION_PURPOSE_MODAL_SEEN_KEY, 'yes')
+    } catch {
+      /* ignore */
+    }
+    setShowNotificationPurposeModal(false)
+    setNotifyBusy(true)
+    try {
+      const gate = await ensureFavoritesUser()
+      if ('error' in gate) {
+        setScreenBanner(userFriendlyFromUnknown(gate.error))
+        return
+      }
+      await subscribeCourtPushNotifications(gate)
+    } catch (e) {
+      Alert.alert('Notifications unavailable', userFriendlyFromUnknown(e))
+    } finally {
+      setNotifyBusy(false)
+    }
+  }, [subscribeCourtPushNotifications])
+
+  const onNotificationPurposeLater = useCallback(async () => {
+    try {
+      await AsyncStorage.setItem(NOTIFICATION_PURPOSE_MODAL_SEEN_KEY, 'yes')
+    } catch {
+      /* ignore */
+    }
+    setShowNotificationPurposeModal(false)
+  }, [])
+
   const onToggleNotification = useCallback(async () => {
     if (!courtId || notifyBusy) return
     setNotifyBusy(true)
@@ -818,26 +931,49 @@ export default function CourtDetailScreen() {
         await supabase.from('notification_subscriptions').delete().eq('user_id', gate.userId).eq('court_id', courtId)
         setIsSubscribed(false)
         scheduleNotifySuccessAlert('Notifications off', 'You will no longer receive alerts for this court.')
-      } else {
-        const token = await getPushToken()
-        if (!token) {
-          alertOpenSettings(
-            'Notifications are off',
-            'Turn them on in Settings for Paddles Up — then tap the bell again.',
-          )
-          return
-        }
-        await supabase.from('notification_tokens').upsert({ user_id: gate.userId, push_token: token }, { onConflict: 'user_id' })
-        await supabase.from('notification_subscriptions').upsert({ user_id: gate.userId, court_id: courtId, push_token: token }, { onConflict: 'user_id,court_id' })
-        setIsSubscribed(true)
-        scheduleNotifySuccessAlert('Notifications on! 🔔', "We'll let you know when this court opens up.")
+        return
       }
+
+      const perm = await Notifications.getPermissionsAsync()
+      if (perm.status === 'denied') {
+        Alert.alert(
+          'Notifications are turned off — tap here to enable them in Settings',
+          undefined,
+          [
+            { text: 'Cancel', style: 'cancel' },
+            { text: 'Open Settings', onPress: () => openIOSAppSettingsDeepLink() },
+          ],
+        )
+        return
+      }
+
+      let seen = false
+      try {
+        seen = (await AsyncStorage.getItem(NOTIFICATION_PURPOSE_MODAL_SEEN_KEY)) === 'yes'
+      } catch {
+        seen = false
+      }
+
+      if (perm.status === 'undetermined' && !seen) {
+        setShowNotificationPurposeModal(true)
+        return
+      }
+
+      await subscribeCourtPushNotifications(gate)
+    } catch (e) {
+      Alert.alert('Notifications unavailable', userFriendlyFromUnknown(e))
     } finally {
       setNotifyBusy(false)
     }
-  }, [courtId, notifyBusy, isSubscribed, scheduleNotifySuccessAlert])
+  }, [courtId, notifyBusy, isSubscribed, scheduleNotifySuccessAlert, subscribeCourtPushNotifications])
 
-  useEffect(() => { loadCourt() }, [loadCourt])
+  useEffect(() => {
+    const cancelled = { current: false }
+    void loadCourt(cancelled)
+    return () => {
+      cancelled.current = true
+    }
+  }, [loadCourt])
 
   useEffect(() => {
     if (court === undefined || court === null) return
@@ -889,8 +1025,10 @@ export default function CourtDetailScreen() {
 
   useFocusEffect(
     useCallback(() => {
+      const cancelled = { current: false }
       refreshLocation()
       void ensureFavoritesUser().then((gate) => {
+        if (cancelled.current) return
         setViewerUserId('error' in gate ? null : gate.userId)
       })
       if (!isOffline) {
@@ -906,6 +1044,7 @@ export default function CourtDetailScreen() {
       loadReviews()
 
       return () => {
+        cancelled.current = true
         setMoreInfoExpanded(false)
       }
     }, [refreshLocation, loadZonesAndReports, loadCourtsAvailabilityReport, checkSubscription, loadCheckins, loadPhotos, loadReviews, isOffline]),
@@ -987,15 +1126,21 @@ export default function CourtDetailScreen() {
     async (count: number) => {
       if (!court || !courtId || courtsAvailSubmitBusy || isOffline) return
       await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light)
-      const { status: perm } = await Location.getForegroundPermissionsAsync()
-      if (perm !== 'granted') {
-        alertOpenSettings(
-          'Location',
-          'Location access is needed for this feature — tap below to open Settings.',
-        )
+      let pos: Location.LocationObject
+      try {
+        const { status: perm } = await Location.getForegroundPermissionsAsync()
+        if (perm !== 'granted') {
+          alertOpenSettings(
+            'Location',
+            'Location access is needed for this feature — tap below to open Settings.',
+          )
+          return
+        }
+        pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Highest })
+      } catch (e) {
+        Alert.alert('Location unavailable', userFriendlyFromUnknown(e))
         return
       }
-      const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Highest })
       const d = distanceKm(pos.coords.latitude, pos.coords.longitude, court.latitude, court.longitude)
       if (!isWithinReportingRadius(d)) {
         setScreenBanner(
@@ -1052,15 +1197,21 @@ export default function CourtDetailScreen() {
         return
       }
       await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light)
-      const { status: perm } = await Location.getForegroundPermissionsAsync()
-      if (perm !== 'granted') {
-        alertOpenSettings(
-          'Location',
-          'Location access is needed for this feature — tap below to open Settings.',
-        )
+      let pos: Location.LocationObject
+      try {
+        const { status: perm } = await Location.getForegroundPermissionsAsync()
+        if (perm !== 'granted') {
+          alertOpenSettings(
+            'Location',
+            'Location access is needed for this feature — tap below to open Settings.',
+          )
+          return
+        }
+        pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Highest })
+      } catch (e) {
+        Alert.alert('Location unavailable', userFriendlyFromUnknown(e))
         return
       }
-      const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Highest })
       const d = distanceKm(pos.coords.latitude, pos.coords.longitude, court.latitude, court.longitude)
       if (!isWithinReportingRadius(d)) {
         setScreenBanner(
@@ -1200,7 +1351,7 @@ export default function CourtDetailScreen() {
           <Text
             style={[styles.dashCourtName, { color: isDark ? '#F8FAFC' : '#0F172A' }, Platform.OS === 'ios' && titleFont ? { fontFamily: titleFont } : null]}
             numberOfLines={3}>
-            {court.name}
+            {court?.name}
           </Text>
           <View style={[styles.dashStatusPill, { backgroundColor: badge.bg }]}>
             <View style={[styles.dashStatusDot, { backgroundColor: STATUS_PIN_COLOR[headerStatus] }]} />
@@ -1233,7 +1384,7 @@ export default function CourtDetailScreen() {
             (() => {
               const venueTotal = Math.max(1, court.courtCount)
               const shown = Math.min(
-                Math.max(0, Math.floor(latestCourtsAvail.courts_available)),
+                Math.max(0, Math.floor(latestCourtsAvail?.courts_available ?? 0)),
                 venueTotal,
               )
               const tone = courtsAvailabilityHeadlineColors(shown, venueTotal, isDark)
@@ -1333,31 +1484,33 @@ export default function CourtDetailScreen() {
               </Text>
             ) : null}
             {courtZones.map((z, zoneIndex) => {
-              const rep = zoneReportsByZone.get(z.id)
+              const zid = z?.id ?? ''
+              const rep = zid ? zoneReportsByZone.get(zid) : undefined
               const highlightOpen = rep?.status === 'open'
               const highlightBusy = rep?.status === 'busy'
               const openSubmitting =
-                zoneReportBusy?.zoneId === z.id && zoneReportBusy?.status === 'open'
+                zoneReportBusy?.zoneId === zid && zoneReportBusy?.status === 'open'
               const busySubmitting =
-                zoneReportBusy?.zoneId === z.id && zoneReportBusy?.status === 'busy'
+                zoneReportBusy?.zoneId === zid && zoneReportBusy?.status === 'busy'
               const zoneActionsDisabled = isOffline || !withinRadius
               const zoneDivider = isDark ? 'rgba(255,255,255,0.08)' : 'rgba(15,23,42,0.08)'
               const isLast = zoneIndex === courtZones.length - 1
+              const zname = z?.zone_name ?? 'Zone'
               return (
                 <View
-                  key={z.id}
+                  key={zid || `zone-${zoneIndex}`}
                   style={[
                     styles.zoneRowFlat,
                     { borderBottomColor: zoneDivider, borderBottomWidth: isLast ? 0 : StyleSheet.hairlineWidth },
                   ]}>
                   <Text style={[styles.zoneNameFlat, { color: isDark ? '#F8FAFC' : '#0F172A' }]} numberOfLines={1}>
-                    {z.zone_name}
+                    {zname}
                   </Text>
                   <View style={styles.zoneTogglePair}>
                     <Pressable
-                      disabled={zoneActionsDisabled || openSubmitting}
-                      onPress={() => void onZoneReport(z.id, 'open')}
-                      accessibilityLabel={`Report ${z.zone_name} as open`}
+                      disabled={zoneActionsDisabled || openSubmitting || !zid}
+                      onPress={() => void onZoneReport(zid, 'open')}
+                      accessibilityLabel={`Report ${zname} as open`}
                       accessibilityState={{ selected: highlightOpen, disabled: zoneActionsDisabled || openSubmitting }}
                       style={({ pressed }) => [
                         styles.zoneToggleBtn,
@@ -1384,9 +1537,9 @@ export default function CourtDetailScreen() {
                       )}
                     </Pressable>
                     <Pressable
-                      disabled={zoneActionsDisabled || busySubmitting}
-                      onPress={() => void onZoneReport(z.id, 'busy')}
-                      accessibilityLabel={`Report ${z.zone_name} as busy`}
+                      disabled={zoneActionsDisabled || busySubmitting || !zid}
+                      onPress={() => void onZoneReport(zid, 'busy')}
+                      accessibilityLabel={`Report ${zname} as busy`}
                       accessibilityState={{ selected: highlightBusy, disabled: zoneActionsDisabled || busySubmitting }}
                       style={({ pressed }) => [
                         styles.zoneToggleBtn,
@@ -1461,18 +1614,24 @@ export default function CourtDetailScreen() {
               ) : (
                 <View style={styles.moreInfoWrittenList}>
                   {recentWrittenReviews.map((r, index) => {
-                    const isMine = viewerUserId != null && r.user_id === viewerUserId
+                    const isMine = viewerUserId != null && r?.user_id === viewerUserId
                     const isLast = index === recentWrittenReviews.length - 1
                     return (
-                      <View
-                        key={r.id}
+                      <Pressable
+                        key={r?.id ?? `written-${index}`}
+                        onLongPress={() => {
+                          if (isMine || !viewerUserId) return
+                          Keyboard.dismiss()
+                          showReportActionSheet(() => setReportTarget({ type: 'review', id: r?.id ?? '' }))
+                        }}
+                        delayLongPress={450}
                         style={[
                           styles.moreInfoWrittenRow,
                           { borderColor: cardBorder, borderBottomWidth: isLast ? 0 : StyleSheet.hairlineWidth },
                         ]}>
                         <View style={styles.reviewHeadingRow}>
                           <Text style={[styles.reviewName, { color: isDark ? '#F8FAFC' : '#0F172A' }]} numberOfLines={1}>
-                            {r.display_name}
+                            {r?.display_name ?? 'Player'}
                           </Text>
                           {isMine ? (
                             <View style={styles.reviewMineActions}>
@@ -1480,7 +1639,7 @@ export default function CourtDetailScreen() {
                                 <Text style={styles.reviewEditText}>Edit</Text>
                               </Pressable>
                               <Pressable
-                                onPress={() => requestDeleteReview(r)}
+                                onPress={() => r && requestDeleteReview(r)}
                                 hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
                                 accessibilityLabel="Delete your review">
                                 <MaterialIcons name="delete-outline" size={20} color="#E24B4A" />
@@ -1488,15 +1647,15 @@ export default function CourtDetailScreen() {
                             </View>
                           ) : null}
                         </View>
-                        <StarRow rating={r.rating} filledColor="#F59E0B" emptyColor={isDark ? '#334155' : '#E2E8F0'} compact />
-                        <Text style={[styles.reviewBody, { color: isDark ? '#CBD5E1' : '#475569' }]}>{r.review_text.trim()}</Text>
-                      </View>
+                        <StarRow rating={r?.rating ?? 0} filledColor="#F59E0B" emptyColor={isDark ? '#334155' : '#E2E8F0'} compact />
+                        <Text style={[styles.reviewBody, { color: isDark ? '#CBD5E1' : '#475569' }]}>{(r?.review_text ?? '').trim()}</Text>
+                      </Pressable>
                     )
                   })}
                 </View>
               )}
               <View style={styles.moreInfoReviewCtas}>
-                {viewerUserId != null && !reviewsPreview.some((r) => r.user_id === viewerUserId) ? (
+                {viewerUserId != null && !reviewsPreview.some((r) => r?.user_id === viewerUserId) ? (
                   <Pressable
                     onPress={openReviewComposer}
                     style={({ pressed }) => [
@@ -1537,18 +1696,18 @@ export default function CourtDetailScreen() {
                     </>
                   )}
                 </Pressable>
-                {photos.map((photo) => {
-                  const isMine = viewerUserId != null && photo.user_id === viewerUserId
-                  const deleting = photoDeletingId === photo.id
+                {photos.map((photo, idx) => {
+                  const isMine = viewerUserId != null && photo?.user_id === viewerUserId
+                  const deleting = photoDeletingId === photo?.id
                   return (
-                    <View key={photo.id} style={styles.photoCard}>
-                      <Pressable onPress={() => setSelectedPhotoUrl(photo.photo_url)} disabled={deleting}>
-                        <Image source={{ uri: photo.photo_url }} style={styles.photoImage} />
+                    <View key={photo?.id ?? `photo-${idx}`} style={styles.photoCard}>
+                      <Pressable onPress={() => setSelectedPhotoUrl(photo?.photo_url ?? null)} disabled={deleting}>
+                        <Image source={{ uri: photo?.photo_url ?? '' }} style={styles.photoImage} />
                       </Pressable>
                       {isMine ? (
                         <Pressable
                           accessibilityLabel="Delete photo"
-                          onPress={() => deleteCourtPhoto(photo)}
+                          onPress={() => photo && deleteCourtPhoto(photo)}
                           disabled={deleting || photoUploading}
                           style={({ pressed }) => [
                             styles.photoDeleteBtn,
@@ -1563,9 +1722,9 @@ export default function CourtDetailScreen() {
                         </Pressable>
                       ) : null}
                       <Text style={[styles.photoMetaName, { color: isDark ? '#E2E8F0' : '#0F172A' }]} numberOfLines={1}>
-                        {photo.uploader_name}
+                        {photo?.uploader_name ?? 'Player'}
                       </Text>
-                      <Text style={[styles.photoMetaTime, { color: muted }]}>{timeAgo(photo.created_at)}</Text>
+                      <Text style={[styles.photoMetaTime, { color: muted }]}>{photo?.created_at ? timeAgo(photo.created_at) : ''}</Text>
                     </View>
                   )
                 })}
@@ -1711,7 +1870,7 @@ export default function CourtDetailScreen() {
             />
             <View style={[styles.modalCardCompact, { backgroundColor: cardBg, borderColor: cardBorder }, cardShadow]}>
               <Text style={[styles.modalTitleCompact, styles.modalCheckoutHeaderText, { color: isDark ? '#F8FAFC' : '#0F172A' }]}>
-                How was {court.name}?
+                How was {court?.name}?
               </Text>
               <Text style={[styles.modalSubCompact, styles.modalCheckoutHeaderText, { color: muted }]}>Tap a star to rate this court</Text>
               <View style={styles.modalStarRowCompact}>
@@ -1758,7 +1917,7 @@ export default function CourtDetailScreen() {
             <View style={[styles.modalCardCompact, styles.modalCardReviewOnly, { backgroundColor: cardBg, borderColor: cardBorder }, cardShadow]}>
               <View style={styles.modalReviewHeader}>
                 <Text style={[styles.modalTitleCompact, { color: isDark ? '#F8FAFC' : '#0F172A', flex: 1, marginBottom: 0 }]}>
-                  {reviewsPreview.some((r) => viewerUserId != null && r.user_id === viewerUserId) ? 'Your review' : 'Write a review'}
+                  {reviewsPreview.some((r) => viewerUserId != null && r?.user_id === viewerUserId) ? 'Your review' : 'Write a review'}
                 </Text>
                 <Pressable hitSlop={10} accessibilityLabel="Close" onPress={() => setShowReviewComposer(false)}>
                   <MaterialIcons name="close" size={22} color={muted} />
@@ -1793,6 +1952,19 @@ export default function CourtDetailScreen() {
           </View>
         </KeyboardAvoidingView>
       </Modal>
+
+      <NotificationPurposeModal
+        visible={showNotificationPurposeModal}
+        onAllow={onNotificationPurposeAllow}
+        onMaybeLater={onNotificationPurposeLater}
+      />
+
+      <ReportReasonModal
+        visible={reportTarget != null}
+        onClose={() => setReportTarget(null)}
+        contentType={reportTarget?.type ?? 'review'}
+        contentId={reportTarget?.id ?? ''}
+      />
     </View>
   )
 }

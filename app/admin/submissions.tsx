@@ -5,7 +5,7 @@ import { ensureFavoritesUser } from '@/lib/favorites'
 import { userFriendlyFromUnknown } from '@/lib/errors'
 import { MaterialIcons } from '@expo/vector-icons'
 import { useFocusEffect } from '@react-navigation/native'
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { ActivityIndicator, Alert, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native'
 import { SafeAreaView } from 'react-native-safe-area-context'
 
@@ -68,16 +68,26 @@ export default function AdminSubmissionsScreen() {
   const [busyId, setBusyId] = useState<string | null>(null)
   const [coordDrafts, setCoordDrafts] = useState<Record<string, CoordDraft>>({})
 
-  const load = useCallback(async () => {
+  const deadRef = useRef(false)
+  useEffect(() => {
+    deadRef.current = false
+    return () => {
+      deadRef.current = true
+    }
+  }, [])
+
+  const load = useCallback(async (cancelledRef?: { current: boolean }) => {
     setLoading(true)
     try {
       const gate = await ensureFavoritesUser()
+      if (cancelledRef?.current) return
       if ('error' in gate) return
       const { data, error } = await supabase
         .from('court_submissions')
         .select('*')
         .eq('status', 'pending')
         .order('created_at', { ascending: true })
+      if (cancelledRef?.current) return
       if (error) {
         Alert.alert('Submissions did not load', userFriendlyFromUnknown(error.message))
         return
@@ -95,11 +105,19 @@ export default function AdminSubmissionsScreen() {
       }
       setCoordDrafts(initialDrafts)
     } finally {
-      setLoading(false)
+      if (!cancelledRef?.current) setLoading(false)
     }
   }, [])
 
-  useFocusEffect(useCallback(() => { load() }, [load]))
+  useFocusEffect(
+    useCallback(() => {
+      const cancelled = { current: false }
+      void load(cancelled)
+      return () => {
+        cancelled.current = true
+      }
+    }, [load]),
+  )
 
   async function rejectSubmission(id: string) {
     setBusyId(id)
@@ -108,6 +126,7 @@ export default function AdminSubmissionsScreen() {
         .from('court_submissions')
         .update({ status: 'rejected' })
         .eq('id', id)
+      if (deadRef.current) return
       if (error) {
         Alert.alert('Update did not go through', userFriendlyFromUnknown(error.message))
         return
@@ -119,7 +138,7 @@ export default function AdminSubmissionsScreen() {
         return next
       })
     } finally {
-      setBusyId(null)
+      if (!deadRef.current) setBusyId(null)
     }
   }
 
@@ -131,6 +150,7 @@ export default function AdminSubmissionsScreen() {
         city: item.city,
         state: item.state,
       })
+      if (deadRef.current) return
       setCoordDrafts(prev => ({
         ...prev,
         [item.id]: {
@@ -141,9 +161,11 @@ export default function AdminSubmissionsScreen() {
         },
       }))
     } catch (error) {
-      Alert.alert('Address lookup', userFriendlyFromUnknown(error instanceof Error ? error.message : ''))
+      if (!deadRef.current) {
+        Alert.alert('Address lookup', userFriendlyFromUnknown(error instanceof Error ? error.message : ''))
+      }
     } finally {
-      setBusyId(null)
+      if (!deadRef.current) setBusyId(null)
     }
   }
 
@@ -175,8 +197,11 @@ export default function AdminSubmissionsScreen() {
           latitude: coords.latitude,
           longitude: coords.longitude,
         })
+      if (deadRef.current) return
       if (courtError) {
-        Alert.alert('Court was not added', userFriendlyFromUnknown(courtError.message))
+        if (!deadRef.current) {
+          Alert.alert('Court was not added', userFriendlyFromUnknown(courtError.message))
+        }
         return
       }
 
@@ -190,8 +215,11 @@ export default function AdminSubmissionsScreen() {
           geocode_confidence: draft.confidence,
         })
         .eq('id', item.id)
+      if (deadRef.current) return
       if (submissionError) {
-        Alert.alert('Submission status', userFriendlyFromUnknown(submissionError.message))
+        if (!deadRef.current) {
+          Alert.alert('Submission status', userFriendlyFromUnknown(submissionError.message))
+        }
         return
       }
 
@@ -202,7 +230,7 @@ export default function AdminSubmissionsScreen() {
         return next
       })
     } finally {
-      setBusyId(null)
+      if (!deadRef.current) setBusyId(null)
     }
   }
 
@@ -210,7 +238,7 @@ export default function AdminSubmissionsScreen() {
     <SafeAreaView style={[styles.root, { backgroundColor: theme.background }]} edges={['top']}>
       <View style={styles.header}>
         <Text style={[styles.title, { color: theme.text }]}>Court Submissions</Text>
-        <TouchableOpacity onPress={load} activeOpacity={0.8} style={styles.refreshBtn}>
+        <TouchableOpacity onPress={() => void load()} activeOpacity={0.8} style={styles.refreshBtn}>
           <MaterialIcons name="refresh" size={20} color="#1D9E75" />
         </TouchableOpacity>
       </View>
@@ -222,25 +250,25 @@ export default function AdminSubmissionsScreen() {
           {items.length === 0 ? (
             <Text style={[styles.emptyText, { color: muted }]}>No pending submissions.</Text>
           ) : items.map((item) => (
-            <View key={item.id} style={[styles.card, { backgroundColor: cardBg, borderColor: cardBorder }]}>
-              <Text style={[styles.courtName, { color: theme.text }]}>{item.court_name}</Text>
-              <Text style={[styles.meta, { color: muted }]}>{item.address}</Text>
-              <Text style={[styles.meta, { color: muted }]}>{item.city}{item.state ? `, ${item.state}` : ''}</Text>
+            <View key={item?.id ?? ''} style={[styles.card, { backgroundColor: cardBg, borderColor: cardBorder }]}>
+              <Text style={[styles.courtName, { color: theme.text }]}>{item?.court_name}</Text>
+              <Text style={[styles.meta, { color: muted }]}>{item?.address}</Text>
+              <Text style={[styles.meta, { color: muted }]}>{item?.city}{item?.state ? `, ${item.state}` : ''}</Text>
               <Text style={[styles.meta, { color: muted }]}>
-                {item.num_courts} courts • {item.indoor_outdoor} • {item.surface_type}
+                {item?.num_courts} courts • {item?.indoor_outdoor} • {item?.surface_type}
               </Text>
-              <Text style={[styles.meta, { color: muted }]}>Fee: {item.fee}</Text>
-              <Text style={[styles.meta, { color: muted }]}>Hours: {item.hours}</Text>
-              {item.notes ? <Text style={[styles.notes, { color: muted }]}>Notes: {item.notes}</Text> : null}
-              <Text style={[styles.submittedBy, { color: muted }]}>Submitted by {item.display_name ?? 'Player'}</Text>
+              <Text style={[styles.meta, { color: muted }]}>Fee: {item?.fee}</Text>
+              <Text style={[styles.meta, { color: muted }]}>Hours: {item?.hours}</Text>
+              {item?.notes ? <Text style={[styles.notes, { color: muted }]}>Notes: {item.notes}</Text> : null}
+              <Text style={[styles.submittedBy, { color: muted }]}>Submitted by {item?.display_name ?? 'Player'}</Text>
 
               <View style={styles.coordWrap}>
                 <View style={styles.coordHeader}>
                   <Text style={[styles.coordTitle, { color: theme.text }]}>Coordinates</Text>
                   <TouchableOpacity
-                    style={[styles.geoBtn, busyId === item.id && { opacity: 0.6 }]}
-                    onPress={() => geocodeSubmission(item)}
-                    disabled={busyId === item.id}
+                    style={[styles.geoBtn, busyId === item?.id && { opacity: 0.6 }]}
+                    onPress={() => item && geocodeSubmission(item)}
+                    disabled={busyId === item?.id}
                     activeOpacity={0.8}>
                     <MaterialIcons name="my-location" size={14} color="#1D9E75" />
                     <Text style={styles.geoBtnText}>Geocode</Text>
@@ -248,47 +276,55 @@ export default function AdminSubmissionsScreen() {
                 </View>
                 <View style={styles.coordRow}>
                   <TextInput
-                    value={coordDrafts[item.id]?.latitude ?? ''}
-                    onChangeText={(text) => setCoordDrafts(prev => ({
-                      ...prev,
-                      [item.id]: { ...(prev[item.id] ?? { latitude: '', longitude: '', source: null, confidence: null }), latitude: text },
-                    }))}
+                    value={coordDrafts[item?.id ?? '']?.latitude ?? ''}
+                    onChangeText={(text) => {
+                      const id = item?.id
+                      if (!id) return
+                      setCoordDrafts(prev => ({
+                        ...prev,
+                        [id]: { ...(prev[id] ?? { latitude: '', longitude: '', source: null, confidence: null }), latitude: text },
+                      }))
+                    }}
                     keyboardType="numbers-and-punctuation"
                     placeholder="Latitude"
                     placeholderTextColor={muted}
                     style={[styles.coordInput, { color: theme.text, borderColor: cardBorder, backgroundColor: cardBg }]}
                   />
                   <TextInput
-                    value={coordDrafts[item.id]?.longitude ?? ''}
-                    onChangeText={(text) => setCoordDrafts(prev => ({
-                      ...prev,
-                      [item.id]: { ...(prev[item.id] ?? { latitude: '', longitude: '', source: null, confidence: null }), longitude: text },
-                    }))}
+                    value={coordDrafts[item?.id ?? '']?.longitude ?? ''}
+                    onChangeText={(text) => {
+                      const id = item?.id
+                      if (!id) return
+                      setCoordDrafts(prev => ({
+                        ...prev,
+                        [id]: { ...(prev[id] ?? { latitude: '', longitude: '', source: null, confidence: null }), longitude: text },
+                      }))
+                    }}
                     keyboardType="numbers-and-punctuation"
                     placeholder="Longitude"
                     placeholderTextColor={muted}
                     style={[styles.coordInput, { color: theme.text, borderColor: cardBorder, backgroundColor: cardBg }]}
                   />
                 </View>
-                {coordDrafts[item.id]?.source ? (
+                {coordDrafts[item?.id ?? '']?.source ? (
                   <Text style={[styles.coordMeta, { color: muted }]}>
-                    Source: {coordDrafts[item.id]?.source} • Confidence: {coordDrafts[item.id]?.confidence ?? 'unknown'}
+                    Source: {coordDrafts[item?.id ?? '']?.source} • Confidence: {coordDrafts[item?.id ?? '']?.confidence ?? 'unknown'}
                   </Text>
                 ) : null}
               </View>
 
               <View style={styles.actionRow}>
                 <TouchableOpacity
-                  style={[styles.actionBtn, styles.approveBtn, busyId === item.id && { opacity: 0.6 }]}
-                  onPress={() => approveSubmission(item)}
-                  disabled={busyId === item.id}
+                  style={[styles.actionBtn, styles.approveBtn, busyId === item?.id && { opacity: 0.6 }]}
+                  onPress={() => item && approveSubmission(item)}
+                  disabled={busyId === item?.id}
                   activeOpacity={0.8}>
                   <Text style={styles.actionBtnText}>Approve</Text>
                 </TouchableOpacity>
                 <TouchableOpacity
-                  style={[styles.actionBtn, styles.rejectBtn, busyId === item.id && { opacity: 0.6 }]}
-                  onPress={() => rejectSubmission(item.id)}
-                  disabled={busyId === item.id}
+                  style={[styles.actionBtn, styles.rejectBtn, busyId === item?.id && { opacity: 0.6 }]}
+                  onPress={() => item?.id && rejectSubmission(item.id)}
+                  disabled={busyId === item?.id}
                   activeOpacity={0.8}>
                   <Text style={styles.actionBtnText}>Reject</Text>
                 </TouchableOpacity>

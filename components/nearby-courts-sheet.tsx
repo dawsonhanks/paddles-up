@@ -6,7 +6,7 @@ import { formatDistanceMiles } from '@/lib/geo'
 import { MaterialIcons } from '@expo/vector-icons'
 import BottomSheet, { BottomSheetFlatList } from '@gorhom/bottom-sheet'
 import type { ReactNode } from 'react'
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useMemo } from 'react'
 import {
   Dimensions,
   FlatList,
@@ -26,8 +26,13 @@ export type ListFilter = 'all' | 'open' | 'outdoor' | 'indoor' | 'favorites'
 export type CourtWithDistance = Court & { distanceKm: number }
 
 const BRAND_GREEN = '#1D9E75'
-/** Collapsed sheet: handle + title + hint only (no list rows). */
-const COLLAPSED_SHEET_BASE_PX = 108
+/**
+ * Map tab only: `CourtMap` bottom padding for the Apple/Google legal line.
+ * Intentionally **not** tied to the bottom sheet's visual peek height.
+ */
+export const MAP_NEARBY_SHEET_COLLAPSED_BASE_PX = 108
+/** Bottom sheet first snap: room for title + filter row + first court card. */
+const COLLAPSED_SHEET_PEEK_PX = 210
 
 export function matchesListFilter(court: Court, filter: ListFilter, favoriteIds?: ReadonlySet<string>): boolean {
   if (filter === 'favorites') return favoriteIds?.has(court.id) ?? false
@@ -169,25 +174,6 @@ function CourtRow({
   )
 }
 
-function CollapsedPeek({
-  isDark,
-  listLoading,
-  expandHint,
-}: {
-  isDark: boolean
-  listLoading: boolean
-  expandHint: string
-}) {
-  return (
-    <View style={styles.collapsedPeek}>
-      <Text style={[styles.sheetTitle, { color: isDark ? '#F8FAFC' : '#0F172A', marginBottom: 4 }]}>Nearby courts</Text>
-      <Text style={[styles.collapsedHint, { color: isDark ? '#A1A1AA' : '#64748B' }]}>
-        {listLoading ? 'Loading…' : expandHint}
-      </Text>
-    </View>
-  )
-}
-
 const SHEET_SKELETON_KEYS = ['sk1', 'sk2', 'sk3', 'sk4'] as const
 
 type NearbyCourtsSheetProps = {
@@ -220,14 +206,11 @@ export function NearbyCourtsSheet(props: NearbyCourtsSheetProps) {
     listLoading = false,
   } = props
   const insets = useSafeAreaInsets()
-  const [sheetIndex, setSheetIndex] = useState(0)
-  const [webExpanded, setWebExpanded] = useState(false)
   const collapsedPeekPx = useMemo(
-    () => Math.round(COLLAPSED_SHEET_BASE_PX + insets.bottom),
+    () => Math.round(COLLAPSED_SHEET_PEEK_PX + insets.bottom),
     [insets.bottom],
   )
   const snapPoints = useMemo(() => [collapsedPeekPx, '66%', '90%'], [collapsedPeekPx])
-  const sheetOpen = sheetIndex > 0
 
   const renderCourtItem = useCallback(
     ({ item }: { item: CourtWithDistance }) => (
@@ -244,13 +227,8 @@ export function NearbyCourtsSheet(props: NearbyCourtsSheetProps) {
   const renderSkeletonSheetItem = useCallback(() => <SkeletonCourtSheetRow isDark={isDark} />, [isDark])
 
   const ListHeader = useCallback(
-    () =>
-      sheetOpen ? (
-        <FilterPills filter={filter} onChange={onFilterChange} isDark={isDark} />
-      ) : (
-        <CollapsedPeek isDark={isDark} listLoading={listLoading} expandHint="Pull up for the list and filters" />
-      ),
-    [filter, onFilterChange, isDark, sheetOpen, listLoading],
+    () => <FilterPills filter={filter} onChange={onFilterChange} isDark={isDark} />,
+    [filter, onFilterChange, isDark],
   )
 
   const EmptyList = useCallback(() => {
@@ -267,102 +245,57 @@ export function NearbyCourtsSheet(props: NearbyCourtsSheetProps) {
   }, [isDark, showNoFavoritesYetHint])
 
   if (Platform.OS === 'web') {
-    const webCollapsedH = Math.round(COLLAPSED_SHEET_BASE_PX + insets.bottom)
     return (
       <View
         style={[
           styles.webSheet,
           {
-            maxHeight: webExpanded ? WEB_SHEET_MAX : webCollapsedH,
-            paddingBottom: webExpanded ? insets.bottom + 8 : insets.bottom + 4,
+            maxHeight: WEB_SHEET_MAX,
+            paddingBottom: insets.bottom + 8,
             backgroundColor: isDark ? '#18181B' : '#FFFFFF',
             borderColor: isDark ? '#3F3F46' : '#E2E8F0',
           },
         ]}>
-        {webExpanded ? (
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel="Collapse nearby courts panel"
-            onPress={() => setWebExpanded(false)}
-            style={({ pressed }) => [styles.webPeekHit, { opacity: pressed ? 0.85 : 1 }]}>
-            <View style={[styles.handle, { backgroundColor: isDark ? '#52525B' : '#CBD5E1' }]} />
-            <View style={styles.webExpandedPeekRow}>
-              <Text style={[styles.sheetTitle, { color: isDark ? '#F8FAFC' : '#0F172A', marginBottom: 0, flex: 1 }]}>
-                Nearby courts
-              </Text>
-              <MaterialIcons name="expand-more" size={22} color={isDark ? '#A1A1AA' : '#64748B'} />
-            </View>
-          </Pressable>
+        <View style={[styles.handle, { backgroundColor: isDark ? '#52525B' : '#CBD5E1' }]} />
+        <FilterPills filter={filter} onChange={onFilterChange} isDark={isDark} />
+        {listLoading ? (
+          <FlatList
+            data={[...SHEET_SKELETON_KEYS]}
+            keyExtractor={(item) => item}
+            renderItem={renderSkeletonSheetItem}
+            contentContainerStyle={styles.listPad}
+            style={{ flex: 1 }}
+            nestedScrollEnabled
+          />
         ) : (
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel="Expand nearby courts panel"
-            onPress={() => setWebExpanded(true)}
-            style={({ pressed }) => [styles.webPeekHit, { opacity: pressed ? 0.85 : 1 }]}>
-            <View style={[styles.handle, { backgroundColor: isDark ? '#52525B' : '#CBD5E1' }]} />
-        <CollapsedPeek isDark={isDark} listLoading={listLoading} expandHint="Tap for the list and filters" />
-          </Pressable>
+          <ContentFadeIn show style={{ flex: 1 }}>
+            <FlatList
+              data={courts}
+              extraData={filter}
+              keyExtractor={(item) => item.id}
+              renderItem={renderCourtItem}
+              ListEmptyComponent={EmptyList}
+              contentContainerStyle={styles.listPad}
+              style={{ flex: 1 }}
+              nestedScrollEnabled
+              keyboardShouldPersistTaps="handled"
+              keyboardDismissMode="on-drag"
+              onScrollBeginDrag={() => Keyboard.dismiss()}
+              onRefresh={onRefresh}
+              refreshing={refreshing}
+              tintColor="#1D9E75"
+              colors={['#1D9E75']}
+            />
+          </ContentFadeIn>
         )}
-        {webExpanded ? (
-          <>
-            <FilterPills filter={filter} onChange={onFilterChange} isDark={isDark} />
-            {listLoading ? (
-              <FlatList
-                data={[...SHEET_SKELETON_KEYS]}
-                keyExtractor={(item) => item}
-                renderItem={renderSkeletonSheetItem}
-                contentContainerStyle={styles.listPad}
-                style={{ flex: 1 }}
-                nestedScrollEnabled
-              />
-            ) : (
-              <ContentFadeIn show style={{ flex: 1 }}>
-                <FlatList
-                  data={courts}
-                  extraData={filter}
-                  keyExtractor={(item) => item.id}
-                  renderItem={renderCourtItem}
-                  ListEmptyComponent={EmptyList}
-                  contentContainerStyle={styles.listPad}
-                  style={{ flex: 1 }}
-                  nestedScrollEnabled
-                  keyboardShouldPersistTaps="handled"
-                  keyboardDismissMode="on-drag"
-                  onScrollBeginDrag={() => Keyboard.dismiss()}
-                  onRefresh={onRefresh}
-                  refreshing={refreshing}
-                  tintColor="#1D9E75"
-                  colors={['#1D9E75']}
-                />
-              </ContentFadeIn>
-            )}
-          </>
-        ) : null}
       </View>
     )
   }
-
-  type SheetRow = CourtWithDistance | (typeof SHEET_SKELETON_KEYS)[number]
-
-  const sheetListData: readonly SheetRow[] = sheetOpen
-    ? listLoading
-      ? [...SHEET_SKELETON_KEYS]
-      : courts
-    : []
-
-  const sheetKeyExtractor = useCallback((item: SheetRow) => (typeof item === 'string' ? item : item.id), [])
-
-  const renderSheetRow = useCallback(
-    ({ item }: { item: SheetRow }) =>
-      typeof item === 'string' ? <SkeletonCourtSheetRow isDark={isDark} /> : renderCourtItem({ item }),
-    [isDark, renderCourtItem],
-  )
 
   return (
     <BottomSheet
       index={0}
       snapPoints={snapPoints}
-      onChange={setSheetIndex}
       enablePanDownToClose={false}
       // Let the sheet sit flush against the tab bar (avoid a visible gap).
       bottomInset={0}
@@ -374,24 +307,36 @@ export function NearbyCourtsSheet(props: NearbyCourtsSheetProps) {
         width: 40,
       }}
       style={styles.sheetRoot}>
-      <BottomSheetFlatList
-          data={sheetListData}
-          extraData={`${filter}:${sheetIndex}:${listLoading}`}
-          keyExtractor={sheetKeyExtractor}
-          renderItem={renderSheetRow}
+      {listLoading ? (
+        <BottomSheetFlatList
+          data={[...SHEET_SKELETON_KEYS]}
+          keyExtractor={(item) => item}
+          renderItem={renderSkeletonSheetItem}
           ListHeaderComponent={ListHeader}
-          ListEmptyComponent={sheetOpen && !listLoading ? EmptyList : null}
           contentContainerStyle={[styles.listPad, { paddingBottom: 16 }]}
           ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
-          scrollEnabled={sheetOpen}
-          keyboardShouldPersistTaps="handled"
-          keyboardDismissMode="on-drag"
-          onScrollBeginDrag={() => Keyboard.dismiss()}
-          onRefresh={sheetOpen ? onRefresh : undefined}
-          refreshing={sheetOpen ? refreshing : false}
-          tintColor="#1D9E75"
-          colors={['#1D9E75']}
         />
+      ) : (
+        <ContentFadeIn show style={{ flex: 1 }}>
+          <BottomSheetFlatList
+            data={courts}
+            extraData={filter}
+            keyExtractor={(item) => item.id}
+            renderItem={renderCourtItem}
+            ListHeaderComponent={ListHeader}
+            ListEmptyComponent={EmptyList}
+            contentContainerStyle={[styles.listPad, { paddingBottom: 16 }]}
+            ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
+            keyboardShouldPersistTaps="handled"
+            keyboardDismissMode="on-drag"
+            onScrollBeginDrag={() => Keyboard.dismiss()}
+            onRefresh={onRefresh}
+            refreshing={refreshing}
+            tintColor="#1D9E75"
+            colors={['#1D9E75']}
+          />
+        </ContentFadeIn>
+      )}
     </BottomSheet>
   )
 }
@@ -418,25 +363,6 @@ const styles = StyleSheet.create({
     borderTopRightRadius: 20,
     borderTopWidth: StyleSheet.hairlineWidth,
     overflow: 'hidden',
-  },
-  collapsedPeek: {
-    paddingHorizontal: 4,
-    paddingBottom: 10,
-  },
-  collapsedHint: {
-    fontSize: 14,
-    lineHeight: 19,
-    paddingHorizontal: 16,
-  },
-  webPeekHit: {
-    width: '100%',
-  },
-  webExpandedPeekRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingBottom: 8,
-    gap: 8,
   },
   handle: {
     alignSelf: 'center',

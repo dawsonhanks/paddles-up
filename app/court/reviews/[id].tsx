@@ -1,11 +1,14 @@
+import { ReportReasonModal } from '@/components/report-reason-modal'
 import { Colors } from '@/constants/theme'
 import { useColorScheme } from '@/hooks/use-color-scheme'
 import type { CourtReview } from '@/lib/courtReviews'
 import { fetchCourtReviewsPage } from '@/lib/courtReviews'
+import { ensureFavoritesUser } from '@/lib/favorites'
+import { showReportActionSheet } from '@/lib/showReportMenu'
 import { MaterialIcons } from '@expo/vector-icons'
 import { useLocalSearchParams, useRouter } from 'expo-router'
 import { useCallback, useEffect, useState } from 'react'
-import { ActivityIndicator, FlatList, StyleSheet, Text, TouchableOpacity, View } from 'react-native'
+import { ActivityIndicator, FlatList, Keyboard, Pressable, StyleSheet, Text, TouchableOpacity, View } from 'react-native'
 import { SafeAreaView } from 'react-native-safe-area-context'
 
 const PAGE_SIZE = 10
@@ -46,6 +49,14 @@ export default function CourtReviewsScreen() {
   const [loading, setLoading] = useState(true)
   const [loadingMore, setLoadingMore] = useState(false)
   const [hasMore, setHasMore] = useState(true)
+  const [myUserId, setMyUserId] = useState<string | null>(null)
+  const [reportReviewId, setReportReviewId] = useState<string | null>(null)
+
+  useEffect(() => {
+    void ensureFavoritesUser().then((g) => {
+      if (!('error' in g)) setMyUserId(g.userId)
+    })
+  }, [])
 
   const loadBatch = useCallback(
     async (offset: number) => {
@@ -91,18 +102,27 @@ export default function CourtReviewsScreen() {
   function renderItem({ item }: { item: CourtReview }) {
     const dateLabel = new Date(item.created_at).toLocaleDateString()
     return (
-      <View style={[styles.card, { backgroundColor: cardBg, borderColor: cardBorder }]}>
-        <View style={styles.cardTop}>
-          <Text style={[styles.name, { color: isDark ? '#F8FAFC' : '#0F172A' }]}>{item.display_name}</Text>
-          <Text style={[styles.date, { color: muted }]}>{dateLabel}</Text>
+      <Pressable
+        onLongPress={() => {
+          if (!myUserId || item.user_id === myUserId) return
+          Keyboard.dismiss()
+          showReportActionSheet(() => setReportReviewId(item.id))
+        }}
+        delayLongPress={450}
+        style={({ pressed }) => [pressed && { opacity: 0.92 }]}>
+        <View style={[styles.card, { backgroundColor: cardBg, borderColor: cardBorder }]}>
+          <View style={styles.cardTop}>
+            <Text style={[styles.name, { color: isDark ? '#F8FAFC' : '#0F172A' }]}>{item.display_name}</Text>
+            <Text style={[styles.date, { color: muted }]}>{dateLabel}</Text>
+          </View>
+          <StarRow rating={item.rating} filledColor="#F59E0B" emptyColor={isDark ? '#334155' : '#E2E8F0'} />
+          {item.review_text.trim() ? (
+            <Text style={[styles.body, { color: isDark ? '#E2E8F0' : '#334155' }]}>{item.review_text.trim()}</Text>
+          ) : (
+            <Text style={[styles.bodyMuted, { color: muted }]}>Stars only · no written notes</Text>
+          )}
         </View>
-        <StarRow rating={item.rating} filledColor="#F59E0B" emptyColor={isDark ? '#334155' : '#E2E8F0'} />
-        {item.review_text.trim() ? (
-          <Text style={[styles.body, { color: isDark ? '#E2E8F0' : '#334155' }]}>{item.review_text.trim()}</Text>
-        ) : (
-          <Text style={[styles.bodyMuted, { color: muted }]}>Stars only · no written notes</Text>
-        )}
-      </View>
+      </Pressable>
     )
   }
 
@@ -145,6 +165,12 @@ export default function CourtReviewsScreen() {
           }
         />
       )}
+      <ReportReasonModal
+        visible={reportReviewId != null}
+        onClose={() => setReportReviewId(null)}
+        contentType="review"
+        contentId={reportReviewId ?? ''}
+      />
     </SafeAreaView>
   )
 }

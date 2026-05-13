@@ -1,6 +1,7 @@
 import { ContentFadeIn } from '@/components/content-fade-in'
 import { ErrorBanner } from '@/components/error-banner'
 import { FriendAvatar } from '@/components/friend-avatar'
+import { ReportReasonModal } from '@/components/report-reason-modal'
 import { SkeletonCard } from '@/components/skeleton-card'
 import { Colors } from '@/constants/theme'
 import { useColorScheme } from '@/hooks/use-color-scheme'
@@ -12,16 +13,18 @@ import {
   type FriendSearchResult,
 } from '@/lib/friends'
 import { userFriendlyFromUnknown } from '@/lib/errors'
+import { showReportActionSheet } from '@/lib/showReportMenu'
 import { MaterialIcons } from '@expo/vector-icons'
 import { useFocusEffect } from '@react-navigation/native'
 import { useNavigation, useRouter } from 'expo-router'
-import { useCallback, useLayoutEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import {
   ActivityIndicator,
   FlatList,
   Image,
   Keyboard,
   Modal,
+  Pressable,
   StyleSheet,
   Text,
   TextInput,
@@ -32,6 +35,8 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context'
 
 import { supabase } from '@/supabase'
+
+import type { ContentReportType } from '@/lib/contentReports'
 
 export default function FriendsScreen() {
   const colorScheme = useColorScheme()
@@ -54,19 +59,53 @@ export default function FriendsScreen() {
   const [searching, setSearching] = useState(false)
   const [addingId, setAddingId] = useState<string | null>(null)
   const [friendsBanner, setFriendsBanner] = useState<string | null>(null)
+  const [myUserId, setMyUserId] = useState<string | null>(null)
+  const [reportTarget, setReportTarget] = useState<{ type: ContentReportType; id: string } | null>(null)
 
-  const loadFriends = useCallback(async () => {
-    setLoading(true)
-    const { friends: list, error } = await fetchFriendsWithStats()
-    if (error) {
-      setFriendsBanner(userFriendlyFromUnknown(error))
-    } else {
-      setFriends(list)
+  const deadRef = useRef(false)
+  useEffect(() => {
+    deadRef.current = false
+    return () => {
+      deadRef.current = true
     }
-    setLoading(false)
   }, [])
 
-  useFocusEffect(useCallback(() => { void loadFriends() }, [loadFriends]))
+  useEffect(() => {
+    let cancelled = false
+    void ensureFavoritesUser().then((g) => {
+      if (cancelled) return
+      if (!('error' in g)) setMyUserId(g.userId)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  const loadFriends = useCallback(async (cancelledRef?: { current: boolean }) => {
+    if (deadRef.current) return
+    setLoading(true)
+    try {
+      const { friends: list, error } = await fetchFriendsWithStats()
+      if (cancelledRef?.current || deadRef.current) return
+      if (error) {
+        setFriendsBanner(userFriendlyFromUnknown(error))
+      } else {
+        setFriends(list)
+      }
+    } finally {
+      if (!cancelledRef?.current && !deadRef.current) setLoading(false)
+    }
+  }, [])
+
+  useFocusEffect(
+    useCallback(() => {
+      const cancelled = { current: false }
+      void loadFriends(cancelled)
+      return () => {
+        cancelled.current = true
+      }
+    }, [loadFriends]),
+  )
 
   useLayoutEffect(() => {
     navigation.setOptions({
@@ -104,6 +143,7 @@ export default function FriendsScreen() {
     setSearching(true)
     try {
       const { results, error } = await searchPlayersFriendshipAware(searchQuery.trim())
+      if (deadRef.current) return
       if (error) {
         setSearchResults([])
         setFriendsBanner(userFriendlyFromUnknown(error))
@@ -111,7 +151,7 @@ export default function FriendsScreen() {
       }
       setSearchResults(results)
     } finally {
-      setSearching(false)
+      if (!deadRef.current) setSearching(false)
     }
   }
 
@@ -119,11 +159,13 @@ export default function FriendsScreen() {
     setAddingId(friendUserId)
     try {
       const gate = await ensureFavoritesUser()
+      if (deadRef.current) return
       if ('error' in gate) {
         setFriendsBanner(userFriendlyFromUnknown(gate.error))
         return
       }
       const { error } = await supabase.from('friendships').insert({ user_id: gate.userId, friend_id: friendUserId })
+      if (deadRef.current) return
       if (error) {
         setFriendsBanner(userFriendlyFromUnknown(error.message))
         return
@@ -133,7 +175,7 @@ export default function FriendsScreen() {
       )
       await loadFriends()
     } finally {
-      setAddingId(null)
+      if (!deadRef.current) setAddingId(null)
     }
   }
 
@@ -141,20 +183,26 @@ export default function FriendsScreen() {
     return (
       <TouchableOpacity
         style={[styles.friendCard, { backgroundColor: cardBg, borderColor: cardBorder }]}
-        onPress={() => router.push(`/friends/${f.user_id}`)}
+        onPress={() => router.push(`/friends/${f?.user_id ?? ''}`)}
+        onLongPress={() => {
+          if (!myUserId || f?.user_id === myUserId) return
+          Keyboard.dismiss()
+          showReportActionSheet(() => setReportTarget({ type: 'profile', id: f?.user_id ?? '' }))
+        }}
+        delayLongPress={450}
         activeOpacity={0.75}>
         <FriendAvatar friend={f} size={56} />
         <View style={styles.friendMid}>
           <Text style={[styles.friendDisplay, { color: theme.text }]} numberOfLines={1}>
-            {f.display_name ?? f.username ?? 'Player'}
+            {f?.display_name ?? f?.username ?? 'Player'}
           </Text>
-          {f.username ? <Text style={[styles.friendUsername, { color: muted }]} numberOfLines={1}>@{f.username}</Text> : null}
+          {f?.username ? <Text style={[styles.friendUsername, { color: muted }]} numberOfLines={1}>@{f.username}</Text> : null}
           <Text style={[styles.recordHint, { color: muted }]}>
-            {f.wins}W {f.losses}L
+            {f?.wins ?? 0}W {f?.losses ?? 0}L
           </Text>
         </View>
         <View style={styles.friendTrail}>
-          {f.skill_rating != null ? (
+          {f?.skill_rating != null ? (
             <View style={[styles.skillBadgeSm, isDark ? { backgroundColor: 'rgba(29, 158, 117, 0.2)' } : { backgroundColor: '#E1F5EE' }]}>
               <Image source={require('../../assets/images/icon.png')} style={styles.ratingIco} />
               <Text style={[styles.skillBadgeTxt, { color: '#0F6E56' }]}>{f.skill_rating.toFixed(1)}</Text>
@@ -170,34 +218,43 @@ export default function FriendsScreen() {
     const isLast = i === searchResults.length - 1
     return (
       <View
-        key={player.user_id}
+        key={player?.user_id ?? String(i)}
         style={[
           styles.searchResultRow,
           { borderBottomColor: cardBorder },
           isLast && { borderBottomWidth: 0 },
         ]}>
-        <FriendAvatar friend={player} size={44} />
-        <View style={styles.searchResultInfo}>
-          <Text style={[styles.searchResultName, { color: theme.text }]}>
-            {player.display_name ?? player.username ?? 'Player'}
-          </Text>
-          {player.username ? (
-            <Text style={[styles.searchResultUsername, { color: muted }]}>@{player.username}</Text>
-          ) : null}
-          {player.linkStatus === 'they_added_you' ? (
-            <Text style={[styles.pendingHint, { color: '#D97706' }]}>Added you</Text>
-          ) : null}
-        </View>
-        {player.linkStatus === 'friends' ? (
+        <Pressable
+          style={{ flex: 1, flexDirection: 'row', alignItems: 'center', gap: 12, minWidth: 0 }}
+          onLongPress={() => {
+            if (!myUserId || player?.user_id === myUserId) return
+            Keyboard.dismiss()
+            showReportActionSheet(() => setReportTarget({ type: 'profile', id: player?.user_id ?? '' }))
+          }}
+          delayLongPress={450}>
+          <FriendAvatar friend={player} size={44} />
+          <View style={styles.searchResultInfo}>
+            <Text style={[styles.searchResultName, { color: theme.text }]}>
+              {player?.display_name ?? player?.username ?? 'Player'}
+            </Text>
+            {player?.username ? (
+              <Text style={[styles.searchResultUsername, { color: muted }]}>@{player.username}</Text>
+            ) : null}
+            {player?.linkStatus === 'they_added_you' ? (
+              <Text style={[styles.pendingHint, { color: '#D97706' }]}>Added you</Text>
+            ) : null}
+          </View>
+        </Pressable>
+        {player?.linkStatus === 'friends' ? (
           <View style={styles.friendedBadge}>
             <MaterialIcons name="check" size={16} color="#1D9E75" />
             <Text style={styles.friendedText}>Friends</Text>
           </View>
         ) : (
           <TouchableOpacity
-            style={[styles.addBtn, addingId === player.user_id && { opacity: 0.6 }]}
-            onPress={() => addFriend(player.user_id)}
-            disabled={addingId === player.user_id}
+            style={[styles.addBtn, addingId === player?.user_id && { opacity: 0.6 }]}
+            onPress={() => addFriend(player?.user_id ?? '')}
+            disabled={addingId === player?.user_id}
             activeOpacity={0.8}>
             {addingId === player.user_id ? (
               <ActivityIndicator color="#fff" size="small" />
@@ -244,7 +301,7 @@ export default function FriendsScreen() {
         <ContentFadeIn show style={{ flex: 1 }}>
           <FlatList
             data={filteredFriends}
-            keyExtractor={(item) => item.user_id}
+            keyExtractor={(item) => item?.user_id ?? ''}
             renderItem={renderFriendCard}
             contentContainerStyle={styles.listContent}
             keyboardShouldPersistTaps="handled"
@@ -290,7 +347,7 @@ export default function FriendsScreen() {
 
           <FlatList
             data={searchResults}
-            keyExtractor={(item) => item.user_id}
+            keyExtractor={(item) => item?.user_id ?? ''}
             keyboardShouldPersistTaps="handled"
             renderItem={({ item, index }) => renderSearchRow(item, index)}
             ListEmptyComponent={
@@ -308,6 +365,12 @@ export default function FriendsScreen() {
       </Modal>
       </View>
       </TouchableWithoutFeedback>
+      <ReportReasonModal
+        visible={reportTarget != null}
+        onClose={() => setReportTarget(null)}
+        contentType="profile"
+        contentId={reportTarget?.id ?? ''}
+      />
     </SafeAreaView>
   )
 }
