@@ -60,6 +60,7 @@ type Profile = {
   pickup_skill_level: string | null
   wins: number
   losses: number
+  admin: boolean
 }
 
 const PICKUP_SKILL_LEVELS = ['Beginner', 'Intermediate', 'Advanced'] as const
@@ -150,6 +151,7 @@ export default function ProfileScreen() {
           (playerData as { pickup_skill_level?: string | null } | null)?.pickup_skill_level ?? null,
         wins,
         losses,
+        admin: Boolean((playerData as { admin?: boolean | null } | null)?.admin),
       })
     } finally {
       setLoading(false)
@@ -608,13 +610,15 @@ export default function ProfileScreen() {
             </TouchableOpacity>
           ))}
         </View>
-        <TouchableOpacity
-          style={styles.adminTestBtn}
-          onPress={() => router.push('/admin/submissions')}
-          activeOpacity={0.8}>
-          <MaterialIcons name="admin-panel-settings" size={18} color="#fff" />
-          <Text style={styles.adminTestBtnText}>Open Admin Submissions (Temp)</Text>
-        </TouchableOpacity>
+        {profile?.admin === true ? (
+          <TouchableOpacity
+            style={styles.adminNavBtn}
+            onPress={() => router.push('/admin/submissions')}
+            activeOpacity={0.8}>
+            <MaterialIcons name="admin-panel-settings" size={18} color="#fff" />
+            <Text style={styles.adminNavBtnText}>Court submissions</Text>
+          </TouchableOpacity>
+        ) : null}
 
         <Text style={[styles.tagline, { color: muted }]}>Find your court. Play your game.</Text>
         <Text style={[styles.version, { color: muted }]}>Version 1.0.0</Text>
@@ -969,8 +973,8 @@ const styles = StyleSheet.create({
   row: { flexDirection: 'row', alignItems: 'center', padding: 16 },
   rowIcon: { marginRight: 14 },
   rowLabel: { flex: 1, fontSize: 15 },
-  adminTestBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, backgroundColor: '#334155', borderRadius: 12, paddingVertical: 12, marginBottom: 20 },
-  adminTestBtnText: { color: '#fff', fontSize: 14, fontWeight: '600' },
+  adminNavBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, backgroundColor: '#334155', borderRadius: 12, paddingVertical: 12, marginBottom: 20 },
+  adminNavBtnText: { color: '#fff', fontSize: 14, fontWeight: '600' },
   tagline: { textAlign: 'center', fontSize: 13, marginBottom: 4 },
   version: { textAlign: 'center', fontSize: 12, marginBottom: 24 },
   deleteAccountBtn: {

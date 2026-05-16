@@ -64,6 +64,7 @@ export default function AdminSubmissionsScreen() {
   const muted = isDark ? '#94A3B8' : '#64748B'
 
   const [loading, setLoading] = useState(true)
+  const [isModerator, setIsModerator] = useState(false)
   const [items, setItems] = useState<CourtSubmission[]>([])
   const [busyId, setBusyId] = useState<string | null>(null)
   const [coordDrafts, setCoordDrafts] = useState<Record<string, CoordDraft>>({})
@@ -76,38 +77,60 @@ export default function AdminSubmissionsScreen() {
     }
   }, [])
 
+  const loadPendingSubmissions = useCallback(async (cancelledRef?: { current: boolean }) => {
+    const { data, error } = await supabase
+      .from('court_submissions')
+      .select('*')
+      .eq('status', 'pending')
+      .order('created_at', { ascending: true })
+    if (cancelledRef?.current) return
+    if (error) {
+      Alert.alert('Submissions did not load', userFriendlyFromUnknown(error.message))
+      return
+    }
+    const rows = (data as CourtSubmission[]) ?? []
+    setItems(rows)
+    const initialDrafts: Record<string, CoordDraft> = {}
+    for (const row of rows) {
+      initialDrafts[row.id] = {
+        latitude: row.latitude != null ? String(row.latitude) : '',
+        longitude: row.longitude != null ? String(row.longitude) : '',
+        source: row.geocode_source ?? null,
+        confidence: row.geocode_confidence ?? null,
+      }
+    }
+    setCoordDrafts(initialDrafts)
+  }, [])
+
   const load = useCallback(async (cancelledRef?: { current: boolean }) => {
     setLoading(true)
     try {
       const gate = await ensureFavoritesUser()
       if (cancelledRef?.current) return
-      if ('error' in gate) return
-      const { data, error } = await supabase
-        .from('court_submissions')
-        .select('*')
-        .eq('status', 'pending')
-        .order('created_at', { ascending: true })
-      if (cancelledRef?.current) return
-      if (error) {
-        Alert.alert('Submissions did not load', userFriendlyFromUnknown(error.message))
+      if ('error' in gate) {
+        setIsModerator(false)
+        setItems([])
+        setCoordDrafts({})
         return
       }
-      const rows = (data as CourtSubmission[]) ?? []
-      setItems(rows)
-      const initialDrafts: Record<string, CoordDraft> = {}
-      for (const row of rows) {
-        initialDrafts[row.id] = {
-          latitude: row.latitude != null ? String(row.latitude) : '',
-          longitude: row.longitude != null ? String(row.longitude) : '',
-          source: row.geocode_source ?? null,
-          confidence: row.geocode_confidence ?? null,
-        }
+      const { data: modRow } = await supabase
+        .from('players')
+        .select('admin')
+        .eq('user_id', gate.userId)
+        .maybeSingle()
+      if (cancelledRef?.current) return
+      if (!Boolean(modRow?.admin)) {
+        setIsModerator(false)
+        setItems([])
+        setCoordDrafts({})
+        return
       }
-      setCoordDrafts(initialDrafts)
+      setIsModerator(true)
+      await loadPendingSubmissions(cancelledRef)
     } finally {
       if (!cancelledRef?.current) setLoading(false)
     }
-  }, [])
+  }, [loadPendingSubmissions])
 
   useFocusEffect(
     useCallback(() => {
@@ -238,13 +261,21 @@ export default function AdminSubmissionsScreen() {
     <SafeAreaView style={[styles.root, { backgroundColor: theme.background }]} edges={['top']}>
       <View style={styles.header}>
         <Text style={[styles.title, { color: theme.text }]}>Court Submissions</Text>
-        <TouchableOpacity onPress={() => void load()} activeOpacity={0.8} style={styles.refreshBtn}>
-          <MaterialIcons name="refresh" size={20} color="#1D9E75" />
-        </TouchableOpacity>
+        {isModerator ? (
+          <TouchableOpacity onPress={() => void load()} activeOpacity={0.8} style={styles.refreshBtn}>
+            <MaterialIcons name="refresh" size={20} color="#1D9E75" />
+          </TouchableOpacity>
+        ) : (
+          <View style={styles.refreshBtnPlaceholder} />
+        )}
       </View>
 
       {loading ? (
         <ActivityIndicator color={theme.tint} style={{ marginTop: 40 }} />
+      ) : !isModerator ? (
+        <Text style={[styles.accessDenied, { color: muted }]}>
+          {"You don't have permission to moderate court suggestions."}
+        </Text>
       ) : (
         <ScrollView contentContainerStyle={styles.container}>
           {items.length === 0 ? (
@@ -343,6 +374,8 @@ const styles = StyleSheet.create({
   header: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 20, paddingVertical: 14 },
   title: { fontSize: 22, fontWeight: '700' },
   refreshBtn: { width: 36, height: 36, borderRadius: 18, alignItems: 'center', justifyContent: 'center', backgroundColor: 'rgba(29, 158, 117, 0.12)' },
+  refreshBtnPlaceholder: { width: 36, height: 36 },
+  accessDenied: { textAlign: 'center', marginTop: 48, paddingHorizontal: 28, fontSize: 15, lineHeight: 22 },
   container: { paddingHorizontal: 16, paddingBottom: 16, gap: 12 },
   emptyText: { textAlign: 'center', marginTop: 32, fontSize: 15 },
   card: { borderWidth: 0.5, borderRadius: 14, padding: 14 },
