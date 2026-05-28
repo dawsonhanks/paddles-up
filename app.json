@@ -9,8 +9,11 @@
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "privacy": "https://dawsonhanks.github.io/paddles-up-privacy/",
+    "privacy_policy_url": "https://dawsonhanks.github.io/paddles-up-privacy/",
     "ios": {
-      "supportsTablet": true,
+      "bundleIdentifier": "com.paddlesup.app",
+      "buildNumber": "1",
+      "supportsTablet": false,
       "infoPlist": {
         "NSLocationWhenInUseUsageDescription": "Paddles Up uses your location to show nearby pickleball courts, verify you are at a court before checking in or reporting availability, and automatically check you in when you arrive at a court. Your location is only used while the app is open and is never stored or shared."
       },
