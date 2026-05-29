@@ -1,7 +1,9 @@
 import { ContentFadeIn } from '@/components/content-fade-in'
 import { ErrorBanner } from '@/components/error-banner'
 import { SkeletonSettingsProfile } from '@/components/skeleton-card'
+import { UsernameAvailabilityStatus } from '@/components/username-availability-status'
 import { Colors } from '@/constants/theme'
+import { useUsernameAvailability } from '@/hooks/use-username-availability'
 import { useColorScheme } from '@/hooks/use-color-scheme'
 import { ensureFavoritesUser } from '@/lib/favorites'
 import {
@@ -10,6 +12,7 @@ import {
   isValidUsername,
   normalizeUsername,
   sanitizeUsernameInput,
+  USERNAME_FORMAT_HINT,
 } from '@/lib/profileValidation'
 import { alertOpenSettings } from '@/lib/alerts'
 import { invokeDeleteAccountEdge } from '@/lib/deleteAccount'
@@ -20,7 +23,7 @@ import * as ImagePicker from 'expo-image-picker'
 import * as Linking from 'expo-linking'
 import * as WebBrowser from 'expo-web-browser'
 import { useRouter } from 'expo-router'
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useState } from 'react'
 import AsyncStorage from '@react-native-async-storage/async-storage'
 import {
   ActivityIndicator,
@@ -105,8 +108,9 @@ export default function ProfileScreen() {
   const [createUsername, setCreateUsername] = useState('')
   const [createContact, setCreateContact] = useState('')
   const [createContactType, setCreateContactType] = useState<'email' | 'phone'>('email')
-  const [createUsernameStatus, setCreateUsernameStatus] = useState<'idle' | 'invalid' | 'checking' | 'available' | 'taken'>('idle')
   const [avatarUri, setAvatarUri] = useState<string | null>(null)
+
+  const createUsernameAvailability = useUsernameAvailability(createUsername, { enabled: showCreate })
 
   const [showSuggestCourt, setShowSuggestCourt] = useState(false)
   const [suggestSubmitting, setSuggestSubmitting] = useState(false)
@@ -121,6 +125,12 @@ export default function ProfileScreen() {
   const [suggestNotes, setSuggestNotes] = useState('')
   const [profileBanner, setProfileBanner] = useState<string | null>(null)
   const [deleteAccountLoading, setDeleteAccountLoading] = useState(false)
+  const [signInEmail, setSignInEmail] = useState<string | null>(null)
+
+  const loadSignInEmail = useCallback(async () => {
+    const { data } = await supabase.auth.getUser()
+    setSignInEmail(data.user?.email?.trim() || null)
+  }, [])
 
   const loadProfile = useCallback(async (cancelledRef?: { current: boolean }) => {
     setLoading(true)
@@ -161,12 +171,18 @@ export default function ProfileScreen() {
   useFocusEffect(
     useCallback(() => {
       const cancelled = { current: false }
+      void loadSignInEmail()
       void loadProfile(cancelled)
       return () => {
         cancelled.current = true
       }
-    }, [loadProfile]),
+    }, [loadProfile, loadSignInEmail]),
   )
+
+  async function signOut() {
+    await supabase.auth.signOut()
+    router.replace('/auth')
+  }
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true)
@@ -218,7 +234,7 @@ export default function ProfileScreen() {
     }
     if (editUsername.trim()) {
       const u = normalizeUsername(editUsername)
-      if (!isValidUsername(u)) { Alert.alert('Invalid username', 'Use 2–32 characters: lowercase letters, numbers, and underscores only.'); return }
+      if (!isValidUsername(u)) { Alert.alert('Invalid username', USERNAME_FORMAT_HINT); return }
     }
     setSaving(true)
     try {
@@ -273,11 +289,11 @@ export default function ProfileScreen() {
 
   async function saveCreateProfile() {
     if (!createName.trim()) { Alert.alert('Name required', 'Please enter your display name.'); return }
-    const handle = normalizeUsername(createUsername)
-    if (!isValidUsername(handle)) {
-      Alert.alert('Invalid username', 'Use 2–32 characters: lowercase letters, numbers, and underscores only. No spaces.')
+    if (createUsernameAvailability.status !== 'available') {
+      Alert.alert('Username unavailable', createUsernameAvailability.status === 'taken' ? 'That username is already taken.' : USERNAME_FORMAT_HINT)
       return
     }
+    const handle = createUsernameAvailability.handle
     const c = createContact.trim()
     if (!c) { Alert.alert('Contact required', 'Add an email or phone number so we can reach you if needed.'); return }
     const contactOk = createContactType === 'email' ? isValidEmail(c) : isValidPhone(c)
@@ -339,45 +355,6 @@ export default function ProfileScreen() {
     : '—'
 
   const hasProfile = Boolean(profile?.display_name?.trim())
-
-  useEffect(() => {
-    if (!showCreate) return
-    const handle = normalizeUsername(createUsername)
-    if (!handle) {
-      setCreateUsernameStatus('idle')
-      return
-    }
-    if (!isValidUsername(handle)) {
-      setCreateUsernameStatus('invalid')
-      return
-    }
-
-    let cancelled = false
-    setCreateUsernameStatus('checking')
-    const timer = setTimeout(async () => {
-      const gate = await ensureFavoritesUser()
-      if (cancelled || 'error' in gate) return
-
-      const { data: taken, error } = await supabase
-        .from('players')
-        .select('user_id')
-        .eq('username', handle)
-        .maybeSingle()
-
-      if (cancelled) return
-      if (error) {
-        setCreateUsernameStatus('idle')
-        return
-      }
-      if (cancelled) return
-      setCreateUsernameStatus(taken && taken.user_id !== gate.userId ? 'taken' : 'available')
-    }, 350)
-
-    return () => {
-      cancelled = true
-      clearTimeout(timer)
-    }
-  }, [createUsername, showCreate])
 
   function openSuggestCourt() {
     setSuggestCourtName('')
@@ -461,8 +438,8 @@ export default function ProfileScreen() {
         return
       }
       await supabase.auth.signOut()
-      await AsyncStorage.clear()
-      router.replace('/onboarding')
+      await AsyncStorage.multiRemove(['onboarded'])
+      router.replace('/auth')
     } catch (e) {
       Alert.alert('Something went wrong', userFriendlyFromUnknown(e))
     } finally {
@@ -525,6 +502,11 @@ export default function ProfileScreen() {
               </Text>
               {profile?.username ? (
                 <Text style={[styles.username, { color: muted }]}>@{profile.username}</Text>
+              ) : null}
+              {signInEmail ? (
+                <Text style={[styles.signInEmail, { color: muted }]} accessibilityLabel={`Signed in as ${signInEmail}`}>
+                  Signed in as {signInEmail}
+                </Text>
               ) : null}
               {profile?.skill_rating != null ? (
                 <View style={styles.profileRatingBadge}>
@@ -624,6 +606,20 @@ export default function ProfileScreen() {
         <Text style={[styles.version, { color: muted }]}>Version 1.0.0</Text>
 
         <TouchableOpacity
+          style={[styles.signOutBtn, { borderColor: cardBorder }]}
+          onPress={() => {
+            Alert.alert('Sign out?', 'You can sign back in with the same email anytime.', [
+              { text: 'Cancel', style: 'cancel' },
+              { text: 'Sign out', style: 'destructive', onPress: () => void signOut() },
+            ])
+          }}
+          activeOpacity={0.65}
+          accessibilityRole="button"
+          accessibilityLabel="Sign out">
+          <Text style={[styles.signOutLabel, { color: theme.text }]}>Sign Out</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
           style={styles.deleteAccountBtn}
           onPress={confirmDeleteAccount}
           activeOpacity={0.65}
@@ -670,8 +666,10 @@ export default function ProfileScreen() {
               value={editUsername} onChangeText={t => setEditUsername(sanitizeUsernameInput(t))}
               placeholder="e.g. pickleball_jake" placeholderTextColor={muted}
               autoCapitalize="none"
+              maxLength={20}
               style={[styles.input, { color: theme.text, borderColor: cardBorder, backgroundColor: cardBg }]}
             />
+            <Text style={[styles.usernameHint, { color: muted }]}>{USERNAME_FORMAT_HINT}</Text>
             <Text style={[styles.fieldLabel, { color: muted }]}>Contact (optional)</Text>
             <View style={styles.contactPillRow}>
               {(['email', 'phone'] as const).map(key => (
@@ -858,7 +856,7 @@ export default function ProfileScreen() {
             />
             <Text style={[styles.fieldLabel, { color: muted }]}>Username</Text>
             <Text style={[styles.usernameHint, { color: muted }]}>
-              Lowercase, no spaces. Shown as {'@' + (createUsername || 'yourname')}
+              {USERNAME_FORMAT_HINT} Shown as {'@' + (createUsername || 'yourname')}
             </Text>
             <TextInput
               value={createUsername} onChangeText={t => setCreateUsername(sanitizeUsernameInput(t))}
@@ -866,22 +864,10 @@ export default function ProfileScreen() {
               placeholderTextColor={muted}
               autoCapitalize="none"
               autoCorrect={false}
+              maxLength={20}
               style={[styles.input, { color: theme.text, borderColor: cardBorder, backgroundColor: cardBg }]}
             />
-            {createUsernameStatus === 'checking' ? (
-              <Text style={[styles.usernameStatus, { color: muted }]}>Checking availability…</Text>
-            ) : null}
-            {createUsernameStatus === 'available' ? (
-              <Text style={[styles.usernameStatus, { color: '#1D9E75' }]}>Username is available.</Text>
-            ) : null}
-            {createUsernameStatus === 'taken' ? (
-              <Text style={[styles.usernameStatus, { color: '#E24B4A' }]}>Username is already taken.</Text>
-            ) : null}
-            {createUsernameStatus === 'invalid' ? (
-              <Text style={[styles.usernameStatus, { color: '#E24B4A' }]}>
-                Use 2-32 characters: lowercase letters, numbers, and underscores only.
-              </Text>
-            ) : null}
+            <UsernameAvailabilityStatus status={createUsernameAvailability.status} mutedColor={muted} />
             <Text style={[styles.fieldLabel, { color: muted }]}>Contact</Text>
             <View style={styles.contactPillRow}>
               {(['email', 'phone'] as const).map(key => (
@@ -977,6 +963,24 @@ const styles = StyleSheet.create({
   adminNavBtnText: { color: '#fff', fontSize: 14, fontWeight: '600' },
   tagline: { textAlign: 'center', fontSize: 13, marginBottom: 4 },
   version: { textAlign: 'center', fontSize: 12, marginBottom: 24 },
+  signInEmail: {
+    fontSize: 13,
+    marginTop: 4,
+    textAlign: 'center',
+  },
+  signOutBtn: {
+    alignSelf: 'center',
+    marginTop: 8,
+    marginBottom: 4,
+    paddingVertical: 12,
+    paddingHorizontal: 24,
+    borderWidth: 1,
+    borderRadius: 10,
+  },
+  signOutLabel: {
+    fontSize: 16,
+    fontWeight: '600',
+  },
   deleteAccountBtn: {
     alignSelf: 'center',
     paddingVertical: 14,

@@ -15,16 +15,19 @@
       "buildNumber": "1",
       "supportsTablet": false,
       "infoPlist": {
-        "NSLocationWhenInUseUsageDescription": "Paddles Up uses your location to show nearby pickleball courts, verify you are at a court before checking in or reporting availability, and automatically check you in when you arrive at a court. Your location is only used while the app is open and is never stored or shared."
-      },
-      "privacyManifests": {
-        "NSPrivacyAccessedAPITypes": []
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSLocationWhenInUseUsageDescription": "Paddles Up uses your location to show nearby pickleball courts, verify you are at a court before checking in or reporting availability, and automatically check you in when you arrive at a court. Your location is only used while the app is open and is never stored or shared.",
+        "NSPhotoLibraryUsageDescription": "Paddles Up needs access to your photo library so you can choose a profile picture or upload court photos.",
+        "NSCameraUsageDescription": "Paddles Up needs access to your camera so you can take court photos at the venue."
       },
       "config": {
         "googleMapsApiKey": "AIzaSyDIIfA-IG2_eHBlXx0kw92T1Gvox8XcoM4"
       }
     },
     "android": {
+      "blockedPermissions": [
+        "android.permission.RECORD_AUDIO"
+      ],
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/images/android-icon-foreground.png",
@@ -50,6 +53,14 @@
           "locationWhenInUsePermission": "Paddles Up uses your location to show nearby pickleball courts, verify you are at a court before checking in or reporting availability, and automatically check you in when you arrive at a court. Your location is only used while the app is open and is never stored or shared."
         }
       ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Paddles Up needs access to your photo library so you can choose a profile picture or upload court photos.",
+          "cameraPermission": "Paddles Up needs access to your camera so you can take court photos at the venue."
+        }
+      ],
+      "expo-notifications",
       [
         "expo-splash-screen",
         {

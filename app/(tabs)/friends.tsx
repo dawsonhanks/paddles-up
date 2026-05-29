@@ -5,6 +5,7 @@ import { ReportReasonModal } from '@/components/report-reason-modal'
 import { SkeletonCard } from '@/components/skeleton-card'
 import { Colors } from '@/constants/theme'
 import { useColorScheme } from '@/hooks/use-color-scheme'
+import { USERNAME_AVAILABILITY_DEBOUNCE_MS } from '@/hooks/use-username-availability'
 import { ensureFavoritesUser } from '@/lib/favorites'
 import {
   fetchFriendsWithStats,
@@ -121,8 +122,9 @@ export default function FriendsScreen() {
             setShowAddFriends(true)
           }}
           style={{ marginRight: 4, padding: 8 }}
-          hitSlop={12}>
-          <MaterialIcons name="person-add" size={24} color={theme.tint} />
+          hitSlop={12}
+          accessibilityLabel="Search players">
+          <MaterialIcons name="person-search" size={24} color={theme.tint} />
         </TouchableOpacity>
       ),
     })
@@ -154,6 +156,37 @@ export default function FriendsScreen() {
       if (!deadRef.current) setSearching(false)
     }
   }
+
+  useEffect(() => {
+    if (!showAddFriends) return
+    const q = searchQuery.trim()
+    if (!q) {
+      setSearchResults([])
+      setSearching(false)
+      return
+    }
+
+    let cancelled = false
+    setSearching(true)
+    const timer = setTimeout(() => {
+      void searchPlayersFriendshipAware(q).then(({ results, error }) => {
+        if (cancelled || deadRef.current) return
+        if (error) {
+          setSearchResults([])
+          setFriendsBanner(userFriendlyFromUnknown(error))
+        } else {
+          setSearchResults(results)
+          setFriendsBanner(null)
+        }
+        setSearching(false)
+      })
+    }, USERNAME_AVAILABILITY_DEBOUNCE_MS)
+
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
+  }, [searchQuery, showAddFriends])
 
   async function addFriend(friendUserId: string) {
     setAddingId(friendUserId)
@@ -294,7 +327,7 @@ export default function FriendsScreen() {
       ) : filteredFriends.length === 0 ? (
         <Text style={[styles.empty, { color: muted }]}>
           {friends.length === 0
-            ? 'No friends yet. Tap + to search and add players you know.'
+            ? 'No friends yet. Tap search to find players by @username.'
             : 'No friends match your search.'}
         </Text>
       ) : (
@@ -314,7 +347,7 @@ export default function FriendsScreen() {
           <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
             <View style={styles.modalRoot}>
           <View style={styles.modalHeader}>
-            <Text style={[styles.modalTitle, { color: theme.text }]}>Add Friends</Text>
+            <Text style={[styles.modalTitle, { color: theme.text }]}>Search Players</Text>
             <TouchableOpacity onPress={() => setShowAddFriends(false)}>
               <MaterialIcons name="close" size={24} color={muted} />
             </TouchableOpacity>
@@ -324,7 +357,7 @@ export default function FriendsScreen() {
             <TextInput
               value={searchQuery}
               onChangeText={setSearchQuery}
-              placeholder="Username or display name…"
+              placeholder="Search by @username or name…"
               placeholderTextColor={muted}
               autoCapitalize="none"
               autoCorrect={false}
@@ -353,7 +386,7 @@ export default function FriendsScreen() {
             ListEmptyComponent={
               searching ? null : (
                 <Text style={[styles.searchEmpty, { color: muted }]}>
-                  {searchQuery.trim() ? 'No players found.' : 'Search by username or display name.'}
+                  {searchQuery.trim() ? 'No players found.' : 'Type a @username or name to find players.'}
                 </Text>
               )
             }

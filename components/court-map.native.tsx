@@ -1,5 +1,5 @@
-import { useEffect, useRef } from 'react'
-import { StyleSheet, View } from 'react-native'
+import { useEffect, useRef, useState } from 'react'
+import { Animated, StyleSheet, View } from 'react-native'
 import MapView, { Marker } from 'react-native-maps'
 import Svg, { Circle, Path } from 'react-native-svg'
 
@@ -12,10 +12,20 @@ export type CourtMapProps = {
   showUserLocation?: boolean
   courts: Court[]
   selectedId: string | null
+  /** Pin diameter in px; scales with map zoom from the map screen. */
+  markerPinSize?: number
   onSelectCourt: (id: string) => void
   /** Bottom `mapPadding` so pins / camera clear overlays; also shifts Apple/Google legal toward the bottom edge. */
   mapBottomPadding: number
   onMapPress?: () => void
+  /** Pin ids that should fade in (debounced viewport reveal); initial pins omit this. */
+  fadeInCourtIds?: ReadonlySet<string>
+  onRegionChange?: (region: {
+    latitude: number
+    longitude: number
+    latitudeDelta: number
+    longitudeDelta: number
+  }) => void
   onRegionChangeComplete?: (region: {
     latitude: number
     longitude: number
@@ -25,10 +35,11 @@ export type CourtMapProps = {
 }
 
 const NEIGHBORHOOD_DELTA = 0.06
+const MARKER_FADE_MS = 420
 
-function PickleballFace({ color }: { color: string }) {
+function PickleballFace({ color, size }: { color: string; size: number }) {
   return (
-    <Svg width={16} height={16} viewBox="0 0 16 16">
+    <Svg width={size} height={size} viewBox="0 0 16 16">
       <Circle cx={8} cy={8} r={8} fill={color} />
       <Path d="M3.2 4.8c1.2-1.5 2.9-2.4 4.8-2.5" stroke="rgba(255,255,255,0.25)" strokeWidth={0.9} fill="none" />
       <Path d="M12.8 4.8c-1.2-1.5-2.9-2.4-4.8-2.5" stroke="rgba(255,255,255,0.25)" strokeWidth={0.9} fill="none" />
@@ -43,19 +54,91 @@ function PickleballFace({ color }: { color: string }) {
   )
 }
 
+const DEFAULT_MARKER_PIN_SIZE = 16
+
+function CourtMarker({
+  court,
+  selected,
+  pinSize,
+  hitSize,
+  borderWidth,
+  tracksViewChanges,
+  fadeIn,
+  onSelectCourt,
+}: {
+  court: Court
+  selected: boolean
+  pinSize: number
+  hitSize: number
+  borderWidth: number
+  tracksViewChanges: boolean
+  fadeIn: boolean
+  onSelectCourt: (id: string) => void
+}) {
+  const opacity = useRef(new Animated.Value(fadeIn ? 0 : 1)).current
+
+  useEffect(() => {
+    if (!fadeIn) return
+    Animated.timing(opacity, {
+      toValue: 1,
+      duration: MARKER_FADE_MS,
+      useNativeDriver: true,
+    }).start()
+  }, [fadeIn, opacity])
+
+  return (
+    <Marker
+      coordinate={{ latitude: court.latitude, longitude: court.longitude }}
+      anchor={{ x: 0.5, y: 0.5 }}
+      centerOffset={{ x: 0, y: 0 }}
+      onPress={() => onSelectCourt(court.id)}
+      tracksViewChanges={tracksViewChanges || selected}>
+      <Animated.View
+        collapsable={false}
+        style={[styles.markerHit, { width: hitSize, height: hitSize, opacity }]}>
+        <View
+          style={[
+            styles.dot,
+            {
+              width: pinSize,
+              height: pinSize,
+              borderRadius: pinSize / 2,
+              borderWidth,
+            },
+            selected && styles.dotSelected,
+          ]}>
+          <PickleballFace color={STATUS_PIN_COLOR[court.status]} size={pinSize} />
+        </View>
+      </Animated.View>
+    </Marker>
+  )
+}
+
 export function CourtMap({
   userLat,
   userLon,
   courts,
   selectedId,
+  markerPinSize = DEFAULT_MARKER_PIN_SIZE,
   onSelectCourt,
   mapBottomPadding,
   onMapPress,
+  fadeInCourtIds,
+  onRegionChange,
   onRegionChangeComplete,
   showUserLocation = true,
 }: CourtMapProps) {
   const mapRef = useRef<MapView>(null)
   const initialZoomDone = useRef(false)
+  const pinSize = Math.max(1, markerPinSize)
+  const hitSize = pinSize * 2.25
+  const borderWidth = Math.max(2, Math.round(pinSize * 0.125))
+  const [tracksMarkerViews, setTracksMarkerViews] = useState(true)
+  useEffect(() => {
+    setTracksMarkerViews(true)
+    const frame = requestAnimationFrame(() => setTracksMarkerViews(false))
+    return () => cancelAnimationFrame(frame)
+  }, [pinSize])
 
   useEffect(() => {
     const map = mapRef.current
@@ -70,7 +153,7 @@ export function CourtMap({
         latitudeDelta: NEIGHBORHOOD_DELTA,
         longitudeDelta: NEIGHBORHOOD_DELTA,
       },
-      400
+      400,
     )
   }, [userLat, userLon])
 
@@ -85,29 +168,24 @@ export function CourtMap({
         latitudeDelta: NEIGHBORHOOD_DELTA,
         longitudeDelta: NEIGHBORHOOD_DELTA,
       }}
+      onRegionChange={onRegionChange}
       onRegionChangeComplete={onRegionChangeComplete}
       onPress={onMapPress}
       onPanDrag={onMapPress}
       showsUserLocation={showUserLocation}
       showsMyLocationButton={false}>
       {courts.map((c) => (
-        <Marker
+        <CourtMarker
           key={c.id}
-          coordinate={{ latitude: c.latitude, longitude: c.longitude }}
-          anchor={{ x: 0.5, y: 0.5 }}
-          centerOffset={{ x: 0, y: 0 }}
-          onPress={() => onSelectCourt(c.id)}
-          tracksViewChanges={selectedId === c.id}>
-          <View collapsable={false} style={styles.markerHit}>
-            <View
-              style={[
-                styles.dot,
-                selectedId === c.id && styles.dotSelected,
-              ]}>
-              <PickleballFace color={STATUS_PIN_COLOR[c.status]} />
-            </View>
-          </View>
-        </Marker>
+          court={c}
+          selected={selectedId === c.id}
+          pinSize={pinSize}
+          hitSize={hitSize}
+          borderWidth={borderWidth}
+          tracksViewChanges={tracksMarkerViews || selectedId === c.id}
+          fadeIn={fadeInCourtIds?.has(c.id) ?? false}
+          onSelectCourt={onSelectCourt}
+        />
       ))}
     </MapView>
   )
@@ -117,15 +195,9 @@ const styles = StyleSheet.create({
   markerHit: {
     alignItems: 'center',
     justifyContent: 'center',
-    width: 36,
-    height: 36,
   },
   dot: {
-    width: 16,
-    height: 16,
-    borderRadius: 8,
     overflow: 'hidden',
-    borderWidth: 2,
     borderColor: '#fff',
     shadowColor: '#000',
     shadowOpacity: 0.28,

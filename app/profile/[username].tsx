@@ -1,3 +1,4 @@
+import { normalizeUsername } from '@/lib/profileValidation'
 import { supabase } from '@/supabase'
 import { MaterialIcons } from '@expo/vector-icons'
 import { useLocalSearchParams, useRouter } from 'expo-router'
@@ -28,7 +29,8 @@ export default function PublicProfileScreen() {
   const [profile, setProfile] = useState<PublicProfile | null | undefined>(undefined)
 
   useEffect(() => {
-    if (!username) {
+    const handle = normalizeUsername(typeof username === 'string' ? username : '')
+    if (!handle) {
       setProfile(null)
       return
     }
@@ -39,7 +41,7 @@ export default function PublicProfileScreen() {
       const { data: player } = await supabase
         .from('players')
         .select('user_id, display_name, username, avatar_url, skill_rating')
-        .eq('username', username)
+        .eq('username', handle)
         .maybeSingle()
 
       if (cancelled) return

@@ -8,10 +8,19 @@ export type CourtMapProps = {
   showUserLocation?: boolean
   courts: Court[]
   selectedId: string | null
+  /** Native only; ignored on web. */
+  markerPinSize?: number
   onSelectCourt: (id: string) => void
   /** Unused on web; kept for a shared `CourtMapProps` shape with native. */
   mapBottomPadding?: number
   onMapPress?: () => void
+  fadeInCourtIds?: ReadonlySet<string>
+  onRegionChange?: (region: {
+    latitude: number
+    longitude: number
+    latitudeDelta: number
+    longitudeDelta: number
+  }) => void
   onRegionChangeComplete?: (region: {
     latitude: number
     longitude: number

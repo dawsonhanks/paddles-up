@@ -8,6 +8,7 @@ import BottomSheet, { BottomSheetFlatList } from '@gorhom/bottom-sheet'
 import type { ReactNode } from 'react'
 import { useCallback, useMemo } from 'react'
 import {
+  ActivityIndicator,
   Dimensions,
   FlatList,
   Keyboard,
@@ -186,8 +187,11 @@ type NearbyCourtsSheetProps = {
   refreshing?: boolean
   onRefresh?: () => void
   showNoFavoritesYetHint?: boolean
+  showNoCourtsWithin5MilesHint?: boolean
   /** Shows placeholder rows shaped like court cards while the list is loading. */
   listLoading?: boolean
+  /** Subtle in-list status while refreshing courts for the visible map area. */
+  listFindingCourts?: boolean
 }
 
 const WEB_SHEET_MAX = Math.round(Dimensions.get('window').height * 0.52)
@@ -203,7 +207,9 @@ export function NearbyCourtsSheet(props: NearbyCourtsSheetProps) {
     refreshing = false,
     onRefresh,
     showNoFavoritesYetHint,
+    showNoCourtsWithin5MilesHint,
     listLoading = false,
+    listFindingCourts = false,
   } = props
   const insets = useSafeAreaInsets()
   const collapsedPeekPx = useMemo(
@@ -227,8 +233,20 @@ export function NearbyCourtsSheet(props: NearbyCourtsSheetProps) {
   const renderSkeletonSheetItem = useCallback(() => <SkeletonCourtSheetRow isDark={isDark} />, [isDark])
 
   const ListHeader = useCallback(
-    () => <FilterPills filter={filter} onChange={onFilterChange} isDark={isDark} />,
-    [filter, onFilterChange, isDark],
+    () => (
+      <View>
+        <FilterPills filter={filter} onChange={onFilterChange} isDark={isDark} />
+        {listFindingCourts ? (
+          <View style={styles.findingCourtsRow}>
+            <ActivityIndicator size="small" color={BRAND_GREEN} />
+            <Text style={[styles.findingCourtsText, { color: isDark ? '#94A3B8' : '#64748B' }]}>
+              Finding courts…
+            </Text>
+          </View>
+        ) : null}
+      </View>
+    ),
+    [filter, onFilterChange, isDark, listFindingCourts],
   )
 
   const EmptyList = useCallback(() => {
@@ -239,10 +257,17 @@ export function NearbyCourtsSheet(props: NearbyCourtsSheetProps) {
         </Text>
       )
     }
+    if (showNoCourtsWithin5MilesHint) {
+      return (
+        <Text style={[styles.emptyText, styles.emptyHintCenter, { color: isDark ? '#A1A1AA' : '#64748B' }]}>
+          No courts within 5 miles — try exploring the map to find more
+        </Text>
+      )
+    }
     return (
       <Text style={[styles.emptyText, { color: isDark ? '#71717A' : '#94A3B8' }]}>No courts match this filter.</Text>
     )
-  }, [isDark, showNoFavoritesYetHint])
+  }, [isDark, showNoCourtsWithin5MilesHint, showNoFavoritesYetHint])
 
   if (Platform.OS === 'web') {
     return (
@@ -258,6 +283,14 @@ export function NearbyCourtsSheet(props: NearbyCourtsSheetProps) {
         ]}>
         <View style={[styles.handle, { backgroundColor: isDark ? '#52525B' : '#CBD5E1' }]} />
         <FilterPills filter={filter} onChange={onFilterChange} isDark={isDark} />
+        {listFindingCourts ? (
+          <View style={styles.findingCourtsRow}>
+            <ActivityIndicator size="small" color={BRAND_GREEN} />
+            <Text style={[styles.findingCourtsText, { color: isDark ? '#94A3B8' : '#64748B' }]}>
+              Finding courts…
+            </Text>
+          </View>
+        ) : null}
         {listLoading ? (
           <FlatList
             data={[...SHEET_SKELETON_KEYS]}
@@ -470,5 +503,18 @@ const styles = StyleSheet.create({
   emptyHintCenter: {
     paddingHorizontal: 24,
     lineHeight: 22,
+  },
+  findingCourtsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    paddingTop: 4,
+    paddingBottom: 10,
+    paddingHorizontal: 16,
+  },
+  findingCourtsText: {
+    fontSize: 13,
+    fontWeight: '500',
   },
 })

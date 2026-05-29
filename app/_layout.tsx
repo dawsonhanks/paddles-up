@@ -15,28 +15,26 @@ import { AppState, Platform, StyleSheet, View } from 'react-native'
 import { SafeAreaProvider } from 'react-native-safe-area-context'
 import 'react-native-reanimated'
 
-Notifications.setNotificationHandler({
-  handleNotification: async () => ({
-    shouldShowAlert: true,
-    shouldPlaySound: true,
-    shouldSetBadge: false,
-    shouldShowBanner: true,
-    shouldShowList: true,
-  }),
-})
+const isNativePlatform = Platform.OS === 'ios' || Platform.OS === 'android'
 
-async function registerForPushNotifications() {
-  if (!Device.isDevice) return null
+if (isNativePlatform) {
+  Notifications.setNotificationHandler({
+    handleNotification: async () => ({
+      shouldShowAlert: true,
+      shouldPlaySound: true,
+      shouldSetBadge: false,
+      shouldShowBanner: true,
+      shouldShowList: true,
+    }),
+  })
+}
+
+/** Syncs an existing push token only — never shows the system permission dialog (that happens in-context elsewhere). */
+async function getPushTokenIfAlreadyGranted() {
+  if (!isNativePlatform || !Device.isDevice) return null
   try {
-    const { status: existingStatus } = await Notifications.getPermissionsAsync()
-    let finalStatus = existingStatus
-
-    if (existingStatus !== 'granted') {
-      const { status } = await Notifications.requestPermissionsAsync()
-      finalStatus = status
-    }
-
-    if (finalStatus !== 'granted') return null
+    const { status } = await Notifications.getPermissionsAsync()
+    if (status !== 'granted') return null
 
     const projectId =
       (Constants.expoConfig?.extra as { eas?: { projectId?: string } } | undefined)?.eas?.projectId ??
@@ -84,30 +82,46 @@ export default function RootLayout() {
   }, [])
 
   useEffect(() => {
-    void registerForPushNotifications()
-      .then(async (token) => {
-        try {
-          if (!token) return
-          const { data: sessionData } = await supabase.auth.getSession()
-          const userId = sessionData.session?.user?.id
-          if (!userId) return
-          await supabase.from('notification_tokens').upsert(
-            {
-              user_id: userId,
-              push_token: token,
-            },
-            { onConflict: 'user_id' },
-          )
-        } catch (e) {
-          if (__DEV__) console.warn('[RootLayout] push token upsert', e)
-        }
-      })
-      .catch((e) => {
-        if (__DEV__) console.warn('[RootLayout] registerForPushNotifications', e)
-      })
+    if (!isNativePlatform) return
+
+    async function syncPushTokenForSession() {
+      const { data: sessionData } = await supabase.auth.getSession()
+      const userId = sessionData.session?.user?.id
+      if (!userId) return
+
+      const token = await getPushTokenIfAlreadyGranted()
+      if (!token) return
+
+      try {
+        await supabase.from('notification_tokens').upsert(
+          { user_id: userId, push_token: token },
+          { onConflict: 'user_id' },
+        )
+      } catch (e) {
+        if (__DEV__) console.warn('[RootLayout] push token upsert', e)
+      }
+    }
+
+    void syncPushTokenForSession().catch((e) => {
+      if (__DEV__) console.warn('[RootLayout] registerForPushNotifications', e)
+    })
+
+    const { data: authListener } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (session?.user?.id) {
+        void syncPushTokenForSession().catch((e) => {
+          if (__DEV__) console.warn('[RootLayout] registerForPushNotifications', e)
+        })
+      }
+    })
+
+    return () => {
+      authListener.subscription.unsubscribe()
+    }
   }, [])
 
   useEffect(() => {
+    if (!isNativePlatform) return
+
     function openCourtFromReminder(data: Record<string, unknown> | undefined) {
       const t = typeof data?.type === 'string' ? data.type : ''
       if (t !== 'session_reminder') return
@@ -151,9 +165,11 @@ export default function RootLayout() {
             <View style={[styles.root, { backgroundColor: theme.background }]}>
               <PersistentOfflineBanner />
               <View style={styles.stackWrap}>
-                <Stack>
-                  <Stack.Screen name="onboarding" options={{ headerShown: false }} />
-                  <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+                <Stack screenOptions={{ headerShown: false }}>
+                  <Stack.Screen name="index" />
+                  <Stack.Screen name="onboarding" />
+                  <Stack.Screen name="auth" />
+                  <Stack.Screen name="(tabs)" />
                   <Stack.Screen name="court/[id]" options={{ headerShown: false }} />
                   <Stack.Screen name="court/reviews/[id]" options={{ headerShown: false }} />
                   <Stack.Screen name="messages/index" options={{ headerShown: false }} />
@@ -162,8 +178,7 @@ export default function RootLayout() {
                   <Stack.Screen name="blocked-players" options={{ headerShown: false }} />
                   <Stack.Screen name="match/[id]" options={{ headerShown: false }} />
                   <Stack.Screen name="play/skill-filter" options={{ headerShown: false, presentation: 'modal' }} />
-                  <Stack.Screen name="admin/submissions" options={{ title: 'Admin Submissions' }} />
-                  <Stack.Screen name="modal" options={{ presentation: 'modal', title: 'Modal' }} />
+                  <Stack.Screen name="admin/submissions" options={{ headerShown: true, title: 'Admin Submissions' }} />
                 </Stack>
               </View>
               <StatusBar style="auto" />

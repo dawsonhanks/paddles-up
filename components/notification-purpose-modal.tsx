@@ -1,11 +1,9 @@
 import { Colors } from '@/constants/theme'
 import { useColorScheme } from '@/hooks/use-color-scheme'
+import { NOTIFICATION_PURPOSE_COPY } from '@/lib/location-permissions'
 import { MaterialIcons } from '@expo/vector-icons'
 import { Modal, Pressable, StyleSheet, Text, View } from 'react-native'
 import { SafeAreaView } from 'react-native-safe-area-context'
-
-const NOTIFICATION_PURPOSE_COPY =
-  'Paddles Up uses notifications to alert you when a subscribed court opens up and to remind you of scheduled sessions.'
 
 type Props = {
   visible: boolean

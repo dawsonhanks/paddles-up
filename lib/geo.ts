@@ -18,8 +18,26 @@ function deg2rad(d: number) {
   return (d * Math.PI) / 180
 }
 
+/** Map pins on first load — only venues this close are shown until the user stops panning. */
+export const MAP_INITIAL_PIN_RADIUS_MI = 2
+
+/** Nearby courts list (map tab sheet) — only show venues within this radius when GPS is available. */
+export const NEARBY_LIST_RADIUS_MI = 5
+
+export function isWithinMapInitialPinRadius(distanceKm: number): boolean {
+  return kmToMiles(distanceKm) <= MAP_INITIAL_PIN_RADIUS_MI
+}
+
+export function kmToMiles(km: number): number {
+  return km * 0.621371
+}
+
+export function isWithinNearbyListRadius(distanceKm: number): boolean {
+  return kmToMiles(distanceKm) <= NEARBY_LIST_RADIUS_MI
+}
+
 export function formatDistanceMiles(km: number): string {
-  const mi = km * 0.621371
+  const mi = kmToMiles(km)
   if (mi < 0.05) return 'Nearby'
   if (mi < 10) return `${mi.toFixed(1)} mi`
   return `${Math.round(mi)} mi`
@@ -27,7 +45,7 @@ export function formatDistanceMiles(km: number): string {
 
 /** Human-readable distance for detail rows (feet when close). */
 export function formatDistanceDetail(km: number): string {
-  const mi = km * 0.621371
+  const mi = kmToMiles(km)
   const ft = mi * 5280
   if (ft < 500) return `${Math.round(ft)} ft away`
   if (mi < 10) return `${mi.toFixed(1)} mi away`
@@ -37,6 +55,13 @@ export function formatDistanceDetail(km: number): string {
 /** Max distance (km) at which availability reports are accepted — 150 m. */
 export const REPORTING_RADIUS_KM = 0.15
 
+/**
+ * Dev-only geofence bypass for testing away from courts (Expo Go / `expo start`).
+ * Set to `false` here to test real 150 m behavior in dev. Never enabled in production.
+ */
+export const BYPASS_REPORTING_RADIUS = __DEV__
+
 export function isWithinReportingRadius(distanceKm: number): boolean {
+  if (BYPASS_REPORTING_RADIUS) return true
   return distanceKm <= REPORTING_RADIUS_KM
 }

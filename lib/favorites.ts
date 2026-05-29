@@ -1,15 +1,13 @@
+import { isSignedInUser } from '@/lib/authSession'
 import { supabase } from '@/supabase'
 
 export async function ensureFavoritesUser(): Promise<{ userId: string } | { error: string }> {
   const { data: sessionData } = await supabase.auth.getSession()
-  if (sessionData.session?.user) {
-    return { userId: sessionData.session.user.id }
+  const user = sessionData.session?.user
+  if (isSignedInUser(user)) {
+    return { userId: user.id }
   }
-  const { data, error } = await supabase.auth.signInAnonymously()
-  if (error || !data.user) {
-    return { error: error?.message ?? 'Could not start a session for favorites.' }
-  }
-  return { userId: data.user.id }
+  return { error: 'Please sign in to continue.' }
 }
 
 export async function isCourtFavorite(courtId: string): Promise<boolean> {

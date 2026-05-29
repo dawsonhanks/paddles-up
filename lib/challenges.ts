@@ -1,4 +1,5 @@
 import { ensureFavoritesUser } from '@/lib/favorites'
+import { normalizeUsername } from '@/lib/profileValidation'
 import { sendPushNotification } from '@/lib/push'
 import { supabase } from '@/supabase'
 
@@ -32,7 +33,7 @@ export async function submitChallenge(input: ChallengeInput): Promise<ChallengeR
     player = data ?? null
     if (!player) return { ok: false, error: 'Could not load that player.' }
   } else {
-    const rawUsername = input.opponent.username.trim().replace(/^@/, '')
+    const rawUsername = normalizeUsername(input.opponent.username)
     if (!rawUsername) return { ok: false, error: "Enter your opponent's username." }
     const { data } = await supabase
       .from('players')

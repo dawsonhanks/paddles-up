@@ -1,10 +1,13 @@
 import { GuidedTourProvider } from '@/components/guided-tour'
+import { SetUsernameModal } from '@/components/set-username-modal'
+import { hasActiveSignedInSession } from '@/lib/authSession'
 import { ensureFavoritesUser } from '@/lib/favorites'
 import { countSessionsTodayUpcoming, fetchUpcomingScheduledSessions } from '@/lib/scheduledSessions'
 import { supabase } from '@/supabase'
 import { useFocusEffect } from '@react-navigation/native'
-import { Tabs } from 'expo-router'
-import React, { useCallback, useEffect, useState } from 'react'
+import { Redirect, Tabs } from 'expo-router'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
+import { ActivityIndicator, View } from 'react-native'
 
 import { HapticTab } from '@/components/haptic-tab'
 import { IconSymbol } from '@/components/ui/icon-symbol'
@@ -13,8 +16,51 @@ import { useColorScheme } from '@/hooks/use-color-scheme'
 
 export default function TabLayout() {
   const colorScheme = useColorScheme()
+  const [authGate, setAuthGate] = useState<'loading' | 'signedOut' | 'signedIn'>('loading')
   const [unreadCount, setUnreadCount] = useState(0)
   const [todaySessionsCount, setTodaySessionsCount] = useState(0)
+  const [needsUsername, setNeedsUsername] = useState(false)
+  const [usernameCheckDone, setUsernameCheckDone] = useState(false)
+
+  useEffect(() => {
+    void supabase.auth.getSession().then(({ data }) => {
+      setAuthGate(hasActiveSignedInSession(data.session) ? 'signedIn' : 'signedOut')
+    })
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+      setAuthGate(hasActiveSignedInSession(session) ? 'signedIn' : 'signedOut')
+    })
+    return () => sub.subscription.unsubscribe()
+  }, [])
+
+  useEffect(() => {
+    if (authGate !== 'signedIn') {
+      setNeedsUsername(false)
+      setUsernameCheckDone(false)
+      return
+    }
+
+    let cancelled = false
+    setUsernameCheckDone(false)
+    void (async () => {
+      const gate = await ensureFavoritesUser()
+      if (cancelled || 'error' in gate) {
+        if (!cancelled) setUsernameCheckDone(true)
+        return
+      }
+      const { data } = await supabase
+        .from('players')
+        .select('username')
+        .eq('user_id', gate.userId)
+        .maybeSingle()
+      if (cancelled) return
+      setNeedsUsername(!data?.username?.trim())
+      setUsernameCheckDone(true)
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [authGate])
 
   const loadUnreadCount = useCallback(async () => {
     try {
@@ -57,32 +103,56 @@ export default function TabLayout() {
     }
   }, [])
 
+  const loadUnreadCountRef = useRef(loadUnreadCount)
+  const loadPlaySessionsBadgeRef = useRef(loadPlaySessionsBadge)
+  loadUnreadCountRef.current = loadUnreadCount
+  loadPlaySessionsBadgeRef.current = loadPlaySessionsBadge
+
   useFocusEffect(
     useCallback(() => {
+      if (authGate !== 'signedIn') return
       void loadUnreadCount()
       void loadPlaySessionsBadge()
-    }, [loadUnreadCount, loadPlaySessionsBadge])
+    }, [authGate, loadUnreadCount, loadPlaySessionsBadge])
   )
 
   useEffect(() => {
+    if (authGate !== 'signedIn') return
+
+    const channelName = 'messages-unread-badge'
+    const stale = supabase.getChannels().find((ch) => ch.topic === `realtime:${channelName}`)
+    if (stale) void supabase.removeChannel(stale)
+
     const channel = supabase
-      .channel('messages-unread-badge')
+      .channel(channelName)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'messages' }, () => {
-        loadUnreadCount()
+        void loadUnreadCountRef.current()
       })
       .subscribe()
-    return () => { supabase.removeChannel(channel) }
-  }, [loadUnreadCount])
+
+    return () => {
+      void supabase.removeChannel(channel)
+    }
+  }, [authGate])
 
   useEffect(() => {
-    let aborted = false
-    let teardown: () => void = () => {}
+    if (authGate !== 'signedIn') return
+
+    let cancelled = false
+    let channel: ReturnType<typeof supabase.channel> | null = null
+
     void (async () => {
       const gate = await ensureFavoritesUser()
-      if ('error' in gate || aborted) return
-      void loadPlaySessionsBadge()
-      const ch = supabase
-        .channel(`play-sessions-badge-${gate.userId}`)
+      if ('error' in gate || cancelled) return
+
+      void loadPlaySessionsBadgeRef.current()
+
+      const channelName = `play-sessions-badge-${gate.userId}`
+      const stale = supabase.getChannels().find((ch) => ch.topic === `realtime:${channelName}`)
+      if (stale) void supabase.removeChannel(stale)
+
+      channel = supabase
+        .channel(channelName)
         .on(
           'postgres_changes',
           {
@@ -91,20 +161,40 @@ export default function TabLayout() {
             table: 'scheduled_sessions',
             filter: `user_id=eq.${gate.userId}`,
           },
-          () => loadPlaySessionsBadge()
+          () => {
+            void loadPlaySessionsBadgeRef.current()
+          }
         )
         .subscribe()
-      teardown = () => {
-        supabase.removeChannel(ch)
-      }
-      if (aborted) teardown()
+
+      if (cancelled && channel) void supabase.removeChannel(channel)
     })()
 
     return () => {
-      aborted = true
-      teardown()
+      cancelled = true
+      if (channel) void supabase.removeChannel(channel)
     }
-  }, [loadPlaySessionsBadge])
+  }, [authGate])
+
+  if (authGate === 'loading' || (authGate === 'signedIn' && !usernameCheckDone)) {
+    return (
+      <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: '#0F6E56' }}>
+        <ActivityIndicator size="large" color="#FFFFFF" />
+      </View>
+    )
+  }
+  if (authGate === 'signedOut') {
+    return <Redirect href="/auth" />
+  }
+
+  if (needsUsername) {
+    return (
+      <SetUsernameModal
+        visible
+        onComplete={() => setNeedsUsername(false)}
+      />
+    )
+  }
 
   return (
     <GuidedTourProvider>

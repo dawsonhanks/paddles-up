@@ -5,14 +5,14 @@ import { SkeletonMatchCard } from '@/components/skeleton-card'
 import { Colors } from '@/constants/theme'
 import { useColorScheme } from '@/hooks/use-color-scheme'
 import { submitChallenge } from '@/lib/challenges'
-import { fetchFriends, type FriendPlayer } from '@/lib/friends'
+import { fetchFriends, searchPlayersFriendshipAware, type FriendPlayer, type FriendSearchResult } from '@/lib/friends'
 import { ensureFavoritesUser } from '@/lib/favorites'
 import { userFriendlyFromUnknown } from '@/lib/errors'
 import { MaterialIcons } from '@expo/vector-icons'
 import { useFocusEffect } from '@react-navigation/native'
 import { useLocalSearchParams, useRouter } from 'expo-router'
 import * as Haptics from 'expo-haptics'
-import { useCallback, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ActivityIndicator,
   Alert,
@@ -117,6 +117,8 @@ export default function RecordScreen() {
   const [challengeFriends, setChallengeFriends] = useState<FriendPlayer[]>([])
   const [challengeFriendsLoading, setChallengeFriendsLoading] = useState(false)
   const [challengeFriendSearch, setChallengeFriendSearch] = useState('')
+  const [challengeSearchResults, setChallengeSearchResults] = useState<FriendSearchResult[]>([])
+  const [challengeSearchLoading, setChallengeSearchLoading] = useState(false)
   const [selectedChallengeFriend, setSelectedChallengeFriend] = useState<FriendPlayer | null>(null)
   const [challengeTime, setChallengeTime] = useState('')
   const [challengeCourtId, setChallengeCourtId] = useState<string | null>(null)
@@ -145,6 +147,40 @@ export default function RecordScreen() {
       return name.includes(q) || un.includes(q)
     })
   }, [challengeFriends, challengeFriendSearch])
+
+  const challengeOpponentList = useMemo(() => {
+    const q = challengeFriendSearch.trim()
+    if (q.length >= 2) return challengeSearchResults
+    return filteredChallengeFriends
+  }, [challengeFriendSearch, challengeSearchResults, filteredChallengeFriends])
+
+  useEffect(() => {
+    const q = challengeFriendSearch.trim()
+    if (!showChallengeModal || q.length < 2) {
+      setChallengeSearchResults([])
+      setChallengeSearchLoading(false)
+      return
+    }
+
+    let cancelled = false
+    setChallengeSearchLoading(true)
+    const timer = setTimeout(() => {
+      void searchPlayersFriendshipAware(q).then(({ results, error }) => {
+        if (cancelled) return
+        if (error) {
+          setChallengeSearchResults([])
+        } else {
+          setChallengeSearchResults(results)
+        }
+        setChallengeSearchLoading(false)
+      })
+    }, 1000)
+
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
+  }, [challengeFriendSearch, showChallengeModal])
 
   const activeChallenges = useMemo(
     () => challenges.filter(c => c.status === 'accepted' || c.status === 'score_submitted'),
@@ -234,6 +270,8 @@ export default function RecordScreen() {
   function openChallengeModal() {
     setSelectedChallengeFriend(null)
     setChallengeFriendSearch('')
+    setChallengeSearchResults([])
+    setChallengeSearchLoading(false)
     setChallengeTime('')
     setChallengeCourtId(null)
     setChallengeCourtName(null)
@@ -254,7 +292,7 @@ export default function RecordScreen() {
 
   async function sendChallenge() {
     if (!selectedChallengeFriend) {
-      Alert.alert('Pick an opponent', 'Choose a friend to challenge.')
+      Alert.alert('Pick an opponent', 'Search by @username or choose a player from the list.')
       return
     }
     setChallengeSubmitting(true)
@@ -917,29 +955,77 @@ export default function RecordScreen() {
             <Text style={[styles.fieldLabel, { color: theme.icon }]}>Opponent</Text>
             <TextInput
               value={challengeFriendSearch}
-              onChangeText={setChallengeFriendSearch}
-              placeholder="Search friends by name"
+              onChangeText={(text) => {
+                setChallengeFriendSearch(text)
+                setSelectedChallengeFriend(null)
+              }}
+              placeholder="Search by @username or name"
               placeholderTextColor={theme.icon}
               autoCapitalize="none"
               autoCorrect={false}
               style={[styles.input, styles.friendSearchInput, { color: theme.text, borderColor: cardBorder, backgroundColor: cardBg }]}
             />
 
-            {challengeFriendsLoading ? (
+            {challengeSearchLoading ? (
+              <View style={styles.friendListLoading}>
+                <ActivityIndicator color="#1D9E75" />
+              </View>
+            ) : challengeFriendSearch.trim().length >= 2 ? (
+              challengeOpponentList.length === 0 ? (
+                <Text style={[styles.friendFilterEmpty, { color: theme.icon }]}>No players found for that search.</Text>
+              ) : (
+                <ScrollView
+                  nestedScrollEnabled
+                  keyboardShouldPersistTaps="handled"
+                  style={styles.friendPickerScroll}
+                  contentContainerStyle={styles.friendPickerListContent}>
+                  {challengeOpponentList.map(item => {
+                    const selected = selectedChallengeFriend?.user_id === item.user_id
+                    return (
+                      <Pressable
+                        key={item.user_id}
+                        onPress={() => toggleChallengeFriendSelection(item)}
+                        style={({ pressed }) => [
+                          styles.friendPickerRow,
+                          {
+                            backgroundColor: cardBg,
+                            borderColor: selected ? '#1D9E75' : cardBorder,
+                            borderWidth: selected ? 2 : StyleSheet.hairlineWidth,
+                            opacity: pressed ? 0.85 : 1,
+                          },
+                        ]}>
+                        <FriendAvatar friend={item} size={44} />
+                        <View style={styles.friendPickerTextCol}>
+                          <Text style={[styles.friendPickerName, { color: theme.text }]} numberOfLines={1}>
+                            {item.display_name ?? item.username ?? 'Player'}
+                          </Text>
+                          {item.username ? (
+                            <Text style={[styles.friendPickerUsername, { color: theme.icon }]} numberOfLines={1}>
+                              @{item.username}
+                            </Text>
+                          ) : null}
+                        </View>
+                        {selected ? <MaterialIcons name="check-circle" size={22} color="#1D9E75" /> : null}
+                      </Pressable>
+                    )
+                  })}
+                </ScrollView>
+              )
+            ) : challengeFriendsLoading ? (
               <View style={styles.friendListLoading}>
                 <ActivityIndicator color="#1D9E75" />
               </View>
             ) : challengeFriends.length === 0 ? (
               <View style={styles.emptyFriendsWrap}>
                 <Text style={[styles.emptyFriendsText, { color: theme.text }]}>
-                  No friends yet — add friends from your{' '}
+                  No friends yet — search by @username above or add friends from the{' '}
                   <Text
                     style={styles.emptyFriendsLink}
                     onPress={() => {
                       setShowChallengeModal(false)
-                      router.push('/(tabs)/settings')
+                      router.push('/(tabs)/friends')
                     }}>
-                    Profile tab
+                    Friends tab
                   </Text>
                 </Text>
               </View>

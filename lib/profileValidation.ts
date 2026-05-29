@@ -14,7 +14,10 @@ export function isValidPhone(s: string): boolean {
   return digits.length >= 10 && digits.length <= 15
 }
 
-const USERNAME_RE = /^[a-z0-9_]{2,32}$/
+const USERNAME_RE = /^[a-z0-9_]{3,20}$/
+
+export const USERNAME_FORMAT_HINT =
+  'Use 3–20 characters: letters, numbers, and underscores only.'
 
 export function isValidUsername(s: string): boolean {
   return USERNAME_RE.test(s.trim().toLowerCase().replace(/^@+/, ''))

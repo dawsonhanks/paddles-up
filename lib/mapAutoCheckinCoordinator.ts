@@ -1,6 +1,6 @@
 /** Map tab silent auto check-in/session state shared with court detail (manual checkout). */
 
-import { distanceKm, REPORTING_RADIUS_KM } from '@/lib/geo'
+import { distanceKm, isWithinReportingRadius, REPORTING_RADIUS_KM } from '@/lib/geo'
 
 let suppressManualCheckoutCourtIdUntilExitGeofence: string | null = null
 /** Prevents repeating silent upsert while still inside geofence for this court visit. */
@@ -63,7 +63,7 @@ export function clearManualCheckoutSuppressIfOutsideGeofence(
   if (id == null) return
   const row = courts.find((c) => c.id === id)
   if (row == null) return
-  if (distanceKm(lat, lon, row.latitude, row.longitude) > REPORTING_RADIUS_KM) {
+  if (!isWithinReportingRadius(distanceKm(lat, lon, row.latitude, row.longitude))) {
     suppressManualCheckoutCourtIdUntilExitGeofence = null
   }
 }

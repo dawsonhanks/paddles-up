@@ -39,10 +39,17 @@ import {
   insertCourtsAvailabilityReport,
 } from '@/lib/availability'
 import { fetchLatestZoneReportsForCourt, fetchZonesForCourt, insertZoneReport, type CourtZoneRow } from '@/lib/zones'
-import { distanceKm, formatDistanceDetail, isWithinReportingRadius, REPORTING_RADIUS_KM } from '@/lib/geo'
+import {
+  BYPASS_REPORTING_RADIUS,
+  distanceKm,
+  formatDistanceDetail,
+  isWithinReportingRadius,
+  REPORTING_RADIUS_KM,
+} from '@/lib/geo'
 import { MaterialIcons } from '@expo/vector-icons'
 import { useNetworkOffline } from '@/contexts/network-status-context'
 import { useFocusEffect, useIsFocused } from '@react-navigation/native'
+import Constants from 'expo-constants'
 import * as Device from 'expo-device'
 import * as ExpoFSLegacy from 'expo-file-system/legacy'
 import * as Haptics from 'expo-haptics'
@@ -89,10 +96,12 @@ const cardShadow =
     : { elevation: 6 }
 
 function openMapsDirections(lat: number, lon: number) {
-  const url = Platform.OS === 'ios'
-    ? `http://maps.apple.com/?daddr=${lat},${lon}&dirflg=d`
-    : `https://www.google.com/maps/dir/?api=1&destination=${lat},${lon}`
-  Linking.openURL(url).catch(() => Linking.openURL(`https://maps.apple.com/?daddr=${lat},${lon}`))
+  const appleMapsUrl = `https://maps.apple.com/?daddr=${lat},${lon}&dirflg=d`
+  const url =
+    Platform.OS === 'ios'
+      ? appleMapsUrl
+      : `https://www.google.com/maps/dir/?api=1&destination=${lat},${lon}`
+  Linking.openURL(url).catch(() => Linking.openURL(appleMapsUrl))
 }
 
 function statusBadgeColors(status: CourtStatus): { bg: string; text: string } {
@@ -224,7 +233,10 @@ async function getPushToken(): Promise<string | null> {
       finalStatus = status
     }
     if (finalStatus !== 'granted') return null
-    return (await Notifications.getExpoPushTokenAsync({ projectId: '5b08d659-3160-45f5-b63f-3ecd0fe3eddc' })).data
+    const projectId =
+      (Constants.expoConfig?.extra as { eas?: { projectId?: string } } | undefined)?.eas?.projectId ??
+      Constants.easConfig?.projectId
+    return (await Notifications.getExpoPushTokenAsync(projectId ? { projectId } : undefined)).data
   } catch (e) {
     Alert.alert('Notifications unavailable', userFriendlyFromUnknown(e))
     return null
@@ -342,7 +354,9 @@ export default function CourtDetailScreen() {
     return distanceKm(userLat, userLon, court.latitude, court.longitude)
   }, [userLat, userLon, court])
 
-  const withinRadius = distanceKmUser != null && isWithinReportingRadius(distanceKmUser)
+  const withinRadius =
+    BYPASS_REPORTING_RADIUS ||
+    (distanceKmUser != null && isWithinReportingRadius(distanceKmUser))
 
   const fullscreenPhoto = useMemo(
     () => (selectedPhotoUrl == null ? undefined : photos.find((p) => p.photo_url === selectedPhotoUrl)),

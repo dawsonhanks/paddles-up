@@ -18,7 +18,7 @@ const SLIDES = [
   },
   { id: '2', emoji: '📍', title: 'Live court availability', subtitle: 'See which courts are open, busy, or full before you leave home.' },
   { id: '3', emoji: '👥', title: 'Updated by the community', subtitle: 'Players tap Open, Busy, or Full so everyone else knows.' },
-  { id: '4', emoji: '❤️', title: 'Save your favourites', subtitle: 'Heart your regular courts for quick access whenever you need them.' },
+  { id: '4', emoji: '❤️', title: 'Save your favorites', subtitle: 'Heart your regular courts for quick access whenever you need them.' },
 ]
 
 export default function OnboardingScreen() {
@@ -33,7 +33,7 @@ export default function OnboardingScreen() {
   async function finish() {
     try {
       await AsyncStorage.setItem('onboarded', 'true')
-      router.replace('/(tabs)')
+      router.replace('/auth')
     } catch (e) {
       setOnboardingBanner(userFriendlyFromUnknown(e))
     }

@@ -1,5 +1,6 @@
 import { fetchBlockedUserIds } from '@/lib/blockedUsers'
 import { ensureFavoritesUser } from '@/lib/favorites'
+import { isValidUsername, normalizeUsername } from '@/lib/profileValidation'
 import { supabase } from '@/supabase'
 
 export type FriendPlayer = {
@@ -177,10 +178,17 @@ export async function searchPlayersFriendshipAware(
   if ('error' in gate) return { results: [], error: gate.error }
   const myId = gate.userId
 
+  const normalized = normalizeUsername(q)
+  const safeQ = q.replace(/[%_]/g, '')
+  const orFilter =
+    normalized.length >= 3 && isValidUsername(normalized)
+      ? `username.eq.${normalized},username.ilike.%${normalized}%,display_name.ilike.%${safeQ}%`
+      : `username.ilike.%${safeQ}%,display_name.ilike.%${safeQ}%`
+
   const { data: results, error } = await supabase
     .from('players')
     .select('user_id, display_name, username, avatar_url, skill_rating')
-    .or(`username.ilike.%${q}%,display_name.ilike.%${q}%`)
+    .or(orFilter)
     .neq('user_id', myId)
     .limit(24)
 
