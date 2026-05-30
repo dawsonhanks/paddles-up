@@ -12,8 +12,22 @@ This is an [Expo](https://expo.dev) project created with [`create-expo-app`](htt
 
 2. Start the app
 
+   **Phone with Expo Go (recommended):** use tunnel so the QR code works off your home Wi‑Fi:
+
    ```bash
-   npx expo start
+   npm run start:tunnel
+   ```
+
+   Same Wi‑Fi as your Mac:
+
+   ```bash
+   npm start
+   ```
+
+   Custom dev build (if you installed one via EAS):
+
+   ```bash
+   npm run start:dev
    ```
 
 In the output, you'll find options to open the app in a
