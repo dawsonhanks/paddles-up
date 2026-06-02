@@ -12,13 +12,15 @@ This is an [Expo](https://expo.dev) project created with [`create-expo-app`](htt
 
 2. Start the app
 
-   **Phone with Expo Go (recommended):** use tunnel so the QR code works off your home Wi‑Fi:
+   **Phone on a different network than your Mac** (tunnel via Cloudflare — install once with `brew install cloudflared`):
 
    ```bash
    npm run start:tunnel
    ```
 
-   Same Wi‑Fi as your Mac:
+   > Expo’s built-in `--tunnel` flag is unreliable (ngrok v2 API errors). This project uses a Cloudflare quick tunnel instead.
+
+   **Same Wi‑Fi as your Mac:**
 
    ```bash
    npm start
