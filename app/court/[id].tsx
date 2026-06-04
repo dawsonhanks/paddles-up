@@ -40,7 +40,6 @@ import {
 } from '@/lib/availability'
 import { fetchLatestZoneReportsForCourt, fetchZonesForCourt, insertZoneReport, type CourtZoneRow } from '@/lib/zones'
 import {
-  BYPASS_REPORTING_RADIUS,
   distanceKm,
   formatDistanceDetail,
   isWithinReportingRadius,
@@ -355,8 +354,7 @@ export default function CourtDetailScreen() {
   }, [userLat, userLon, court])
 
   const withinRadius =
-    BYPASS_REPORTING_RADIUS ||
-    (distanceKmUser != null && isWithinReportingRadius(distanceKmUser))
+    distanceKmUser != null && isWithinReportingRadius(distanceKmUser)
 
   const fullscreenPhoto = useMemo(
     () => (selectedPhotoUrl == null ? undefined : photos.find((p) => p.photo_url === selectedPhotoUrl)),

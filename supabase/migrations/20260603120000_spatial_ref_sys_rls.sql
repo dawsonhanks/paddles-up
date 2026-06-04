@@ -1,0 +1,2 @@
+-- Documented in 20260603210000_block_postgis_system_api_access.sql (applied remotely).
+-- REVOKE/RLS on spatial_ref_sys requires supabase_admin; see supabase/manual/spatial_ref_sys_lockdown.sql.

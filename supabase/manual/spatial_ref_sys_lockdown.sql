@@ -1,0 +1,8 @@
+-- PostGIS system tables (spatial_ref_sys, geometry_columns, geography_columns) are owned
+-- by supabase_admin. The postgres role cannot REVOKE or enable RLS on them.
+--
+-- Security is enforced via migration 20260603210000_block_postgis_system_api_access.sql,
+-- which blocks direct Data API access with HTTP 403.
+--
+-- If Supabase support can run this as supabase_admin, it clears the Security Advisor alert:
+--   REVOKE ALL ON TABLE public.spatial_ref_sys FROM PUBLIC, anon, authenticated;

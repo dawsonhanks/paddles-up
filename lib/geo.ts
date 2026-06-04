@@ -52,16 +52,9 @@ export function formatDistanceDetail(km: number): string {
   return `${Math.round(mi)} mi away`
 }
 
-/** Max distance (km) at which availability reports are accepted — 150 m. */
+/** Max distance (km) at which check-in and availability reports are accepted — 150 m. */
 export const REPORTING_RADIUS_KM = 0.15
 
-/**
- * Dev-only geofence bypass for testing away from courts (Expo Go / `expo start`).
- * Set to `false` here to test real 150 m behavior in dev. Never enabled in production.
- */
-export const BYPASS_REPORTING_RADIUS = __DEV__
-
 export function isWithinReportingRadius(distanceKm: number): boolean {
-  if (BYPASS_REPORTING_RADIUS) return true
   return distanceKm <= REPORTING_RADIUS_KM
 }

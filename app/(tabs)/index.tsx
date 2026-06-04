@@ -14,7 +14,6 @@ import { courtFromRow, type Court, type CourtStatus } from '@/lib/courts'
 import { deleteCourtCheckIn, upsertActiveCourtCheckIn } from '@/lib/courtPresenceCheckin'
 import { fetchFavoriteCourtIds } from '@/lib/favorites'
 import {
-  BYPASS_REPORTING_RADIUS,
   distanceKm,
   isWithinMapInitialPinRadius,
   isWithinNearbyListRadius,
@@ -533,7 +532,7 @@ export default function MapScreen() {
       clearManualCheckoutSuppressIfOutsideGeofence(lat, lon, list)
 
       const managed = getSilentManagedCourtId()
-      if (managed && !BYPASS_REPORTING_RADIUS) {
+      if (managed) {
         const row = list.find((c) => c.id === managed)
         if (
           row != null &&
