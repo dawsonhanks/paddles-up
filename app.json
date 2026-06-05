@@ -25,6 +25,7 @@
       }
     },
     "android": {
+      "package": "com.paddlesup.app",
       "blockedPermissions": [
         "android.permission.RECORD_AUDIO"
       ],
@@ -46,6 +47,7 @@
       "favicon": "./assets/images/favicon.png"
     },
     "plugins": [
+      "expo-dev-client",
       "expo-router",
       [
         "expo-location",

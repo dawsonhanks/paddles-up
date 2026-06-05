@@ -10,7 +10,7 @@ import { Colors } from '@/constants/theme'
 import { useColorScheme } from '@/hooks/use-color-scheme'
 import { courtsAvailableToPinStatus, fetchLatestCourtsAvailableByCourtIds } from '@/lib/availability'
 import { fetchActiveCheckinCountsByCourtIds } from '@/lib/checkins'
-import { courtFromRow, type Court, type CourtStatus } from '@/lib/courts'
+import { courtFromRow, STATUS_PIN_COLOR, type Court, type CourtStatus } from '@/lib/courts'
 import { deleteCourtCheckIn, upsertActiveCourtCheckIn } from '@/lib/courtPresenceCheckin'
 import { fetchFavoriteCourtIds } from '@/lib/favorites'
 import {
@@ -35,6 +35,7 @@ import {
   shouldSkipSilentUpsert,
   subscribeMapAutoCheckin,
 } from '@/lib/mapAutoCheckinCoordinator'
+import BottomSheet, { BottomSheetView } from '@gorhom/bottom-sheet'
 import { MaterialIcons } from '@expo/vector-icons'
 import { useFocusEffect, useIsFocused } from '@react-navigation/native'
 import { useNetworkOffline } from '@/contexts/network-status-context'
@@ -93,6 +94,19 @@ const MARKER_ZOOM_DELTA_IN = 0.02
 /** longitudeDelta at min zoom (pins smallest). */
 const MARKER_ZOOM_DELTA_OUT = 0.45
 
+function courtStatusLabel(status: CourtStatus): string {
+  switch (status) {
+    case 'open':
+      return 'Open'
+    case 'busy':
+      return 'Busy'
+    case 'full':
+      return 'Full'
+    default:
+      return 'Unknown'
+  }
+}
+
 function markerPinSizeFromLongitudeDelta(longitudeDelta: number): number {
   const span = MARKER_ZOOM_DELTA_OUT - MARKER_ZOOM_DELTA_IN
   const t = (longitudeDelta - MARKER_ZOOM_DELTA_IN) / span
@@ -134,6 +148,7 @@ export default function MapScreen() {
   const [listMapCenter, setListMapCenter] = useState<{ lat: number; lon: number } | null>(null)
 
   const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [selectedCourt, setSelectedCourt] = useState<Court | null>(null)
   const [listFilter, setListFilter] = useState<ListFilter>('all')
   const [favoriteCourtIds, setFavoriteCourtIds] = useState<string[]>([])
   const [favoritesLoaded, setFavoritesLoaded] = useState(false)
@@ -144,6 +159,7 @@ export default function MapScreen() {
     markerPinSizeFromLongitudeDelta(MAP_NEIGHBORHOOD_LONGITUDE_DELTA),
   )
   const searchInputRef = useRef<TextInput>(null)
+  const bottomSheetRef = useRef<BottomSheet>(null)
   const searchSlideY = useRef(new Animated.Value(-120)).current
 
   const autoNavigated = useRef(false)
@@ -176,6 +192,7 @@ export default function MapScreen() {
   const liveRefreshDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const mapPinRevealTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const mapListUpdateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const regionChangeTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const mapRegionRef = useRef<MapRegion | null>(null)
   const mapPinExpandActiveRef = useRef(false)
   const userHasManuallyPannedRef = useRef(false)
@@ -220,6 +237,19 @@ export default function MapScreen() {
       router.push(`/court/${encodeURIComponent(id)}`)
     },
     [router]
+  )
+
+  const courtPreviewSnapPoints = useMemo(() => ['40%', '75%'], [])
+
+  const onMapCourtPinPress = useCallback(
+    (id: string) => {
+      const court = courts.find((c) => c.id === id) ?? null
+      if (!court) return
+      setSelectedId(id)
+      setSelectedCourt(court)
+      bottomSheetRef.current?.expand()
+    },
+    [courts],
   )
 
   const areaKeyFor = useCallback((lat: number, lon: number) => {
@@ -770,6 +800,12 @@ export default function MapScreen() {
     setMarkerPinSize(markerPinSizeFromLongitudeDelta(region.longitudeDelta))
   }, [])
 
+  useEffect(() => {
+    return () => {
+      if (regionChangeTimer.current) clearTimeout(regionChangeTimer.current)
+    }
+  }, [])
+
   const dismissKeyboard = useCallback(() => {
     Keyboard.dismiss()
   }, [])
@@ -1195,11 +1231,16 @@ export default function MapScreen() {
                   fadeInCourtIds={mapFadeInCourtIds}
                   selectedId={selectedId}
                   markerPinSize={markerPinSize}
-                  onSelectCourt={openCourtDetail}
+                  onSelectCourt={onMapCourtPinPress}
                   mapBottomPadding={mapBottomPadding}
                   onMapPress={dismissKeyboard}
                   onRegionChange={onMapRegionChange}
-                  onRegionChangeComplete={onMapRegionChangeComplete}
+                  onRegionChangeComplete={(region) => {
+                    if (regionChangeTimer.current) clearTimeout(regionChangeTimer.current)
+                    regionChangeTimer.current = setTimeout(() => {
+                      onMapRegionChangeComplete(region)
+                    }, 300)
+                  }}
                 />
               ) : (
                 <View
@@ -1293,6 +1334,91 @@ export default function MapScreen() {
             listLoading={sheetListLoading}
             listFindingCourts={listAreaLoading}
           />
+          <BottomSheet
+            ref={bottomSheetRef}
+            index={-1}
+            snapPoints={courtPreviewSnapPoints}
+            enablePanDownToClose
+            onChange={(index) => {
+              if (index === -1) setSelectedCourt(null)
+            }}
+            backgroundStyle={{
+              backgroundColor: isDark ? '#18181B' : '#FFFFFF',
+            }}
+            handleIndicatorStyle={{
+              backgroundColor: isDark ? '#52525B' : '#CBD5E1',
+              width: 40,
+            }}
+            style={styles.courtPreviewSheet}>
+            <BottomSheetView style={[styles.courtPreviewContent, { paddingBottom: insets.bottom + 16 }]}>
+              {selectedCourt ? (
+                <>
+                  <Text style={[styles.courtPreviewName, { color: isDark ? '#F8FAFC' : '#0F172A' }]}>
+                    {selectedCourt.name}
+                  </Text>
+                  <Text style={[styles.courtPreviewAddress, { color: isDark ? '#A1A1AA' : '#64748B' }]}>
+                    {[
+                      selectedCourt.indoorOutdoor?.trim(),
+                      `${selectedCourt.courtCount} court${selectedCourt.courtCount === 1 ? '' : 's'}`,
+                    ]
+                      .filter(Boolean)
+                      .join(' · ')}
+                  </Text>
+                  <View style={styles.courtPreviewStatusRow}>
+                    {selectedCourt.liveCourtsAvailable != null &&
+                    Number.isFinite(selectedCourt.liveCourtsAvailable) ? (
+                      <View
+                        style={[
+                          styles.courtPreviewStatusPill,
+                          {
+                            backgroundColor: STATUS_PIN_COLOR[
+                              courtsAvailableToPinStatus(
+                                Math.min(
+                                  Math.max(0, Math.floor(selectedCourt.liveCourtsAvailable)),
+                                  Math.max(1, selectedCourt.courtCount),
+                                ),
+                                Math.max(1, selectedCourt.courtCount),
+                              )
+                            ],
+                          },
+                        ]}>
+                        <Text style={styles.courtPreviewStatusPillText}>
+                          {`${Math.min(
+                            Math.max(0, Math.floor(selectedCourt.liveCourtsAvailable)),
+                            Math.max(1, selectedCourt.courtCount),
+                          )} of ${Math.max(1, selectedCourt.courtCount)} open`}
+                        </Text>
+                      </View>
+                    ) : (
+                      <View
+                        style={[
+                          styles.courtPreviewStatusPill,
+                          { backgroundColor: isDark ? '#374151' : '#E5E7EB' },
+                        ]}>
+                        <Text
+                          style={[
+                            styles.courtPreviewStatusPillText,
+                            { color: isDark ? '#9CA3AF' : '#6B7280' },
+                          ]}>
+                          {courtStatusLabel(selectedCourt.status)} · No report
+                        </Text>
+                      </View>
+                    )}
+                  </View>
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel="View full court details"
+                    onPress={() => openCourtDetail(selectedCourt.id)}
+                    style={({ pressed }) => [
+                      styles.courtPreviewDetailsBtn,
+                      { backgroundColor: '#1D9E75', opacity: pressed ? 0.9 : 1 },
+                    ]}>
+                    <Text style={styles.courtPreviewDetailsBtnText}>View Full Details</Text>
+                  </Pressable>
+                </>
+              ) : null}
+            </BottomSheetView>
+          </BottomSheet>
         </View>
       </MapTabGestureRoot>
       <LocationPurposeModal
@@ -1464,5 +1590,47 @@ const styles = StyleSheet.create({
   hint: {
     marginTop: 12,
     fontSize: 15,
+  },
+  courtPreviewSheet: {
+    zIndex: 30,
+  },
+  courtPreviewContent: {
+    paddingHorizontal: 20,
+    paddingTop: 4,
+    gap: 10,
+  },
+  courtPreviewName: {
+    fontSize: 22,
+    fontWeight: '700',
+    lineHeight: 28,
+  },
+  courtPreviewAddress: {
+    fontSize: 15,
+    lineHeight: 21,
+  },
+  courtPreviewStatusRow: {
+    marginTop: 4,
+  },
+  courtPreviewStatusPill: {
+    alignSelf: 'flex-start',
+    borderRadius: 999,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+  },
+  courtPreviewStatusPillText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '700',
+  },
+  courtPreviewDetailsBtn: {
+    marginTop: 8,
+    borderRadius: 14,
+    paddingVertical: 14,
+    alignItems: 'center',
+  },
+  courtPreviewDetailsBtnText: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '700',
   },
 })

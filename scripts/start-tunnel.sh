@@ -14,16 +14,46 @@ if [[ "${1:-}" == "--dev-client" ]]; then
 fi
 
 PORT="${EXPO_PORT:-8081}"
+BIN_DIR="$ROOT/.bin"
+CF_BIN=""
 
-if ! command -v cloudflared >/dev/null 2>&1; then
-  echo "cloudflared is not installed."
-  echo ""
-  echo "Install it, then run this script again:"
-  echo "  brew install cloudflared"
-  echo ""
-  echo "If your phone and Mac are on the same Wi‑Fi, use LAN mode instead:"
-  echo "  npm start"
-  exit 1
+resolve_cloudflared() {
+  if command -v cloudflared >/dev/null 2>&1; then
+    CF_BIN="$(command -v cloudflared)"
+    return 0
+  fi
+  if [[ -x "$BIN_DIR/cloudflared" ]]; then
+    CF_BIN="$BIN_DIR/cloudflared"
+    return 0
+  fi
+  return 1
+}
+
+download_cloudflared() {
+  mkdir -p "$BIN_DIR"
+  local arch url tmp
+  arch="$(uname -m)"
+  case "$arch" in
+    arm64|aarch64) url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz" ;;
+    x86_64) url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64.tgz" ;;
+    *)
+      echo "Unsupported architecture for auto-download: $arch"
+      echo "Install cloudflared manually: brew install cloudflared"
+      return 1
+      ;;
+  esac
+  echo "Downloading cloudflared ($arch) ..."
+  tmp="$(mktemp -d)"
+  curl -fsSL "$url" -o "$tmp/cloudflared.tgz"
+  tar -xzf "$tmp/cloudflared.tgz" -C "$tmp"
+  mv "$tmp/cloudflared" "$BIN_DIR/cloudflared"
+  chmod +x "$BIN_DIR/cloudflared"
+  rm -rf "$tmp"
+  CF_BIN="$BIN_DIR/cloudflared"
+}
+
+if ! resolve_cloudflared; then
+  download_cloudflared || exit 1
 fi
 
 LOG="$(mktemp)"
@@ -34,7 +64,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "Starting Cloudflare tunnel to http://127.0.0.1:${PORT} ..."
-cloudflared tunnel --url "http://127.0.0.1:${PORT}" >"$LOG" 2>&1 &
+"$CF_BIN" tunnel --url "http://127.0.0.1:${PORT}" >"$LOG" 2>&1 &
 CF_PID=$!
 
 TUNNEL_URL=""

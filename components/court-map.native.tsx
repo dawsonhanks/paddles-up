@@ -1,6 +1,8 @@
-import { useEffect, useRef, useState } from 'react'
+import { memo, useEffect, useRef, useState } from 'react'
 import { Animated, StyleSheet, View } from 'react-native'
-import MapView, { Marker } from 'react-native-maps'
+import MapView from 'react-native-map-clustering'
+console.log('MapView source:', MapView.displayName ?? MapView.name ?? 'unknown')
+import { Marker } from 'react-native-maps'
 import Svg, { Circle, Path } from 'react-native-svg'
 
 import { STATUS_PIN_COLOR, type Court } from '@/lib/courts'
@@ -56,7 +58,7 @@ function PickleballFace({ color, size }: { color: string; size: number }) {
 
 const DEFAULT_MARKER_PIN_SIZE = 16
 
-function CourtMarker({
+const CourtMarker = memo(function CourtMarker({
   court,
   selected,
   pinSize,
@@ -112,7 +114,7 @@ function CourtMarker({
       </Animated.View>
     </Marker>
   )
-}
+})
 
 export function CourtMap({
   userLat,
@@ -134,6 +136,11 @@ export function CourtMap({
   const hitSize = pinSize * 2.25
   const borderWidth = Math.max(2, Math.round(pinSize * 0.125))
   const [tracksMarkerViews, setTracksMarkerViews] = useState(true)
+
+  useEffect(() => {
+    console.log('MapView component mounted:', MapView)
+  }, [])
+
   useEffect(() => {
     setTracksMarkerViews(true)
     const frame = requestAnimationFrame(() => setTracksMarkerViews(false))
@@ -173,7 +180,10 @@ export function CourtMap({
       onPress={onMapPress}
       onPanDrag={onMapPress}
       showsUserLocation={showUserLocation}
-      showsMyLocationButton={false}>
+      showsMyLocationButton={false}
+      clusterColor="#1D9E75"
+      clusterTextColor="#FFFFFF"
+      radius={60}>
       {courts.map((c) => (
         <CourtMarker
           key={c.id}
