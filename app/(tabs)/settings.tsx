@@ -51,7 +51,7 @@ const PRIVACY_POLICY_URL = 'https://dawsonhanks.github.io/paddles-up-privacy/'
 const ITEMS = [
   { id: 'privacy', label: 'Privacy Policy', icon: 'lock-outline', url: PRIVACY_POLICY_URL },
   { id: 'suggest', label: 'Suggest a Court', icon: 'add-location-alt' },
-  { id: 'feedback', label: 'Send Feedback', icon: 'chat-bubble-outline', url: 'mailto:paddlesupapp@gmail.com?subject=Paddles Up Feedback' },
+  { id: 'feedback', label: 'Send Feedback', icon: 'chat-bubble-outline', url: 'mailto:dawsonhanks@gmail.com?subject=Paddles Up Feedback' },
 ]
 
 type Profile = {

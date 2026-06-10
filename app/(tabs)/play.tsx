@@ -939,13 +939,22 @@ export default function PlayScreen() {
         up.session_starts_at = composeSessionStartsAt.toISOString()
       } else up.session_starts_at = null
 
-      const { error } = await supabase
+      const { data: updatedRow, error } = await supabase
         .from('game_posts')
         .update(up)
         .eq('id', editingPost.id)
         .eq('user_id', userId)
+        .select('id')
+        .maybeSingle()
 
-      if (error) { setPlayBanner(userFriendlyFromUnknown(error.message)); return }
+      if (error) {
+        setPlayBanner(userFriendlyFromUnknown(error.message))
+        return
+      }
+      if (!updatedRow) {
+        setPlayBanner('We could not save your changes. Please sign in and try again.')
+        return
+      }
 
       setEditingPost(null)
       setShowModal(false)
@@ -958,7 +967,7 @@ export default function PlayScreen() {
       setComposeCourtId(null)
       setComposeCourtName('')
       setComposeSessionStartsAt(null)
-      loadPosts()
+      await loadPosts()
       Alert.alert('Post updated', 'Your game post has been updated.')
     } finally {
       setSubmitting(false)

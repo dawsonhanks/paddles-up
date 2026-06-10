@@ -1,5 +1,6 @@
 import { useColorScheme } from '@/hooks/use-color-scheme'
 import AsyncStorage from '@react-native-async-storage/async-storage'
+import { router, type Href } from 'expo-router'
 import {
   createContext,
   useCallback,
@@ -29,37 +30,53 @@ export const TOUR_COMPLETED_STORAGE_KEY = 'tour_completed'
 
 const BRAND_GREEN = '#1D9E75'
 const CARD_RADIUS = 22
+/** Let the destination tab render before the step overlay appears. */
+const TAB_NAV_DELAY_MS = 350
+
+type GuidedTourStep = {
+  id: string
+  text: string
+  tabHref: Href
+  emoji?: string
+  image?: number
+}
 
 /** Same copy and order as the previous Copilot tour (steps 1–6). */
-export const GUIDED_TOUR_STEPS = [
+export const GUIDED_TOUR_STEPS: readonly GuidedTourStep[] = [
   {
     id: 'tour-map',
     emoji: '🗺️',
+    tabHref: '/(tabs)',
     text: 'Welcome to Paddles Up! This is your local court map — pin colors reflect recent availability reports from players at each venue (gray when none)',
   },
   {
     id: 'tour-courts-list',
     emoji: '📍',
+    tabHref: '/(tabs)',
     text: 'Nearby courts are listed here sorted by distance — tap any court to see details',
   },
   {
     id: 'tour-search-bar',
     emoji: '🔍',
+    tabHref: '/(tabs)',
     text: 'Search for any court by name',
   },
   {
     id: 'tour-play-tab',
     image: require('../assets/images/icon.png'),
+    tabHref: '/(tabs)/play',
     text: 'Looking for a game? Post here and connect with players near you',
   },
   {
     id: 'tour-record-tab',
     emoji: '🏆',
+    tabHref: '/(tabs)/record',
     text: 'Track your wins and losses against friends here',
   },
   {
     id: 'tour-profile-tab',
     emoji: '👤',
+    tabHref: '/(tabs)/settings',
     text: 'Set up your profile and find friends here',
   },
 ] as const
@@ -92,42 +109,59 @@ export function GuidedTourProvider({ children }: { children: ReactNode }) {
   const isDark = colorScheme === 'dark'
   const insets = useSafeAreaInsets()
   const [visible, setVisible] = useState(false)
+  const [overlayVisible, setOverlayVisible] = useState(false)
   const [stepIndex, setStepIndex] = useState(0)
 
   const fade = useRef(new Animated.Value(1)).current
-  const prevIndex = useRef(-1)
+  const navTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const totalSteps = GUIDED_TOUR_STEPS.length
   const step = GUIDED_TOUR_STEPS[stepIndex]
   const isLastStep = stepIndex >= totalSteps - 1
 
-  useEffect(() => {
-    if (!visible) return
-    if (prevIndex.current === -1 && stepIndex === 0) {
-      prevIndex.current = 0
-      fade.setValue(1)
-      return
+  const clearNavTimer = useCallback(() => {
+    if (navTimerRef.current != null) {
+      clearTimeout(navTimerRef.current)
+      navTimerRef.current = null
     }
-    if (prevIndex.current === stepIndex) return
-    prevIndex.current = stepIndex
-    fade.setValue(0)
-    Animated.timing(fade, {
-      toValue: 1,
-      duration: 280,
-      easing: Easing.out(Easing.cubic),
-      useNativeDriver: true,
-    }).start()
-  }, [stepIndex, visible, fade])
-
-  const finishTour = useCallback(async () => {
-    await AsyncStorage.setItem(TOUR_COMPLETED_STORAGE_KEY, 'true')
-    setVisible(false)
-    setStepIndex(0)
-    prevIndex.current = 0
   }, [])
 
+  useEffect(() => {
+    if (!visible) {
+      setOverlayVisible(false)
+      return
+    }
+
+    const targetHref = GUIDED_TOUR_STEPS[stepIndex]?.tabHref ?? '/(tabs)'
+    setOverlayVisible(false)
+    fade.setValue(0)
+    router.replace(targetHref)
+
+    clearNavTimer()
+    navTimerRef.current = setTimeout(() => {
+      navTimerRef.current = null
+      setOverlayVisible(true)
+      Animated.timing(fade, {
+        toValue: 1,
+        duration: 280,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }).start()
+    }, TAB_NAV_DELAY_MS)
+
+    return clearNavTimer
+  }, [visible, stepIndex, fade, clearNavTimer])
+
+  const finishTour = useCallback(async () => {
+    clearNavTimer()
+    setOverlayVisible(false)
+    setVisible(false)
+    setStepIndex(0)
+    fade.setValue(1)
+    await AsyncStorage.setItem(TOUR_COMPLETED_STORAGE_KEY, 'true')
+  }, [clearNavTimer, fade])
+
   const startTour = useCallback(() => {
-    prevIndex.current = -1
     setStepIndex(0)
     setVisible(true)
   }, [])
@@ -155,7 +189,7 @@ export function GuidedTourProvider({ children }: { children: ReactNode }) {
   return (
     <GuidedTourContext.Provider value={value}>
       {children}
-      <Modal visible={visible} animationType="fade" transparent statusBarTranslucent>
+      <Modal visible={visible && overlayVisible} animationType="fade" transparent statusBarTranslucent>
         <View style={[styles.modalRoot, { paddingTop: insets.top, paddingBottom: insets.bottom }]}>
           <Animated.View style={[styles.cardOuter, { opacity: fade, maxHeight: maxCardH }]}>
             <View

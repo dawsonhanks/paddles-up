@@ -67,7 +67,6 @@ import { TOUR_COMPLETED_STORAGE_KEY, useGuidedTour } from '@/components/guided-t
 
 import { supabase } from '@/supabase'
 
-const AUTO_NAVIGATE_DELAY_MS = 10000
 /** Avoid refetching courts on every GPS tick when user moves within this radius of last fetch center. */
 const AREA_RELOAD_THRESHOLD_KM = 0.8
 /** Throttle map user marker / distance sort updates while still firing silent check-in on each GPS callback. */
@@ -162,7 +161,6 @@ export default function MapScreen() {
   const bottomSheetRef = useRef<BottomSheet>(null)
   const searchSlideY = useRef(new Animated.Value(-120)).current
 
-  const autoNavigated = useRef(false)
   const tourStarted = useRef(false)
   /** After first successful courts+live merge; tab refocus uses quiet background refetch. */
   const courtsHydratedRef = useRef(false)
@@ -846,26 +844,6 @@ export default function MapScreen() {
       }))
       .sort((a, b) => a.distanceKm - b.distanceKm)
   }, [courts, userLat, userLon])
-
-  // Only schedule auto-navigate while this tab is focused (not on Play/Record/etc. or court detail stack).
-  // Clearing the timer on blur is handled by this effect's cleanup when isMapScreenFocused becomes false.
-  useEffect(() => {
-    if (!isMapScreenFocused) return
-    if (autoNavigated.current) return
-    if (courtsWithDistance.length === 0) return
-    if (userLat == null || userLon == null) return
-
-    const nearest = courtsWithDistance[0]
-    if (!isWithinReportingRadius(nearest.distanceKm)) return
-
-    const timer = setTimeout(() => {
-      if (autoNavigated.current) return
-      autoNavigated.current = true
-      openCourtDetail(nearest.id)
-    }, AUTO_NAVIGATE_DELAY_MS)
-
-    return () => clearTimeout(timer)
-  }, [isMapScreenFocused, courtsWithDistance, userLat, userLon, openCourtDetail])
 
   const favoriteIdSet = useMemo(() => new Set(favoriteCourtIds), [favoriteCourtIds])
 
