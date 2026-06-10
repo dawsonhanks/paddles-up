@@ -1,10 +1,11 @@
 import { DarkTheme, DefaultTheme, ThemeProvider } from '@react-navigation/native'
 import { AppErrorBoundary } from '@/components/app-error-boundary'
+import { SupabaseConfigErrorScreen } from '@/components/supabase-config-error'
 import { PersistentOfflineBanner } from '@/components/persistent-offline-banner'
 import { NetworkStatusProvider } from '@/contexts/network-status-context'
 import { Colors } from '@/constants/theme'
 import { useColorScheme } from '@/hooks/use-color-scheme'
-import { supabase } from '@/supabase'
+import { isSupabaseConfigured, supabase } from '@/supabase'
 import Constants from 'expo-constants'
 import * as Device from 'expo-device'
 import * as Notifications from 'expo-notifications'
@@ -156,6 +157,10 @@ export default function RootLayout() {
       sub.remove()
     }
   }, [])
+
+  if (!isSupabaseConfigured) {
+    return <SupabaseConfigErrorScreen />
+  }
 
   return (
     <AppErrorBoundary>

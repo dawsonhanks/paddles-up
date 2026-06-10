@@ -1,7 +1,6 @@
 import { memo, useEffect, useRef, useState } from 'react'
 import { Animated, StyleSheet, View } from 'react-native'
 import MapView from 'react-native-map-clustering'
-console.log('MapView source:', MapView.displayName ?? MapView.name ?? 'unknown')
 import { Marker } from 'react-native-maps'
 import Svg, { Circle, Path } from 'react-native-svg'
 
@@ -136,10 +135,6 @@ export function CourtMap({
   const hitSize = pinSize * 2.25
   const borderWidth = Math.max(2, Math.round(pinSize * 0.125))
   const [tracksMarkerViews, setTracksMarkerViews] = useState(true)
-
-  useEffect(() => {
-    console.log('MapView component mounted:', MapView)
-  }, [])
 
   useEffect(() => {
     setTracksMarkerViews(true)

@@ -9,6 +9,7 @@ import { sanitizeUsernameInput } from '@/lib/profileValidation'
 import { supabase } from '@/supabase'
 import { UsernameAvailabilityStatus } from '@/components/username-availability-status'
 import { useUsernameAvailability } from '@/hooks/use-username-availability'
+import * as WebBrowser from 'expo-web-browser'
 import { useRouter } from 'expo-router'
 import { useCallback, useEffect, useState } from 'react'
 import {
@@ -31,6 +32,11 @@ type AuthMode = 'signup' | 'login'
 
 const BRAND = '#0F6E56'
 const BRAND_DARK = '#0B3D33'
+const PRIVACY_POLICY_URL = 'https://dawsonhanks.github.io/paddles-up-privacy/'
+
+function openPrivacyPolicy() {
+  void WebBrowser.openBrowserAsync(PRIVACY_POLICY_URL)
+}
 
 export default function AuthScreen() {
   const router = useRouter()
@@ -268,6 +274,17 @@ export default function AuthScreen() {
                   <Text style={styles.submitText}>{mode === 'signup' ? 'Create account' : 'Log in'}</Text>
                 )}
               </Pressable>
+
+              <Text style={styles.privacyText}>
+                By creating an account, you agree to our{' '}
+                <Text
+                  style={styles.privacyLink}
+                  onPress={openPrivacyPolicy}
+                  accessibilityRole="link"
+                  accessibilityLabel="Privacy Policy">
+                  Privacy Policy
+                </Text>
+              </Text>
             </View>
           </ScrollView>
         </TouchableWithoutFeedback>
@@ -462,5 +479,16 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     fontSize: 17,
     fontWeight: '700',
+  },
+  privacyText: {
+    marginTop: 16,
+    fontSize: 12,
+    lineHeight: 18,
+    color: '#64748B',
+    textAlign: 'center',
+  },
+  privacyLink: {
+    color: BRAND,
+    fontWeight: '600',
   },
 })
