@@ -1,5 +1,13 @@
 /** @type {import('expo/config').ExpoConfig} */
-const appJson = require('./app.json')
+// ios.config.googleMapsApiKey in app.json — restricted to com.paddlesup.app + Maps SDK for iOS in GCP (2026-06-27).
+const fs = require('fs')
+const path = require('path')
+
+const appJson = JSON.parse(
+  fs
+    .readFileSync(path.join(__dirname, 'app.json'), 'utf8')
+    .replace(/^\s*\/\/.*$/gm, ''),
+)
 
 const REQUIRED_PUBLIC_ENV = [
   'EXPO_PUBLIC_SUPABASE_URL',

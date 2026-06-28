@@ -17,6 +17,11 @@ import {
 import { alertOpenSettings } from '@/lib/alerts'
 import { invokeDeleteAccountEdge } from '@/lib/deleteAccount'
 import { userFriendlyFromUnknown } from '@/lib/errors'
+import {
+  objectPathFromCourtPhotosPublicUrl,
+  removeCourtPhotosObjectByPublicUrl,
+  uploadPickedImageToCourtPhotos,
+} from '@/lib/storageImages'
 import { MaterialIcons } from '@expo/vector-icons'
 import { useFocusEffect } from '@react-navigation/native'
 import * as ImagePicker from 'expo-image-picker'
@@ -109,6 +114,7 @@ export default function ProfileScreen() {
   const [createContact, setCreateContact] = useState('')
   const [createContactType, setCreateContactType] = useState<'email' | 'phone'>('email')
   const [avatarUri, setAvatarUri] = useState<string | null>(null)
+  const [avatarUploading, setAvatarUploading] = useState(false)
 
   const createUsernameAvailability = useUsernameAvailability(createUsername, { enabled: showCreate })
 
@@ -194,6 +200,7 @@ export default function ProfileScreen() {
   }, [loadProfile])
 
   async function pickImage() {
+    if (avatarUploading) return
     try {
       const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync()
       if (status !== 'granted') {
@@ -209,9 +216,41 @@ export default function ProfileScreen() {
         aspect: [1, 1],
         quality: 0.7,
       })
-      if (!result.canceled && result.assets[0]) setAvatarUri(result.assets[0].uri)
+      if (result.canceled || !result.assets[0]) return
+
+      const gate = await ensureFavoritesUser()
+      if ('error' in gate) {
+        Alert.alert('Could not upload photo', userFriendlyFromUnknown(gate.error))
+        return
+      }
+
+      const unsavedSessionAvatar =
+        avatarUri && avatarUri !== profile?.avatar_url ? avatarUri : null
+
+      setAvatarUploading(true)
+      const uploaded = await uploadPickedImageToCourtPhotos(
+        gate.userId,
+        result.assets[0],
+        `avatars/${Date.now()}`,
+      )
+      if ('error' in uploaded) {
+        Alert.alert('Could not upload photo', userFriendlyFromUnknown(uploaded.error))
+        return
+      }
+
+      if (
+        unsavedSessionAvatar &&
+        unsavedSessionAvatar !== uploaded.publicUrl &&
+        objectPathFromCourtPhotosPublicUrl(unsavedSessionAvatar)
+      ) {
+        await removeCourtPhotosObjectByPublicUrl(unsavedSessionAvatar)
+      }
+
+      setAvatarUri(uploaded.publicUrl)
     } catch (e) {
-      Alert.alert('Photos unavailable', userFriendlyFromUnknown(e))
+      Alert.alert('Could not upload photo', userFriendlyFromUnknown(e))
+    } finally {
+      setAvatarUploading(false)
     }
   }
 
@@ -255,6 +294,10 @@ export default function ProfileScreen() {
           return
         }
       }
+      const avatarUrl =
+        avatarUri && !avatarUri.startsWith('file://') && !avatarUri.startsWith('content://')
+          ? avatarUri
+          : profile?.avatar_url ?? null
       const { error } = await supabase.from('players').upsert({
         user_id: gate.userId,
         display_name: editName.trim(),
@@ -262,7 +305,7 @@ export default function ProfileScreen() {
         contact: c || null,
         skill_rating: editSkillRating,
         pickup_skill_level: editPickupSkill.trim() ? editPickupSkill.trim() : null,
-        avatar_url: avatarUri ?? profile?.avatar_url ?? null,
+        avatar_url: avatarUrl,
       }, { onConflict: 'user_id' })
       if (error) {
         if (error.code === '23505') {
@@ -272,6 +315,16 @@ export default function ProfileScreen() {
         setProfileBanner(userFriendlyFromUnknown(error.message))
         return
       }
+
+      const persistedAvatar = profile?.avatar_url
+      if (
+        persistedAvatar &&
+        persistedAvatar !== avatarUrl &&
+        objectPathFromCourtPhotosPublicUrl(persistedAvatar)
+      ) {
+        await removeCourtPhotosObjectByPublicUrl(persistedAvatar)
+      }
+
       setShowEdit(false)
       loadProfile()
     } finally {
@@ -641,8 +694,16 @@ export default function ProfileScreen() {
             </TouchableOpacity>
           </View>
           <ScrollView style={styles.modalScroll} keyboardShouldPersistTaps="handled">
-            <TouchableOpacity style={styles.avatarPickerWrap} onPress={pickImage} activeOpacity={0.85}>
-              {avatarUri ? (
+            <TouchableOpacity
+              style={styles.avatarPickerWrap}
+              onPress={pickImage}
+              activeOpacity={0.85}
+              disabled={avatarUploading}>
+              {avatarUploading ? (
+                <View style={[styles.avatarLargePlaceholder, { backgroundColor: '#0F6E56' }]}>
+                  <ActivityIndicator color="#FFFFFF" />
+                </View>
+              ) : avatarUri ? (
                 <Image source={{ uri: avatarUri }} style={styles.avatarLarge} />
               ) : (
                 <View style={[styles.avatarLargePlaceholder, { backgroundColor: '#0F6E56' }]}>
@@ -652,7 +713,9 @@ export default function ProfileScreen() {
               <View style={styles.avatarPickerBadge}>
                 <MaterialIcons name="photo-camera" size={18} color="#fff" />
               </View>
-              <Text style={[styles.avatarPickerHint, { color: muted }]}>Tap to change photo</Text>
+              <Text style={[styles.avatarPickerHint, { color: muted }]}>
+                {avatarUploading ? 'Uploading…' : 'Tap to change photo'}
+              </Text>
             </TouchableOpacity>
 
             <Text style={[styles.fieldLabel, { color: muted }]}>Display name</Text>

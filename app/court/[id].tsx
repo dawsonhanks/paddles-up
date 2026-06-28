@@ -50,7 +50,10 @@ import { useNetworkOffline } from '@/contexts/network-status-context'
 import { useFocusEffect, useIsFocused } from '@react-navigation/native'
 import Constants from 'expo-constants'
 import * as Device from 'expo-device'
-import * as ExpoFSLegacy from 'expo-file-system/legacy'
+import {
+  removeCourtPhotosObjectByPublicUrl,
+  uploadPickedImageToCourtPhotos,
+} from '@/lib/storageImages'
 import * as Haptics from 'expo-haptics'
 import * as ImagePicker from 'expo-image-picker'
 import * as Location from 'expo-location'
@@ -130,21 +133,6 @@ type CourtPhoto = {
   uploader_name: string
 }
 
-/** Path inside bucket `court-photos` from a Storage public object URL. */
-function courtPhotoObjectPathFromPublicUrl(photoUrl: string): string | null {
-  const needle = '/storage/v1/object/public/court-photos/'
-  const i = photoUrl.indexOf(needle)
-  if (i === -1) return null
-  let path = photoUrl.slice(i + needle.length)
-  const q = path.indexOf('?')
-  if (q !== -1) path = path.slice(0, q)
-  try {
-    return decodeURIComponent(path)
-  } catch {
-    return path
-  }
-}
-
 function timeAgo(dateStr: string): string {
   const diffMs = Date.now() - new Date(dateStr).getTime()
   const mins = Math.floor(diffMs / 60000)
@@ -183,43 +171,6 @@ function StarRow({
       <Text style={[numStyle, { color: filledColor }]}>{rating.toFixed(1)}</Text>
     </View>
   )
-}
-
-function base64ToUint8Array(base64: string): Uint8Array {
-  const bin = globalThis.atob(base64)
-  const len = bin.length
-  const out = new Uint8Array(len)
-  for (let i = 0; i < len; i++) out[i] = bin.charCodeAt(i)
-  return out
-}
-
-function imageContentType(asset: ImagePicker.ImagePickerAsset, ext: string): string {
-  if (asset.mimeType) return asset.mimeType
-  switch (ext) {
-    case 'png':
-      return 'image/png'
-    case 'webp':
-      return 'image/webp'
-    case 'gif':
-      return 'image/gif'
-    case 'heic':
-    case 'heif':
-      return 'image/heic'
-    default:
-      return 'image/jpeg'
-  }
-}
-
-/** Reads picked/captured photo bytes reliably on native (avoid fetch+blob empty bodies on RN). */
-async function uriImageBytes(uri: string): Promise<Uint8Array> {
-  if (Platform.OS === 'web') {
-    const r = await fetch(uri)
-    if (!r.ok) throw new Error(`Could not read image (${r.status})`)
-    const buf = await r.arrayBuffer()
-    return new Uint8Array(buf)
-  }
-  const b64 = await ExpoFSLegacy.readAsStringAsync(uri, { encoding: ExpoFSLegacy.EncodingType.Base64 })
-  return base64ToUint8Array(b64)
 }
 
 async function getPushToken(): Promise<string | null> {
@@ -563,30 +514,16 @@ export default function CourtDetailScreen() {
         return
       }
 
-      let ext =
-        asset.fileName?.split('.').pop()?.toLowerCase()?.replace(/^\./, '')
-        ?? asset.mimeType?.split('/')[1]
-        ?? 'jpg'
-      if (ext.includes('jpeg')) ext = 'jpg'
-      const objectPath = `${gate.userId}/${courtId}/${Date.now()}.${ext}`
-
-      const bytes = await uriImageBytes(asset.uri)
-      if (bytes.byteLength === 0) {
-        setScreenBanner('That photo did not load. Try choosing another picture.')
+      const uploaded = await uploadPickedImageToCourtPhotos(
+        gate.userId,
+        asset,
+        `${courtId}/${Date.now()}`,
+      )
+      if ('error' in uploaded) {
+        setScreenBanner(userFriendlyFromUnknown(uploaded.error))
         return
       }
-      const contentType = imageContentType(asset, ext)
-
-      const { error: uploadError } = await supabase.storage
-        .from('court-photos')
-        .upload(objectPath, bytes, { contentType, upsert: false })
-      if (uploadError) {
-        setScreenBanner(userFriendlyFromUnknown(uploadError))
-        return
-      }
-
-      const { data: pub } = supabase.storage.from('court-photos').getPublicUrl(objectPath)
-      const publicUrl = pub.publicUrl
+      const publicUrl = uploaded.publicUrl
 
       const { error: insertError } = await supabase
         .from('court_photos')
@@ -635,13 +572,7 @@ export default function CourtDetailScreen() {
                   return
                 }
 
-                const objectPath = courtPhotoObjectPathFromPublicUrl(photo.photo_url)
-                if (objectPath) {
-                  const { error: storageErr } = await supabase.storage.from('court-photos').remove([objectPath])
-                  if (storageErr && __DEV__) {
-                    console.warn('court photo storage remove:', storageErr.message)
-                  }
-                }
+                await removeCourtPhotosObjectByPublicUrl(photo.photo_url)
 
                 setSelectedPhotoUrl((u) => (u === photo.photo_url ? null : u))
                 await loadPhotos()
