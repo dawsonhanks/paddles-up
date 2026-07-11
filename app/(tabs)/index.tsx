@@ -10,6 +10,7 @@ import { Colors } from '@/constants/theme'
 import { useColorScheme } from '@/hooks/use-color-scheme'
 import { courtsAvailableToPinStatus, fetchLatestCourtsAvailableByCourtIds } from '@/lib/availability'
 import { fetchActiveCheckinCountsByCourtIds } from '@/lib/checkins'
+import { fetchSensorSummaryByCourtIds, resolveCourtPinStatus, type CourtSensorSummary } from '@/lib/courtSensors'
 import { courtFromRow, STATUS_PIN_COLOR, type Court, type CourtStatus } from '@/lib/courts'
 import { deleteCourtCheckIn, upsertActiveCourtCheckIn } from '@/lib/courtPresenceCheckin'
 import { fetchFavoriteCourtIds } from '@/lib/favorites'
@@ -198,6 +199,44 @@ export default function MapScreen() {
   const lastThinUserPosRef = useRef<{ lat: number; lon: number } | null>(null)
   const [mapRevealedIds, setMapRevealedIds] = useState<Set<string>>(() => new Set())
   const [mapFadeInCourtIds, setMapFadeInCourtIds] = useState<Set<string>>(() => new Set())
+  const [sensorSummaryByCourtId, setSensorSummaryByCourtId] = useState<Map<string, CourtSensorSummary>>(
+    () => new Map(),
+  )
+  const sensorSummaryRef = useRef<Map<string, CourtSensorSummary>>(new Map())
+  useEffect(() => {
+    sensorSummaryRef.current = sensorSummaryByCourtId
+  }, [sensorSummaryByCourtId])
+
+  const applySensorSummaryToCourts = useCallback((summary: Map<string, CourtSensorSummary>) => {
+    const patchCourt = (c: Court): Court => {
+      const s = summary.get(c.id)
+      const reportedAvail =
+        c.liveCourtsAvailable != null && Number.isFinite(c.liveCourtsAvailable)
+          ? c.liveCourtsAvailable
+          : undefined
+      const status = resolveCourtPinStatus(s, reportedAvail, c.courtCount)
+      return status === c.status ? c : { ...c, status }
+    }
+
+    setCourts((prev) => {
+      const next = prev.map(patchCourt)
+      mergedCourtsByIdRef.current = new Map(next.map((c) => [c.id, c]))
+      return next
+    })
+  }, [])
+
+  const loadSensorSummaryForCourts = useCallback(
+    async (courtIds: string[]) => {
+      if (isOffline || courtIds.length === 0) {
+        setSensorSummaryByCourtId(new Map())
+        return
+      }
+      const summary = await fetchSensorSummaryByCourtIds(courtIds)
+      setSensorSummaryByCourtId(summary)
+      applySensorSummaryToCourts(summary)
+    },
+    [isOffline, applySensorSummaryToCourts],
+  )
   /** Latest known user position without re-subscribing the location watcher each tick */
   const userPosLatestRef = useRef<{ lat: number; lon: number } | null>(null)
 
@@ -460,22 +499,19 @@ export default function MapScreen() {
         .filter((c): c is Court => c != null)
 
       const ids = parsed.map((c) => c.id)
-      const [countsByCourt, availByCourt] = await Promise.all([
+      const [countsByCourt, availByCourt, sensorSummary] = await Promise.all([
         fetchActiveCheckinCountsByCourtIds(ids),
         fetchLatestCourtsAvailableByCourtIds(ids),
+        fetchSensorSummaryByCourtIds(ids),
       ])
       const nextAreaCourts = parsed.map((c) => {
         const key = String(c.id).trim()
         const n = countsByCourt.get(key) ?? 0
         const reportedAvail = availByCourt.get(key)
         const total = Math.max(1, c.courtCount)
-        let status: CourtStatus = 'unknown'
-        let liveCourtsAvailable: number | null = null
-        if (reportedAvail !== undefined) {
-          liveCourtsAvailable = reportedAvail
-          const clamped = Math.min(Math.max(0, reportedAvail), total)
-          status = courtsAvailableToPinStatus(clamped, total)
-        }
+        const summary = sensorSummary.get(key)
+        const liveCourtsAvailable = reportedAvail !== undefined ? reportedAvail : null
+        const status = resolveCourtPinStatus(summary, reportedAvail, total)
         return {
           ...c,
           liveCheckins: n,
@@ -488,6 +524,11 @@ export default function MapScreen() {
       for (const c of nextAreaCourts) merged.set(c.id, c)
       mergedCourtsByIdRef.current = merged
       setCourts(Array.from(merged.values()))
+      setSensorSummaryByCourtId((prev) => {
+        const next = new Map(prev)
+        for (const [courtId, summary] of sensorSummary) next.set(courtId, summary)
+        return next
+      })
 
       loadedAreaKeysRef.current.add(cacheKey)
       lastFetchedCenterRef.current = center
@@ -709,27 +750,34 @@ export default function MapScreen() {
     setFavoritesLoaded(true)
   }, [isOffline])
 
+  const refreshSensorSummaryForKnownCourts = useCallback(async () => {
+    const ids = Array.from(mergedCourtsByIdRef.current.keys())
+    await loadSensorSummaryForCourts(ids)
+  }, [loadSensorSummaryForCourts])
+
   const wasOfflineRef = useRef(isOffline)
   useEffect(() => {
     if (wasOfflineRef.current && !isOffline) {
       void loadFavoriteCourtIds()
+      void refreshSensorSummaryForKnownCourts()
       const lat = userLat ?? FALLBACK_MAP_LAT
       const lon = userLon ?? FALLBACK_MAP_LON
       const center = lastFetchedCenterRef.current ?? { lat, lon }
       void loadCourtsWithLiveStatus(center, { background: true, force: true })
     }
     wasOfflineRef.current = isOffline
-  }, [isOffline, loadFavoriteCourtIds, userLat, userLon, loadCourtsWithLiveStatus])
+  }, [isOffline, loadFavoriteCourtIds, refreshSensorSummaryForKnownCourts, userLat, userLon, loadCourtsWithLiveStatus])
 
   useFocusEffect(
     useCallback(() => {
       void loadFavoriteCourtIds()
+      void refreshSensorSummaryForKnownCourts()
       if (!courtsHydratedRef.current) return
       const lat = userLat ?? FALLBACK_MAP_LAT
       const lon = userLon ?? FALLBACK_MAP_LON
       const center = lastFetchedCenterRef.current ?? { lat, lon }
       void loadCourtsWithLiveStatus(center, { background: true })
-    }, [userLat, userLon, loadCourtsWithLiveStatus, loadFavoriteCourtIds])
+    }, [userLat, userLon, loadCourtsWithLiveStatus, loadFavoriteCourtIds, refreshSensorSummaryForKnownCourts])
   )
 
   useEffect(() => {
@@ -747,6 +795,11 @@ export default function MapScreen() {
         { event: '*', schema: 'public', table: 'availability_reports' },
         () => scheduleLiveCourtRefresh()
       )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'court_sensors' },
+        () => void refreshSensorSummaryForKnownCourts()
+      )
       .subscribe()
 
     const pollTimer = setInterval(() => {
@@ -754,6 +807,7 @@ export default function MapScreen() {
     }, LIVE_REFRESH_POLL_MS)
 
     void refreshLiveCourtData()
+    void refreshSensorSummaryForKnownCourts()
 
     return () => {
       clearInterval(pollTimer)
@@ -763,7 +817,7 @@ export default function MapScreen() {
       }
       void supabase.removeChannel(channel)
     }
-  }, [isMapScreenFocused, isOffline, refreshLiveCourtData, scheduleLiveCourtRefresh])
+  }, [isMapScreenFocused, isOffline, refreshLiveCourtData, scheduleLiveCourtRefresh, refreshSensorSummaryForKnownCourts])
 
   const onRefreshCourts = useCallback(async () => {
     setRefreshing(true)

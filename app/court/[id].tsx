@@ -1,3 +1,4 @@
+import { SensorTag } from '@/components/sensor-tag'
 import { ContentFadeIn } from '@/components/content-fade-in'
 import { ReportReasonModal } from '@/components/report-reason-modal'
 import { NotificationPurposeModal } from '@/components/notification-purpose-modal'
@@ -38,6 +39,12 @@ import {
   fetchLatestCourtsAvailableReport,
   insertCourtsAvailabilityReport,
 } from '@/lib/availability'
+import {
+  courtSensorsByZone,
+  fetchCourtSensorsForCourt,
+  resolveFacilityCourtStatus,
+  type CourtSensorRow,
+} from '@/lib/courtSensors'
 import { fetchLatestZoneReportsForCourt, fetchZonesForCourt, insertZoneReport, type CourtZoneRow } from '@/lib/zones'
 import {
   distanceKm,
@@ -273,6 +280,7 @@ export default function CourtDetailScreen() {
     error: string | null
     data: CachedCourtWeather | null
   }>({ loading: false, error: null, data: null })
+  const [courtSensors, setCourtSensors] = useState<CourtSensorRow[]>([])
 
   const notifySuccessAlertTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -352,6 +360,7 @@ export default function CourtDetailScreen() {
   useEffect(() => {
     setCourtZones([])
     setZoneReportsByZone(new Map())
+    setCourtSensors([])
     setLatestCourtsAvail(null)
     setPendingCourtsAvailPick(null)
   }, [courtId])
@@ -432,6 +441,15 @@ export default function CourtDetailScreen() {
     const mine = rows.find((r) => r.user_id === gate.userId)
     setIsCheckedIn(!!mine)
   }, [courtId])
+
+  const loadCourtSensors = useCallback(async () => {
+    if (!courtId || isOffline) {
+      setCourtSensors([])
+      return
+    }
+    const rows = await fetchCourtSensorsForCourt(courtId)
+    setCourtSensors(rows)
+  }, [courtId, isOffline])
 
   const loadPhotos = useCallback(async () => {
     if (!courtId) return
@@ -978,9 +996,11 @@ export default function CourtDetailScreen() {
         loadCheckins()
         loadZonesAndReports()
         void loadCourtsAvailabilityReport()
+        void loadCourtSensors()
       } else {
         setCheckinCount(0)
         setIsCheckedIn(false)
+        setCourtSensors([])
       }
       loadPhotos()
       checkSubscription()
@@ -990,7 +1010,7 @@ export default function CourtDetailScreen() {
         cancelled.current = true
         setMoreInfoExpanded(false)
       }
-    }, [refreshLocation, loadZonesAndReports, loadCourtsAvailabilityReport, checkSubscription, loadCheckins, loadPhotos, loadReviews, isOffline]),
+    }, [refreshLocation, loadZonesAndReports, loadCourtsAvailabilityReport, checkSubscription, loadCheckins, loadPhotos, loadReviews, loadCourtSensors, isOffline]),
   )
 
   useEffect(() => {
@@ -999,6 +1019,7 @@ export default function CourtDetailScreen() {
     const refreshLive = () => {
       void loadCheckins()
       void loadCourtsAvailabilityReport({ background: true })
+      void loadCourtSensors()
     }
 
     const channel = supabase
@@ -1023,6 +1044,16 @@ export default function CourtDetailScreen() {
         },
         refreshLive
       )
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'court_sensors',
+          filter: `court_id=eq.${courtId}`,
+        },
+        refreshLive
+      )
       .subscribe()
 
     const pollTimer = setInterval(refreshLive, DETAIL_LIVE_REFRESH_POLL_MS)
@@ -1031,9 +1062,9 @@ export default function CourtDetailScreen() {
       clearInterval(pollTimer)
       void supabase.removeChannel(channel)
     }
-  }, [isCourtScreenFocused, courtId, isOffline, loadCheckins, loadCourtsAvailabilityReport])
+  }, [isCourtScreenFocused, courtId, isOffline, loadCheckins, loadCourtsAvailabilityReport, loadCourtSensors])
 
-  useEffect(() => { setFavoriteReady(false); setIsFavorite(false) }, [courtId])
+  useEffect(() => { setFavoriteReady(false); setIsFavorite(false); setCourtSensors([]) }, [courtId])
 
   useEffect(() => {
     if (!courtId || court == null) return
@@ -1193,6 +1224,8 @@ export default function CourtDetailScreen() {
     [court, courtId, isOffline, loadZonesAndReports],
   )
 
+  const zoneSensorsByZone = useMemo(() => courtSensorsByZone(courtSensors), [courtSensors])
+
   if (court === undefined) {
     return (
       <View style={{ flex: 1, backgroundColor: screenBg }}>
@@ -1230,7 +1263,12 @@ export default function CourtDetailScreen() {
     )
   }
 
-  const headerStatus: CourtStatus = checkinCountToCourtStatus(checkinCount)
+  const headerStatus: CourtStatus = resolveFacilityCourtStatus({
+    sensors: courtSensors,
+    zoneReportsByZone,
+    courtZones,
+    fallbackStatus: checkinCountToCourtStatus(checkinCount),
+  })
   const badge = statusBadgeColors(headerStatus)
   const playersHere = checkinBucketLabel(checkinCount)
   const titleFont = Fonts.rounded
@@ -1428,14 +1466,16 @@ export default function CourtDetailScreen() {
             ) : null}
             {courtZones.map((z, zoneIndex) => {
               const zid = z?.id ?? ''
+              const zoneSensor = zid ? zoneSensorsByZone.get(zid) : undefined
+              const hasSensor = zoneSensor != null
               const rep = zid ? zoneReportsByZone.get(zid) : undefined
-              const highlightOpen = rep?.status === 'open'
-              const highlightBusy = rep?.status === 'busy'
+              const highlightOpen = hasSensor ? !zoneSensor.is_active : rep?.status === 'open'
+              const highlightBusy = hasSensor ? zoneSensor.is_active : rep?.status === 'busy'
               const openSubmitting =
                 zoneReportBusy?.zoneId === zid && zoneReportBusy?.status === 'open'
               const busySubmitting =
                 zoneReportBusy?.zoneId === zid && zoneReportBusy?.status === 'busy'
-              const zoneActionsDisabled = isOffline || !withinRadius
+              const zoneActionsDisabled = isOffline || !withinRadius || hasSensor
               const zoneDivider = isDark ? 'rgba(255,255,255,0.08)' : 'rgba(15,23,42,0.08)'
               const isLast = zoneIndex === courtZones.length - 1
               const zname = z?.zone_name ?? 'Zone'
@@ -1446,9 +1486,12 @@ export default function CourtDetailScreen() {
                     styles.zoneRowFlat,
                     { borderBottomColor: zoneDivider, borderBottomWidth: isLast ? 0 : StyleSheet.hairlineWidth },
                   ]}>
-                  <Text style={[styles.zoneNameFlat, { color: isDark ? '#F8FAFC' : '#0F172A' }]} numberOfLines={1}>
-                    {zname}
-                  </Text>
+                  <View style={styles.zoneNameRow}>
+                    <Text style={[styles.zoneNameFlat, { color: isDark ? '#F8FAFC' : '#0F172A' }]} numberOfLines={1}>
+                      {zname}
+                    </Text>
+                    {hasSensor ? <SensorTag isDark={isDark} mutedColor={muted} /> : null}
+                  </View>
                   <View style={styles.zoneTogglePair}>
                     <Pressable
                       disabled={zoneActionsDisabled || openSubmitting || !zid}
@@ -2020,6 +2063,13 @@ const styles = StyleSheet.create({
     gap: 12,
     paddingVertical: 16,
     paddingHorizontal: 0,
+  },
+  zoneNameRow: {
+    flex: 1,
+    minWidth: 0,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
   },
   zoneNameFlat: { flex: 1, minWidth: 0, fontSize: 16, fontWeight: '700', letterSpacing: -0.2 },
   dashProxRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 10, paddingVertical: 12, marginBottom: 4 },
