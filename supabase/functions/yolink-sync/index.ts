@@ -16,8 +16,10 @@ const corsHeaders: Record<string, string> = {
 type CourtSensor = {
   id: string
   court_id: string | null
+  zone_id: string | null
   device_id: string
   device_token: string
+  is_active: boolean
 }
 
 type SyncResult = {
@@ -180,7 +182,7 @@ Deno.serve(async (req) => {
 
     const { data: sensors, error: sensorsErr } = await supabase
       .from('court_sensors')
-      .select('id, court_id, device_id, device_token')
+      .select('id, court_id, zone_id, device_id, device_token, is_active')
       .eq('device_type', 'MotionSensor')
 
     if (sensorsErr) {
@@ -201,6 +203,11 @@ Deno.serve(async (req) => {
         const state = rawState.data?.state?.state
         const stateChangedAt = rawState.data?.state?.stateChangedAt
         const isActive = occupancyIsActive(state, stateChangedAt)
+        const previousIsActive = sensor.is_active === true
+        const statusChanged = isActive !== previousIsActive
+        const eventOccurredAt = stateChangedAt != null
+          ? new Date(stateChangedAt).toISOString()
+          : now
 
         const { error: updateErr } = await supabase
           .from('court_sensors')
@@ -216,6 +223,20 @@ Deno.serve(async (req) => {
 
         if (updateErr) {
           throw new Error(updateErr.message)
+        }
+
+        if (statusChanged && sensor.court_id) {
+          const { error: eventErr } = await supabase.from('court_status_events').insert({
+            court_id: sensor.court_id,
+            zone_id: sensor.zone_id,
+            status: isActive ? 'busy' : 'available',
+            source: 'sensor',
+            occurred_at: eventOccurredAt,
+          })
+
+          if (eventErr) {
+            throw new Error(`Failed to log court_status_event: ${eventErr.message}`)
+          }
         }
 
         updated.push({
