@@ -1136,13 +1136,9 @@ export default function CourtDetailScreen() {
         return
       }
 
+      // Per-zone spinner via zoneReportBusy only — do not guess Open/Busy from this
+      // single report; consensus comes from loadZonesAndReports after insert.
       setZoneReportBusy({ zoneId, status })
-      // Optimistic update so the headline matches the toggles immediately.
-      setZoneReportsByZone((prev) => {
-        const next = new Map(prev)
-        next.set(zoneId, { status, reported_at: new Date().toISOString() })
-        return next
-      })
       try {
         const { error } = await insertZoneReport({
           courtId,
