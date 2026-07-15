@@ -35,22 +35,31 @@ import { alertOpenSettings } from '@/lib/alerts'
 import { userFriendlyFromUnknown } from '@/lib/errors'
 import { NOTIFICATION_PURPOSE_MODAL_SEEN_KEY } from '@/lib/location-permissions'
 import {
-  courtsAvailabilityHeadlineColors,
-  fetchLatestCourtsAvailableReport,
-  insertCourtsAvailabilityReport,
+  courtStatusHeadlineColors,
 } from '@/lib/availability'
 import {
+  courtSensorFromRealtimePayload,
+  applyCourtSensorRealtimeChange,
   courtSensorsByZone,
   fetchCourtSensorsForCourt,
   resolveFacilityCourtStatus,
   type CourtSensorRow,
 } from '@/lib/courtSensors'
-import { fetchLatestZoneReportsForCourt, fetchZonesForCourt, insertZoneReport, type CourtZoneRow } from '@/lib/zones'
+import {
+  fetchLatestZoneReportsForCourt,
+  fetchZonesForCourt,
+  insertZoneReport,
+  countOpenZones,
+  resolveZoneStatus,
+  venueSummaryToCourtStatus,
+  type CourtZoneRow,
+} from '@/lib/zones'
 import {
   distanceKm,
-  formatDistanceDetail,
-  isWithinReportingRadius,
-  REPORTING_RADIUS_KM,
+  // TEMP: proximity restriction disabled for pitch demo — re-enable before public launch
+  // formatDistanceDetail,
+  // isWithinReportingRadius,
+  // REPORTING_RADIUS_KM,
 } from '@/lib/geo'
 import { MaterialIcons } from '@expo/vector-icons'
 import { useNetworkOffline } from '@/contexts/network-status-context'
@@ -236,12 +245,6 @@ export default function CourtDetailScreen() {
   const [zoneReportBusy, setZoneReportBusy] = useState<{ zoneId: string; status: 'open' | 'busy' } | null>(
     null,
   )
-  const [latestCourtsAvail, setLatestCourtsAvail] = useState<{ courts_available: number; created_at: string } | null>(
-    null,
-  )
-  const [courtsAvailLoading, setCourtsAvailLoading] = useState(false)
-  const [courtsAvailSubmitBusy, setCourtsAvailSubmitBusy] = useState(false)
-  const [pendingCourtsAvailPick, setPendingCourtsAvailPick] = useState<number | null>(null)
   const [isFavorite, setIsFavorite] = useState(false)
   const [favoriteReady, setFavoriteReady] = useState(false)
   const [favoriteBusy, setFavoriteBusy] = useState(false)
@@ -312,8 +315,10 @@ export default function CourtDetailScreen() {
     return distanceKm(userLat, userLon, court.latitude, court.longitude)
   }, [userLat, userLon, court])
 
-  const withinRadius =
-    distanceKmUser != null && isWithinReportingRadius(distanceKmUser)
+  // TEMP: proximity restriction disabled for pitch demo — re-enable before public launch
+  const withinRadius = true
+  // const withinRadius =
+  //   distanceKmUser != null && isWithinReportingRadius(distanceKmUser)
 
   const fullscreenPhoto = useMemo(
     () => (selectedPhotoUrl == null ? undefined : photos.find((p) => p.photo_url === selectedPhotoUrl)),
@@ -361,37 +366,7 @@ export default function CourtDetailScreen() {
     setCourtZones([])
     setZoneReportsByZone(new Map())
     setCourtSensors([])
-    setLatestCourtsAvail(null)
-    setPendingCourtsAvailPick(null)
   }, [courtId])
-
-  const loadCourtsAvailabilityReport = useCallback(async (opts?: { background?: boolean }) => {
-    if (!courtId || isOffline) {
-      setLatestCourtsAvail(null)
-      return
-    }
-    const background = opts?.background === true
-    if (!background) setCourtsAvailLoading(true)
-    try {
-      const row = await fetchLatestCourtsAvailableReport(courtId)
-      setLatestCourtsAvail(row)
-    } catch {
-      setLatestCourtsAvail(null)
-    } finally {
-      if (!background) setCourtsAvailLoading(false)
-    }
-  }, [courtId, isOffline])
-
-  useEffect(() => {
-    if (court == null || court === undefined) return
-    const total = Math.max(1, court.courtCount)
-    if (latestCourtsAvail === null) {
-      setPendingCourtsAvailPick(null)
-      return
-    }
-    const v = Math.min(Math.max(0, Math.floor(latestCourtsAvail.courts_available)), total)
-    setPendingCourtsAvailPick(v)
-  }, [latestCourtsAvail, court])
 
   const loadZonesAndReports = useCallback(async (cancelledRef?: { current: boolean }) => {
     if (!courtId) return
@@ -675,10 +650,11 @@ export default function CourtDetailScreen() {
         setCheckoutReviewText('')
         setShowRatingModal(true)
       } else {
-        if (!withinRadius) {
-          setScreenBanner('Get a little closer to the court to check in.')
-          return
-        }
+        // TEMP: proximity restriction disabled for pitch demo — re-enable before public launch
+        // if (!withinRadius) {
+        //   setScreenBanner('Get a little closer to the court to check in.')
+        //   return
+        // }
         await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium)
         const up = await upsertActiveCourtCheckIn(courtId)
         if (!up.ok) {
@@ -692,7 +668,7 @@ export default function CourtDetailScreen() {
     } finally {
       setCheckinBusy(false)
     }
-  }, [courtId, checkinBusy, isCheckedIn, withinRadius, court, isOffline, loadCheckins])
+  }, [courtId, checkinBusy, isCheckedIn, court, isOffline, loadCheckins])
 
   const submitRating = useCallback(async (stars: number) => {
     if (!courtId || ratingBusy || stars < 1) return
@@ -995,7 +971,6 @@ export default function CourtDetailScreen() {
       if (!isOffline) {
         loadCheckins()
         loadZonesAndReports()
-        void loadCourtsAvailabilityReport()
         void loadCourtSensors()
       } else {
         setCheckinCount(0)
@@ -1010,15 +985,27 @@ export default function CourtDetailScreen() {
         cancelled.current = true
         setMoreInfoExpanded(false)
       }
-    }, [refreshLocation, loadZonesAndReports, loadCourtsAvailabilityReport, checkSubscription, loadCheckins, loadPhotos, loadReviews, loadCourtSensors, isOffline]),
+    }, [refreshLocation, loadZonesAndReports, checkSubscription, loadCheckins, loadPhotos, loadReviews, loadCourtSensors, isOffline]),
   )
 
   useEffect(() => {
     if (!isCourtScreenFocused || !courtId || isOffline) return
 
-    const refreshLive = () => {
-      void loadCheckins()
-      void loadCourtsAvailabilityReport({ background: true })
+    const onSensorChange = (payload: {
+      eventType?: string
+      new?: unknown
+      old?: unknown
+    }) => {
+      const eventType = String(payload.eventType ?? '')
+      const nextRow = courtSensorFromRealtimePayload(payload.new)
+      const oldId =
+        payload.old != null && typeof payload.old === 'object' && 'id' in (payload.old as object)
+          ? String((payload.old as { id?: unknown }).id ?? '').trim() || null
+          : null
+
+      // Apply Realtime payload immediately so YoLink status flips without a refetch wait.
+      setCourtSensors((prev) => applyCourtSensorRealtimeChange(prev, eventType, nextRow, oldId))
+      // Background reconcile in case of partial payloads or multi-row races.
       void loadCourtSensors()
     }
 
@@ -1032,17 +1019,21 @@ export default function CourtDetailScreen() {
           table: 'court_checkins',
           filter: `court_id=eq.${courtId}`,
         },
-        refreshLive
+        () => {
+          void loadCheckins()
+        },
       )
       .on(
         'postgres_changes',
         {
           event: '*',
           schema: 'public',
-          table: 'availability_reports',
+          table: 'zone_reports',
           filter: `court_id=eq.${courtId}`,
         },
-        refreshLive
+        () => {
+          void loadZonesAndReports()
+        },
       )
       .on(
         'postgres_changes',
@@ -1052,17 +1043,21 @@ export default function CourtDetailScreen() {
           table: 'court_sensors',
           filter: `court_id=eq.${courtId}`,
         },
-        refreshLive
+        onSensorChange,
       )
       .subscribe()
 
-    const pollTimer = setInterval(refreshLive, DETAIL_LIVE_REFRESH_POLL_MS)
+    const pollTimer = setInterval(() => {
+      void loadCheckins()
+      void loadZonesAndReports()
+      void loadCourtSensors()
+    }, DETAIL_LIVE_REFRESH_POLL_MS)
 
     return () => {
       clearInterval(pollTimer)
       void supabase.removeChannel(channel)
     }
-  }, [isCourtScreenFocused, courtId, isOffline, loadCheckins, loadCourtsAvailabilityReport, loadCourtSensors])
+  }, [isCourtScreenFocused, courtId, isOffline, loadCheckins, loadZonesAndReports, loadCourtSensors])
 
   useEffect(() => { setFavoriteReady(false); setIsFavorite(false); setCourtSensors([]) }, [courtId])
 
@@ -1096,73 +1091,6 @@ export default function CourtDetailScreen() {
     }
   }, [courtId, favoriteReady, favoriteBusy, isFavorite])
 
-  const submitCourtsAvailability = useCallback(
-    async (count: number) => {
-      if (!court || !courtId || courtsAvailSubmitBusy || isOffline) return
-      await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light)
-      let pos: Location.LocationObject
-      try {
-        const { status: perm } = await Location.getForegroundPermissionsAsync()
-        if (perm !== 'granted') {
-          alertOpenSettings(
-            'Location',
-            'Location access is needed for this feature — tap below to open Settings.',
-          )
-          return
-        }
-        pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Highest })
-      } catch (e) {
-        Alert.alert('Location unavailable', userFriendlyFromUnknown(e))
-        return
-      }
-      const d = distanceKm(pos.coords.latitude, pos.coords.longitude, court.latitude, court.longitude)
-      if (!isWithinReportingRadius(d)) {
-        setScreenBanner(
-          `Stand within about ${Math.round(REPORTING_RADIUS_KM * 1000)} meters of this court to submit an availability update.`,
-        )
-        setUserLat(pos.coords.latitude)
-        setUserLon(pos.coords.longitude)
-        return
-      }
-      setUserLat(pos.coords.latitude)
-      setUserLon(pos.coords.longitude)
-
-      const gate = await ensureFavoritesUser()
-      if ('error' in gate) {
-        setScreenBanner(userFriendlyFromUnknown(gate.error))
-        return
-      }
-
-      const total = Math.max(1, court.courtCount)
-      const bounded = Math.min(Math.max(0, Math.floor(count)), total)
-
-      setCourtsAvailSubmitBusy(true)
-      try {
-        const { error } = await insertCourtsAvailabilityReport({
-          court_id: courtId,
-          courts_available: bounded,
-          reporter_lat: pos.coords.latitude,
-          reporter_lng: pos.coords.longitude,
-        })
-        if (error) {
-          setScreenBanner(userFriendlyFromUnknown(error.message))
-          return
-        }
-        setPendingCourtsAvailPick(bounded)
-        await loadCourtsAvailabilityReport()
-      } finally {
-        setCourtsAvailSubmitBusy(false)
-      }
-    },
-    [
-      court,
-      courtId,
-      courtsAvailSubmitBusy,
-      isOffline,
-      loadCourtsAvailabilityReport,
-    ],
-  )
-
   const onZoneReport = useCallback(
     async (zoneId: string, status: 'open' | 'busy') => {
       if (!court || !courtId) return
@@ -1171,32 +1099,35 @@ export default function CourtDetailScreen() {
         return
       }
       await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light)
-      let pos: Location.LocationObject
-      try {
-        const { status: perm } = await Location.getForegroundPermissionsAsync()
-        if (perm !== 'granted') {
-          alertOpenSettings(
-            'Location',
-            'Location access is needed for this feature — tap below to open Settings.',
-          )
-          return
-        }
-        pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Highest })
-      } catch (e) {
-        Alert.alert('Location unavailable', userFriendlyFromUnknown(e))
-        return
-      }
-      const d = distanceKm(pos.coords.latitude, pos.coords.longitude, court.latitude, court.longitude)
-      if (!isWithinReportingRadius(d)) {
-        setScreenBanner(
-          `Stand within about ${Math.round(REPORTING_RADIUS_KM * 1000)} meters of this court to submit a zone update.`,
-        )
-        setUserLat(pos.coords.latitude)
-        setUserLon(pos.coords.longitude)
-        return
-      }
-      setUserLat(pos.coords.latitude)
-      setUserLon(pos.coords.longitude)
+
+      // TEMP: proximity restriction disabled for pitch demo — re-enable before public launch
+      // Zone reports do not store coordinates; GPS was only used for the 150m gate.
+      // let pos: Location.LocationObject
+      // try {
+      //   const { status: perm } = await Location.getForegroundPermissionsAsync()
+      //   if (perm !== 'granted') {
+      //     alertOpenSettings(
+      //       'Location',
+      //       'Location access is needed for this feature — tap below to open Settings.',
+      //     )
+      //     return
+      //   }
+      //   pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Highest })
+      // } catch (e) {
+      //   Alert.alert('Location unavailable', userFriendlyFromUnknown(e))
+      //   return
+      // }
+      // const d = distanceKm(pos.coords.latitude, pos.coords.longitude, court.latitude, court.longitude)
+      // if (!isWithinReportingRadius(d)) {
+      //   setScreenBanner(
+      //     `Stand within about ${Math.round(REPORTING_RADIUS_KM * 1000)} meters of this court to submit a zone update.`,
+      //   )
+      //   setUserLat(pos.coords.latitude)
+      //   setUserLon(pos.coords.longitude)
+      //   return
+      // }
+      // setUserLat(pos.coords.latitude)
+      // setUserLon(pos.coords.longitude)
 
       const gate = await ensureFavoritesUser()
       if ('error' in gate) {
@@ -1205,6 +1136,12 @@ export default function CourtDetailScreen() {
       }
 
       setZoneReportBusy({ zoneId, status })
+      // Optimistic update so the headline matches the toggles immediately.
+      setZoneReportsByZone((prev) => {
+        const next = new Map(prev)
+        next.set(zoneId, { status, reported_at: new Date().toISOString() })
+        return next
+      })
       try {
         const { error } = await insertZoneReport({
           courtId,
@@ -1214,6 +1151,7 @@ export default function CourtDetailScreen() {
         })
         if (error) {
           setScreenBanner(userFriendlyFromUnknown(error.message))
+          await loadZonesAndReports()
           return
         }
         await loadZonesAndReports()
@@ -1225,6 +1163,21 @@ export default function CourtDetailScreen() {
   )
 
   const zoneSensorsByZone = useMemo(() => courtSensorsByZone(courtSensors), [courtSensors])
+
+  /** Headline "X of Y courts open" — confirmed-open count; color uses three-state venue rollup. */
+  const courtsOpenHeadline = useMemo(() => {
+    if (courtZones.length === 0) {
+      return {
+        open: 0,
+        busy: 0,
+        unknown: Math.max(1, court?.courtCount ?? 1),
+        total: Math.max(1, court?.courtCount ?? 1),
+        status: 'unknown' as const,
+      }
+    }
+    const summary = countOpenZones(courtZones, zoneSensorsByZone, zoneReportsByZone)
+    return { ...summary, status: venueSummaryToCourtStatus(summary) }
+  }, [court?.courtCount, courtZones, zoneReportsByZone, zoneSensorsByZone])
 
   if (court === undefined) {
     return (
@@ -1357,69 +1310,15 @@ export default function CourtDetailScreen() {
         </View>
 
         <View style={styles.availHeroBlock}>
-          {courtsAvailLoading ? (
-            <ActivityIndicator size="large" color="#1D9E75" style={{ marginVertical: 24 }} />
-          ) : latestCourtsAvail === null ? (
-            <Text style={[styles.availHeroEmpty, { color: muted }]}>No reports yet — be the first to update</Text>
-          ) : (
-            (() => {
-              const venueTotal = Math.max(1, court.courtCount)
-              const shown = Math.min(
-                Math.max(0, Math.floor(latestCourtsAvail?.courts_available ?? 0)),
-                venueTotal,
-              )
-              const tone = courtsAvailabilityHeadlineColors(shown, venueTotal, isDark)
-              return (
-                <Text style={[styles.availHeroLine, { color: tone.text }]}>
-                  {`${shown} of ${venueTotal} courts open`}
-                </Text>
-              )
-            })()
-          )}
-          <Text style={[styles.typeMutedDetail, styles.availUpdateLabelPad, { color: muted }]}>Update availability</Text>
-          <View style={styles.availPillsRow}>
-            {Array.from({ length: Math.max(1, court.courtCount) + 1 }, (_, i) => i).map((n) => {
-              const selected = pendingCourtsAvailPick === n
-              const countBtnsDisabled = isOffline || !withinRadius || courtsAvailSubmitBusy
-              const divider = isDark ? 'rgba(255,255,255,0.12)' : 'rgba(15,23,42,0.12)'
-              return (
-                <Pressable
-                  key={n}
-                  disabled={countBtnsDisabled}
-                  onPress={() => void submitCourtsAvailability(n)}
-                  accessibilityLabel={`Report ${n} courts open`}
-                  accessibilityState={{ selected, disabled: countBtnsDisabled }}
-                  style={({ pressed }) => [
-                    styles.availPill,
-                    {
-                      backgroundColor: selected
-                        ? isDark
-                          ? 'rgba(34,197,94,0.22)'
-                          : '#DCFCE7'
-                        : 'transparent',
-                      borderColor: selected ? '#22c55e' : divider,
-                      opacity: countBtnsDisabled ? 0.45 : pressed ? 0.85 : 1,
-                    },
-                  ]}>
-                  <Text
-                    style={[
-                      styles.availPillDigit,
-                      { color: selected ? '#166534' : subtle },
-                    ]}>
-                    {n}
-                  </Text>
-                </Pressable>
-              )
-            })}
-          </View>
-          {courtsAvailSubmitBusy ? (
-            <ActivityIndicator size="small" color="#1D9E75" style={{ marginTop: 14 }} />
-          ) : null}
-          {!withinRadius && distanceKmUser != null ? (
-            <Text style={[styles.typeMutedDetail, styles.availHintPad, { color: muted }]}>
-              Reporting unlocks within {Math.round(REPORTING_RADIUS_KM * 1000)} m of this venue.
-            </Text>
-          ) : null}
+          <Text
+            style={[
+              styles.availHeroLine,
+              {
+                color: courtStatusHeadlineColors(courtsOpenHeadline.status, isDark).text,
+              },
+            ]}>
+            {`${courtsOpenHeadline.open} of ${courtsOpenHeadline.total} courts open`}
+          </Text>
         </View>
 
         <View style={styles.playersDashBlock}>
@@ -1450,32 +1349,39 @@ export default function CourtDetailScreen() {
                   {isCheckedIn ? "You're on the court!" : "Let others know you're here"}
                 </Text>
               </View>
+              {/* TEMP: proximity restriction disabled for pitch demo — re-enable before public launch
               {!isCheckedIn && !withinRadius ? (
                 <Text style={styles.checkinWideHint}>Must be at court</Text>
               ) : null}
+              */}
             </View>
           )}
         </Pressable>
 
         {courtZones.length > 0 ? (
           <View style={styles.zoneDashSection}>
+            {/* TEMP: proximity restriction disabled for pitch demo — re-enable before public launch
             {!isOffline && !withinRadius && distanceKmUser != null ? (
               <Text style={[styles.typeMutedDetail, { color: muted, marginBottom: 10 }]}>
                 Zone buttons work within {Math.round(REPORTING_RADIUS_KM * 1000)} m of this venue.
               </Text>
             ) : null}
+            */}
             {courtZones.map((z, zoneIndex) => {
               const zid = z?.id ?? ''
               const zoneSensor = zid ? zoneSensorsByZone.get(zid) : undefined
               const hasSensor = zoneSensor != null
               const rep = zid ? zoneReportsByZone.get(zid) : undefined
-              const highlightOpen = hasSensor ? !zoneSensor.is_active : rep?.status === 'open'
-              const highlightBusy = hasSensor ? zoneSensor.is_active : rep?.status === 'busy'
+              const zoneStatus = resolveZoneStatus(zoneSensor, rep)
+              const highlightOpen = zoneStatus === 'open'
+              const highlightBusy = zoneStatus === 'busy'
               const openSubmitting =
                 zoneReportBusy?.zoneId === zid && zoneReportBusy?.status === 'open'
               const busySubmitting =
                 zoneReportBusy?.zoneId === zid && zoneReportBusy?.status === 'busy'
-              const zoneActionsDisabled = isOffline || !withinRadius || hasSensor
+              // TEMP: proximity restriction disabled for pitch demo — re-enable before public launch
+              // (was: isOffline || !withinRadius || hasSensor)
+              const zoneActionsDisabled = isOffline || hasSensor
               const zoneDivider = isDark ? 'rgba(255,255,255,0.08)' : 'rgba(15,23,42,0.08)'
               const isLast = zoneIndex === courtZones.length - 1
               const zname = z?.zone_name ?? 'Zone'
@@ -1558,6 +1464,7 @@ export default function CourtDetailScreen() {
           </View>
         ) : null}
 
+        {/* TEMP: proximity restriction disabled for pitch demo — re-enable before public launch
         {!withinRadius && distanceKmUser != null ? (
           <View style={styles.dashProxRow}>
             <MaterialIcons name="info-outline" size={18} color={muted} />
@@ -1566,6 +1473,7 @@ export default function CourtDetailScreen() {
             </Text>
           </View>
         ) : null}
+        */}
 
         <Pressable
           onPress={toggleMoreInfo}
@@ -2010,32 +1918,6 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     marginBottom: 6,
   },
-  availHeroEmpty: {
-    fontSize: 22,
-    fontWeight: '700',
-    textAlign: 'center',
-    lineHeight: 28,
-    marginBottom: 8,
-    paddingHorizontal: 12,
-  },
-  availUpdateLabelPad: { alignSelf: 'center', marginTop: 14, marginBottom: 10 },
-  availPillsRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    justifyContent: 'center',
-    gap: 8,
-    alignSelf: 'stretch',
-  },
-  availPill: {
-    minWidth: 40,
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    borderRadius: 999,
-    borderWidth: StyleSheet.hairlineWidth,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  availPillDigit: { fontSize: 15, fontWeight: '800' },
   availHintPad: { textAlign: 'center', marginTop: 12, paddingHorizontal: 8 },
   playersDashBlock: { marginTop: 28, marginBottom: 14 },
   playersDashSub: { marginTop: 4 },

@@ -1,6 +1,11 @@
 import { courtsAvailableToPinStatus } from '@/lib/availability'
 import { type CourtStatus } from '@/lib/courts'
 import { supabase } from '@/supabase'
+import {
+  summarizeVenueZones,
+  venueSummaryToCourtStatus,
+  type VenueZoneSummary,
+} from '@/lib/zones'
 
 export type CourtSensorRow = {
   id: string
@@ -32,6 +37,44 @@ function rowFromRecord(raw: Record<string, unknown>): CourtSensorRow | null {
   }
 }
 
+/** Parse a Realtime `payload.new` / `payload.old` row into a CourtSensorRow. */
+export function courtSensorFromRealtimePayload(raw: unknown): CourtSensorRow | null {
+  if (raw == null || typeof raw !== 'object') return null
+  return rowFromRecord(raw as Record<string, unknown>)
+}
+
+/**
+ * Apply a Realtime INSERT/UPDATE/DELETE for court_sensors into a local list.
+ * Returns the next list (same reference if unchanged).
+ */
+export function applyCourtSensorRealtimeChange(
+  prev: CourtSensorRow[],
+  eventType: string,
+  nextRow: CourtSensorRow | null,
+  oldId: string | null,
+): CourtSensorRow[] {
+  if (eventType === 'DELETE') {
+    if (!oldId) return prev
+    const filtered = prev.filter((s) => s.id !== oldId)
+    return filtered.length === prev.length ? prev : filtered
+  }
+  if (!nextRow) return prev
+  const idx = prev.findIndex((s) => s.id === nextRow.id)
+  if (idx < 0) return [...prev, nextRow]
+  const existing = prev[idx]
+  if (
+    existing.is_active === nextRow.is_active &&
+    existing.last_synced_at === nextRow.last_synced_at &&
+    existing.last_event_at === nextRow.last_event_at &&
+    existing.zone_id === nextRow.zone_id
+  ) {
+    return prev
+  }
+  const out = prev.slice()
+  out[idx] = nextRow
+  return out
+}
+
 export function courtSensorsByZone(sensors: CourtSensorRow[]): Map<string, CourtSensorRow> {
   const out = new Map<string, CourtSensorRow>()
   for (const sensor of sensors) {
@@ -41,8 +84,8 @@ export function courtSensorsByZone(sensors: CourtSensorRow[]): Map<string, Court
 }
 
 /**
- * Facility-level pill when sensors exist: busy if any sensor-linked zone is active
- * OR any non-sensor zone has a recent crowdsourced "busy" report; otherwise open.
+ * Facility-level status from zones (sensor + reports), same three-state rollup as the map pin.
+ * Falls back when this venue has no zone rows / no sensors yet.
  */
 export function resolveFacilityCourtStatus(params: {
   sensors: CourtSensorRow[]
@@ -51,39 +94,38 @@ export function resolveFacilityCourtStatus(params: {
   fallbackStatus: CourtStatus
 }): CourtStatus {
   const { sensors, zoneReportsByZone, courtZones, fallbackStatus } = params
-  if (sensors.length === 0) return fallbackStatus
+  if (courtZones.length === 0) return fallbackStatus
 
   const sensorZones = courtSensorsByZone(sensors)
-
-  if (sensors.some((s) => s.is_active)) return 'busy'
-
-  for (const zone of courtZones) {
-    if (sensorZones.has(zone.id)) continue
-    if (zoneReportsByZone.get(zone.id)?.status === 'busy') return 'busy'
-  }
-
-  return 'open'
+  const summary = summarizeVenueZones(courtZones, sensorZones, zoneReportsByZone)
+  return venueSummaryToCourtStatus(summary)
 }
 
-/** Map/list pin color: active sensor wins; otherwise crowdsourced availability when present. */
+/** Map/list pin color from open-court count (crowdsourced fallback only). */
 export function resolveCourtPinStatus(
-  summary: CourtSensorSummary | undefined,
-  reportedAvail: number | undefined,
+  openCount: number | null | undefined,
   totalCourts: number,
 ): CourtStatus {
-  if (summary?.hasSensors) {
-    if (summary.anyActive) return 'busy'
-    if (reportedAvail !== undefined) {
-      const total = Math.max(1, totalCourts)
-      const clamped = Math.min(Math.max(0, reportedAvail), total)
-      return courtsAvailableToPinStatus(clamped, total)
-    }
-    return 'open'
+  if (openCount == null || !Number.isFinite(openCount)) return 'unknown'
+  const total = Math.max(1, totalCourts)
+  const clamped = Math.min(Math.max(0, Math.floor(openCount)), total)
+  return courtsAvailableToPinStatus(clamped, total)
+}
+
+/**
+ * Prefer zone-derived three-state summary; else crowdsourced availability_reports; else unknown.
+ */
+export function resolveVenuePinStatus(params: {
+  venueOpen: VenueZoneSummary | undefined
+  reportedAvail: number | undefined
+  courtCount: number
+}): CourtStatus {
+  const { venueOpen, reportedAvail, courtCount } = params
+  if (venueOpen != null && venueOpen.total > 0) {
+    return venueSummaryToCourtStatus(venueOpen)
   }
   if (reportedAvail !== undefined) {
-    const total = Math.max(1, totalCourts)
-    const clamped = Math.min(Math.max(0, reportedAvail), total)
-    return courtsAvailableToPinStatus(clamped, total)
+    return resolveCourtPinStatus(reportedAvail, Math.max(1, courtCount))
   }
   return 'unknown'
 }

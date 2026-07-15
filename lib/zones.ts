@@ -1,4 +1,5 @@
 import { supabase } from '@/supabase'
+import { type CourtStatus } from '@/lib/courts'
 
 export type CourtZoneRow = {
   id: string
@@ -12,7 +13,94 @@ export type ZoneLatestReport = {
   reported_at: string
 }
 
+/** Per-zone: sensor wins; else live report; else literally no data. */
+export type ZoneStatus = 'open' | 'busy' | 'unknown'
+
+/** Venue rollup for map pin + list badge (same rules as court-detail rows). */
+export type VenueZoneSummary = {
+  open: number
+  busy: number
+  unknown: number
+  total: number
+}
+
+/** @deprecated Prefer VenueZoneSummary — kept as alias for open-count call sites. */
+export type VenueOpenCount = VenueZoneSummary
+
 const ZONE_REPORT_TTL_MS = 30 * 60 * 1000
+const COURT_ID_IN_CHUNK = 80
+
+/**
+ * Same Open/Busy/Unknown rule as court-detail zone rows:
+ * sensor wins when present; otherwise latest zone report; else unknown.
+ */
+export function resolveZoneStatus(
+  sensor: { is_active: boolean } | null | undefined,
+  report: { status: 'open' | 'busy' } | null | undefined,
+): ZoneStatus {
+  if (sensor != null) return sensor.is_active ? 'busy' : 'open'
+  if (report?.status === 'open') return 'open'
+  if (report?.status === 'busy') return 'busy'
+  return 'unknown'
+}
+
+export function isZoneCurrentlyOpen(
+  sensor: { is_active: boolean } | null | undefined,
+  report: { status: 'open' | 'busy' } | null | undefined,
+): boolean {
+  return resolveZoneStatus(sensor, report) === 'open'
+}
+
+export function summarizeVenueZones(
+  zones: ReadonlyArray<{ id: string }>,
+  sensorsByZone: ReadonlyMap<string, { is_active: boolean }>,
+  reportsByZone: ReadonlyMap<string, { status: 'open' | 'busy' }>,
+): VenueZoneSummary {
+  let open = 0
+  let busy = 0
+  let unknown = 0
+  for (const z of zones) {
+    const st = resolveZoneStatus(sensorsByZone.get(z.id), reportsByZone.get(z.id))
+    if (st === 'open') open += 1
+    else if (st === 'busy') busy += 1
+    else unknown += 1
+  }
+  return { open, busy, unknown, total: zones.length }
+}
+
+/** Open-count helper used by detail headline. */
+export function countOpenZones(
+  zones: ReadonlyArray<{ id: string }>,
+  sensorsByZone: ReadonlyMap<string, { is_active: boolean }>,
+  reportsByZone: ReadonlyMap<string, { status: 'open' | 'busy' }>,
+): VenueZoneSummary {
+  return summarizeVenueZones(zones, sensorsByZone, reportsByZone)
+}
+
+/**
+ * Facility pin / badge color from zone rollup:
+ * - green/open: every zone confirmed open (no busy, no unknown)
+ * - red/full: every zone confirmed busy (no unknown)
+ * - orange/busy: any unknown, or a mix of open + busy
+ */
+export function venueSummaryToCourtStatus(summary: VenueZoneSummary): CourtStatus {
+  const { open, busy, unknown, total } = summary
+  if (total <= 0) return 'unknown'
+  if (unknown === 0 && busy === 0 && open > 0) return 'open'
+  if (unknown === 0 && busy === total) return 'full'
+  return 'busy'
+}
+
+/**
+ * List-badge copy:
+ * - All zones confirmed → "X of Y open" (matches green/red/orange mix-of-known)
+ * - Any unknown → "Partial" (orange) so we never show a red-looking "0 of N" next to an orange pin
+ */
+export function venueSummaryBadgeLabel(summary: VenueZoneSummary): string {
+  if (summary.total <= 0) return 'No report'
+  if (summary.unknown > 0) return 'Partial'
+  return `${summary.open} of ${summary.total} open`
+}
 
 export async function fetchZonesForCourt(courtId: string): Promise<CourtZoneRow[]> {
   const { data, error } = await supabase
@@ -75,4 +163,83 @@ export async function insertZoneReport(input: {
   })
   if (error) return { error: new Error(error.message) }
   return { error: null }
+}
+
+/**
+ * Batch zone summaries for map/list: sensors + live zone_reports per zone,
+ * matching court-detail open / busy / unknown.
+ */
+export async function fetchVenueOpenCountsByCourtIds(
+  courtIds: string[],
+): Promise<Map<string, VenueZoneSummary>> {
+  const out = new Map<string, VenueZoneSummary>()
+  if (courtIds.length === 0) return out
+
+  const zonesByCourt = new Map<string, { id: string }[]>()
+  const sensorByZone = new Map<string, { is_active: boolean }>()
+  const reportByZone = new Map<string, { status: 'open' | 'busy' }>()
+
+  for (let i = 0; i < courtIds.length; i += COURT_ID_IN_CHUNK) {
+    const chunk = courtIds.slice(i, i + COURT_ID_IN_CHUNK)
+    const nowIso = new Date().toISOString()
+
+    const [zonesRes, sensorsRes, reportsRes] = await Promise.all([
+      supabase.from('zones').select('id, court_id').in('court_id', chunk),
+      supabase.from('court_sensors').select('zone_id, is_active').in('court_id', chunk),
+      supabase
+        .from('zone_reports')
+        .select('zone_id, status, reported_at')
+        .in('court_id', chunk)
+        .gt('expires_at', nowIso)
+        .order('reported_at', { ascending: false })
+        .limit(2000),
+    ])
+
+    if (zonesRes.error) {
+      if (__DEV__) console.warn('[zones] fetchVenueOpenCounts zones', zonesRes.error.message)
+    } else {
+      for (const raw of zonesRes.data ?? []) {
+        const row = raw as { id?: string; court_id?: string }
+        const zid = row.id != null ? String(row.id).trim() : ''
+        const cid = row.court_id != null ? String(row.court_id).trim() : ''
+        if (!zid || !cid) continue
+        const list = zonesByCourt.get(cid) ?? []
+        list.push({ id: zid })
+        zonesByCourt.set(cid, list)
+      }
+    }
+
+    if (sensorsRes.error) {
+      if (__DEV__) console.warn('[zones] fetchVenueOpenCounts sensors', sensorsRes.error.message)
+    } else {
+      for (const raw of sensorsRes.data ?? []) {
+        const row = raw as { zone_id?: string | null; is_active?: boolean }
+        const zid = row.zone_id != null ? String(row.zone_id).trim() : ''
+        if (!zid) continue
+        sensorByZone.set(zid, { is_active: row.is_active === true })
+      }
+    }
+
+    if (reportsRes.error) {
+      if (__DEV__) console.warn('[zones] fetchVenueOpenCounts reports', reportsRes.error.message)
+    } else {
+      for (const raw of reportsRes.data ?? []) {
+        const row = raw as { zone_id?: string; status?: string }
+        const zid = row.zone_id != null ? String(row.zone_id).trim() : ''
+        if (!zid || reportByZone.has(zid)) continue
+        if (row.status === 'open' || row.status === 'busy') {
+          reportByZone.set(zid, { status: row.status })
+        }
+      }
+    }
+  }
+
+  for (const cid of courtIds) {
+    const key = String(cid).trim()
+    const zones = zonesByCourt.get(key)
+    if (!zones || zones.length === 0) continue
+    out.set(key, summarizeVenueZones(zones, sensorByZone, reportByZone))
+  }
+
+  return out
 }

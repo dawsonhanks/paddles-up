@@ -1,19 +1,22 @@
 import {
   MapTabGestureRoot,
   MAP_NEARBY_SHEET_COLLAPSED_BASE_PX,
+  matchesCityFilter,
   matchesListFilter,
   NearbyCourtsSheet,
+  distinctCitiesFromCourts,
   type CourtWithDistance,
   type ListFilter,
 } from '@/components/nearby-courts-sheet'
 import { Colors } from '@/constants/theme'
 import { useColorScheme } from '@/hooks/use-color-scheme'
-import { courtsAvailableToPinStatus, fetchLatestCourtsAvailableByCourtIds } from '@/lib/availability'
+import { fetchLatestCourtsAvailableByCourtIds } from '@/lib/availability'
 import { fetchActiveCheckinCountsByCourtIds } from '@/lib/checkins'
-import { fetchSensorSummaryByCourtIds, resolveCourtPinStatus, type CourtSensorSummary } from '@/lib/courtSensors'
-import { courtFromRow, STATUS_PIN_COLOR, type Court, type CourtStatus } from '@/lib/courts'
+import { resolveVenuePinStatus } from '@/lib/courtSensors'
+import { courtFromRow, type Court } from '@/lib/courts'
 import { deleteCourtCheckIn, upsertActiveCourtCheckIn } from '@/lib/courtPresenceCheckin'
 import { fetchFavoriteCourtIds } from '@/lib/favorites'
+import { fetchVenueOpenCountsByCourtIds, type VenueOpenCount } from '@/lib/zones'
 import {
   distanceKm,
   isWithinMapInitialPinRadius,
@@ -22,21 +25,17 @@ import {
 } from '@/lib/geo'
 import {
   courtsInMapRegion,
-  mapRegionQueryBounds,
   mergeCourtIdSet,
-  viewportCacheKey,
   type MapRegion,
 } from '@/lib/mapRegion'
 import {
   clearManualCheckoutSuppressIfOutsideGeofence,
   getSilentManagedCourtId,
-  notifyBannerSilentCheckoutInitiated,
   notifySilentCheckoutCompleted,
   silentAutoCheckInCommitted,
   shouldSkipSilentUpsert,
   subscribeMapAutoCheckin,
 } from '@/lib/mapAutoCheckinCoordinator'
-import BottomSheet, { BottomSheetView } from '@gorhom/bottom-sheet'
 import { MaterialIcons } from '@expo/vector-icons'
 import { useFocusEffect, useIsFocused } from '@react-navigation/native'
 import { useNetworkOffline } from '@/contexts/network-status-context'
@@ -72,17 +71,16 @@ import { supabase } from '@/supabase'
 const AREA_RELOAD_THRESHOLD_KM = 0.8
 /** Throttle map user marker / distance sort updates while still firing silent check-in on each GPS callback. */
 const USER_POSITION_UI_THROTTLE_KM = 0.05
-const AREA_HALF_DELTA_DEG = 0.5
-/** User panned away from the initial map center — enables debounced area search. */
+/** User panned away from the initial map center — enables viewport pin reveal. */
 const MANUAL_PAN_THRESHOLD_KM = 1.6
 const TOUR_START_DELAY_MS = 1000
 const CACHED_COURTS_KEY = 'cached_courts'
+/** In-memory catalog key — full court list is loaded once, then filtered client-side. */
+const COURTS_CATALOG_CACHE_KEY = 'all'
 const LIVE_REFRESH_POLL_MS = 60000
 const LIVE_REFRESH_DEBOUNCE_MS = 500
-/** After the user stops panning, reveal additional map pins in the viewport. */
-const MAP_PIN_REVEAL_DEBOUNCE_MS = 2500
-/** After the user stops panning, refresh the nearby list for the map center. */
-const MAP_LIST_UPDATE_DEBOUNCE_MS = 5000
+/** After map movement settles, reveal additional pins already in memory (~settled, not mid-drag). */
+const MAP_PIN_REVEAL_DEBOUNCE_MS = 200
 
 /** Default map zoom in `court-map.native` — used for initial pin size. */
 const MAP_NEIGHBORHOOD_LONGITUDE_DELTA = 0.06
@@ -93,19 +91,6 @@ const MARKER_PIN_SIZE_MAX = 28
 const MARKER_ZOOM_DELTA_IN = 0.02
 /** longitudeDelta at min zoom (pins smallest). */
 const MARKER_ZOOM_DELTA_OUT = 0.45
-
-function courtStatusLabel(status: CourtStatus): string {
-  switch (status) {
-    case 'open':
-      return 'Open'
-    case 'busy':
-      return 'Busy'
-    case 'full':
-      return 'Full'
-    default:
-      return 'Unknown'
-  }
-}
 
 function markerPinSizeFromLongitudeDelta(longitudeDelta: number): number {
   const span = MARKER_ZOOM_DELTA_OUT - MARKER_ZOOM_DELTA_IN
@@ -143,13 +128,12 @@ export default function MapScreen() {
   const [courts, setCourts] = useState<Court[]>([])
   const isOffline = useNetworkOffline()
   const [cachedCourtsAt, setCachedCourtsAt] = useState<string | null>(null)
-  const [listAreaLoading, setListAreaLoading] = useState(false)
   const [listDistanceMode, setListDistanceMode] = useState<'gps' | 'mapCenter'>('gps')
   const [listMapCenter, setListMapCenter] = useState<{ lat: number; lon: number } | null>(null)
 
   const [selectedId, setSelectedId] = useState<string | null>(null)
-  const [selectedCourt, setSelectedCourt] = useState<Court | null>(null)
   const [listFilter, setListFilter] = useState<ListFilter>('all')
+  const [cityFilter, setCityFilter] = useState<string | null>(null)
   const [favoriteCourtIds, setFavoriteCourtIds] = useState<string[]>([])
   const [favoritesLoaded, setFavoritesLoaded] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
@@ -159,7 +143,6 @@ export default function MapScreen() {
     markerPinSizeFromLongitudeDelta(MAP_NEIGHBORHOOD_LONGITUDE_DELTA),
   )
   const searchInputRef = useRef<TextInput>(null)
-  const bottomSheetRef = useRef<BottomSheet>(null)
   const searchSlideY = useRef(new Animated.Value(-120)).current
 
   const tourStarted = useRef(false)
@@ -189,8 +172,6 @@ export default function MapScreen() {
   const liveRefreshBusyRef = useRef(false)
   const liveRefreshQueuedRef = useRef(false)
   const liveRefreshDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const mapPinRevealTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const mapListUpdateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const regionChangeTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const mapRegionRef = useRef<MapRegion | null>(null)
   const mapPinExpandActiveRef = useRef(false)
@@ -199,23 +180,39 @@ export default function MapScreen() {
   const lastThinUserPosRef = useRef<{ lat: number; lon: number } | null>(null)
   const [mapRevealedIds, setMapRevealedIds] = useState<Set<string>>(() => new Set())
   const [mapFadeInCourtIds, setMapFadeInCourtIds] = useState<Set<string>>(() => new Set())
-  const [sensorSummaryByCourtId, setSensorSummaryByCourtId] = useState<Map<string, CourtSensorSummary>>(
-    () => new Map(),
-  )
-  const sensorSummaryRef = useRef<Map<string, CourtSensorSummary>>(new Map())
-  useEffect(() => {
-    sensorSummaryRef.current = sensorSummaryByCourtId
-  }, [sensorSummaryByCourtId])
-
-  const applySensorSummaryToCourts = useCallback((summary: Map<string, CourtSensorSummary>) => {
+  const applyVenueOpenToCourts = useCallback((venueOpen: Map<string, VenueOpenCount>) => {
     const patchCourt = (c: Court): Court => {
-      const s = summary.get(c.id)
+      const vo = venueOpen.get(c.id)
       const reportedAvail =
-        c.liveCourtsAvailable != null && Number.isFinite(c.liveCourtsAvailable)
+        vo == null && c.liveCourtsAvailable != null && Number.isFinite(c.liveCourtsAvailable)
           ? c.liveCourtsAvailable
           : undefined
-      const status = resolveCourtPinStatus(s, reportedAvail, c.courtCount)
-      return status === c.status ? c : { ...c, status }
+      const status = resolveVenuePinStatus({
+        venueOpen: vo,
+        reportedAvail,
+        courtCount: c.courtCount,
+      })
+      const nextAvail = vo != null ? vo.open : c.liveCourtsAvailable
+      const nextTotal = vo != null ? vo.total : c.liveOpenTotal ?? null
+      const nextBusy = vo != null ? vo.busy : c.liveBusyCount ?? null
+      const nextUnknown = vo != null ? vo.unknown : c.liveUnknownCount ?? null
+      if (
+        status === c.status &&
+        nextAvail === c.liveCourtsAvailable &&
+        nextTotal === (c.liveOpenTotal ?? null) &&
+        nextBusy === (c.liveBusyCount ?? null) &&
+        nextUnknown === (c.liveUnknownCount ?? null)
+      ) {
+        return c
+      }
+      return {
+        ...c,
+        status,
+        liveCourtsAvailable: nextAvail ?? null,
+        liveOpenTotal: nextTotal,
+        liveBusyCount: nextBusy,
+        liveUnknownCount: nextUnknown,
+      }
     }
 
     setCourts((prev) => {
@@ -225,17 +222,13 @@ export default function MapScreen() {
     })
   }, [])
 
-  const loadSensorSummaryForCourts = useCallback(
+  const loadVenueOpenForCourts = useCallback(
     async (courtIds: string[]) => {
-      if (isOffline || courtIds.length === 0) {
-        setSensorSummaryByCourtId(new Map())
-        return
-      }
-      const summary = await fetchSensorSummaryByCourtIds(courtIds)
-      setSensorSummaryByCourtId(summary)
-      applySensorSummaryToCourts(summary)
+      if (isOffline || courtIds.length === 0) return
+      const summary = await fetchVenueOpenCountsByCourtIds(courtIds)
+      applyVenueOpenToCourts(summary)
     },
-    [isOffline, applySensorSummaryToCourts],
+    [isOffline, applyVenueOpenToCourts],
   )
   /** Latest known user position without re-subscribing the location watcher each tick */
   const userPosLatestRef = useRef<{ lat: number; lon: number } | null>(null)
@@ -275,25 +268,6 @@ export default function MapScreen() {
     },
     [router]
   )
-
-  const courtPreviewSnapPoints = useMemo(() => ['40%', '75%'], [])
-
-  const onMapCourtPinPress = useCallback(
-    (id: string) => {
-      const court = courts.find((c) => c.id === id) ?? null
-      if (!court) return
-      setSelectedId(id)
-      setSelectedCourt(court)
-      bottomSheetRef.current?.expand()
-    },
-    [courts],
-  )
-
-  const areaKeyFor = useCallback((lat: number, lon: number) => {
-    const latBucket = Math.round(lat * 2) / 2
-    const lonBucket = Math.round(lon * 2) / 2
-    return `${latBucket.toFixed(1)}:${lonBucket.toFixed(1)}`
-  }, [])
 
   const onLocationPurposeAllow = useCallback(async () => {
     try {
@@ -440,14 +414,13 @@ export default function MapScreen() {
 
   const loadCourtsWithLiveStatus = useCallback(async (
     center: { lat: number; lon: number },
-    opts?: { background?: boolean; force?: boolean; silent?: boolean; bounds?: MapRegion },
+    opts?: { background?: boolean; force?: boolean; silent?: boolean },
   ) => {
     const background = opts?.background === true
     const force = opts?.force === true
     const silent = opts?.silent === true
-    const bounds = opts?.bounds
-    const cacheKey = bounds ? viewportCacheKey(bounds) : areaKeyFor(center.lat, center.lon)
-    const alreadyLoaded = loadedAreaKeysRef.current.has(cacheKey)
+    // Full catalog loads once and stays in memory; pan/zoom only client-filters this set.
+    const alreadyLoaded = loadedAreaKeysRef.current.has(COURTS_CATALOG_CACHE_KEY)
 
     if (!force && alreadyLoaded) {
       lastFetchedCenterRef.current = center
@@ -465,6 +438,7 @@ export default function MapScreen() {
           setCourts(parsed.courts ?? [])
           setCachedCourtsAt(parsed.cachedAt ?? null)
           mergedCourtsByIdRef.current = new Map((parsed.courts ?? []).map((c) => [c.id, c]))
+          loadedAreaKeysRef.current.add(COURTS_CATALOG_CACHE_KEY)
         } else {
           setCourts([])
           setCachedCourtsAt(null)
@@ -472,22 +446,9 @@ export default function MapScreen() {
         return
       }
 
-      const queryBounds = bounds ? mapRegionQueryBounds(bounds) : null
-      let query = supabase.from('courts').select('*')
-      if (queryBounds) {
-        query = query
-          .gte('latitude', queryBounds.minLat)
-          .lte('latitude', queryBounds.maxLat)
-          .gte('longitude', queryBounds.minLon)
-          .lte('longitude', queryBounds.maxLon)
-      } else {
-        query = query
-          .gte('latitude', center.lat - AREA_HALF_DELTA_DEG)
-          .lte('latitude', center.lat + AREA_HALF_DELTA_DEG)
-          .gte('longitude', center.lon - AREA_HALF_DELTA_DEG)
-          .lte('longitude', center.lon + AREA_HALF_DELTA_DEG)
-      }
-      const { data, error } = await query.limit(500)
+      // Dataset is small (~hundreds of courts) — load the full catalog once instead of
+      // bounding-box queries on every viewport change.
+      const { data, error } = await supabase.from('courts').select('*').limit(2000)
 
       if (error) {
         setCourtsError(error.message)
@@ -499,38 +460,40 @@ export default function MapScreen() {
         .filter((c): c is Court => c != null)
 
       const ids = parsed.map((c) => c.id)
-      const [countsByCourt, availByCourt, sensorSummary] = await Promise.all([
+      const [countsByCourt, availByCourt, venueOpen] = await Promise.all([
         fetchActiveCheckinCountsByCourtIds(ids),
         fetchLatestCourtsAvailableByCourtIds(ids),
-        fetchSensorSummaryByCourtIds(ids),
+        fetchVenueOpenCountsByCourtIds(ids),
       ])
-      const nextAreaCourts = parsed.map((c) => {
+      const nextCourts = parsed.map((c) => {
         const key = String(c.id).trim()
         const n = countsByCourt.get(key) ?? 0
         const reportedAvail = availByCourt.get(key)
-        const total = Math.max(1, c.courtCount)
-        const summary = sensorSummary.get(key)
-        const liveCourtsAvailable = reportedAvail !== undefined ? reportedAvail : null
-        const status = resolveCourtPinStatus(summary, reportedAvail, total)
+        const vo = venueOpen.get(key)
+        const liveCourtsAvailable = vo != null ? vo.open : reportedAvail !== undefined ? reportedAvail : null
+        const liveOpenTotal = vo != null ? vo.total : null
+        const liveBusyCount = vo != null ? vo.busy : null
+        const liveUnknownCount = vo != null ? vo.unknown : null
+        const status = resolveVenuePinStatus({
+          venueOpen: vo,
+          reportedAvail,
+          courtCount: c.courtCount,
+        })
         return {
           ...c,
           liveCheckins: n,
           liveCourtsAvailable,
+          liveOpenTotal,
+          liveBusyCount,
+          liveUnknownCount,
           status,
         }
       })
 
-      const merged = new Map(mergedCourtsByIdRef.current)
-      for (const c of nextAreaCourts) merged.set(c.id, c)
-      mergedCourtsByIdRef.current = merged
-      setCourts(Array.from(merged.values()))
-      setSensorSummaryByCourtId((prev) => {
-        const next = new Map(prev)
-        for (const [courtId, summary] of sensorSummary) next.set(courtId, summary)
-        return next
-      })
+      mergedCourtsByIdRef.current = new Map(nextCourts.map((c) => [c.id, c]))
+      setCourts(nextCourts)
 
-      loadedAreaKeysRef.current.add(cacheKey)
+      loadedAreaKeysRef.current.add(COURTS_CATALOG_CACHE_KEY)
       lastFetchedCenterRef.current = center
 
       const cachedAt = new Date().toISOString()
@@ -538,7 +501,7 @@ export default function MapScreen() {
         CACHED_COURTS_KEY,
         JSON.stringify({
           cachedAt,
-          courts: Array.from(merged.values()),
+          courts: nextCourts,
         })
       )
       setCachedCourtsAt(cachedAt)
@@ -549,7 +512,7 @@ export default function MapScreen() {
       if (!background) setCourtsLoading(false)
       courtsHydratedRef.current = true
     }
-  }, [areaKeyFor, courts.length, isOffline])
+  }, [courts.length, isOffline])
 
   const refreshLiveCourtData = useCallback(async () => {
     if (!isMapFocusedRef.current) return
@@ -750,55 +713,64 @@ export default function MapScreen() {
     setFavoritesLoaded(true)
   }, [isOffline])
 
-  const refreshSensorSummaryForKnownCourts = useCallback(async () => {
+  const refreshVenueOpenForKnownCourts = useCallback(async () => {
     const ids = Array.from(mergedCourtsByIdRef.current.keys())
-    await loadSensorSummaryForCourts(ids)
-  }, [loadSensorSummaryForCourts])
+    await loadVenueOpenForCourts(ids)
+  }, [loadVenueOpenForCourts])
 
   const wasOfflineRef = useRef(isOffline)
   useEffect(() => {
     if (wasOfflineRef.current && !isOffline) {
       void loadFavoriteCourtIds()
-      void refreshSensorSummaryForKnownCourts()
+      void refreshVenueOpenForKnownCourts()
       const lat = userLat ?? FALLBACK_MAP_LAT
       const lon = userLon ?? FALLBACK_MAP_LON
       const center = lastFetchedCenterRef.current ?? { lat, lon }
       void loadCourtsWithLiveStatus(center, { background: true, force: true })
     }
     wasOfflineRef.current = isOffline
-  }, [isOffline, loadFavoriteCourtIds, refreshSensorSummaryForKnownCourts, userLat, userLon, loadCourtsWithLiveStatus])
+  }, [isOffline, loadFavoriteCourtIds, refreshVenueOpenForKnownCourts, userLat, userLon, loadCourtsWithLiveStatus])
 
   useFocusEffect(
     useCallback(() => {
       void loadFavoriteCourtIds()
-      void refreshSensorSummaryForKnownCourts()
+      void refreshVenueOpenForKnownCourts()
       if (!courtsHydratedRef.current) return
       const lat = userLat ?? FALLBACK_MAP_LAT
       const lon = userLon ?? FALLBACK_MAP_LON
       const center = lastFetchedCenterRef.current ?? { lat, lon }
       void loadCourtsWithLiveStatus(center, { background: true })
-    }, [userLat, userLon, loadCourtsWithLiveStatus, loadFavoriteCourtIds, refreshSensorSummaryForKnownCourts])
+    }, [userLat, userLon, loadCourtsWithLiveStatus, loadFavoriteCourtIds, refreshVenueOpenForKnownCourts])
   )
 
   useEffect(() => {
     if (!isMapScreenFocused || isOffline) return
 
     const channel = supabase
-      .channel(`map-live-${Date.now()}`)
+      .channel('map-live-courts')
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'court_checkins' },
-        () => scheduleLiveCourtRefresh()
+        () => scheduleLiveCourtRefresh(),
       )
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'availability_reports' },
-        () => scheduleLiveCourtRefresh()
+        () => scheduleLiveCourtRefresh(),
       )
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'court_sensors' },
-        () => void refreshSensorSummaryForKnownCourts()
+        () => {
+          void refreshVenueOpenForKnownCourts()
+        },
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'zone_reports' },
+        () => {
+          void refreshVenueOpenForKnownCourts()
+        },
       )
       .subscribe()
 
@@ -807,7 +779,7 @@ export default function MapScreen() {
     }, LIVE_REFRESH_POLL_MS)
 
     void refreshLiveCourtData()
-    void refreshSensorSummaryForKnownCourts()
+    void refreshVenueOpenForKnownCourts()
 
     return () => {
       clearInterval(pollTimer)
@@ -817,7 +789,13 @@ export default function MapScreen() {
       }
       void supabase.removeChannel(channel)
     }
-  }, [isMapScreenFocused, isOffline, refreshLiveCourtData, scheduleLiveCourtRefresh, refreshSensorSummaryForKnownCourts])
+  }, [
+    isMapScreenFocused,
+    isOffline,
+    refreshLiveCourtData,
+    scheduleLiveCourtRefresh,
+    refreshVenueOpenForKnownCourts,
+  ])
 
   const onRefreshCourts = useCallback(async () => {
     setRefreshing(true)
@@ -830,7 +808,6 @@ export default function MapScreen() {
       await loadCourtsWithLiveStatus(center, {
         background: true,
         force: true,
-        bounds: region ?? undefined,
       })
       await loadFavoriteCourtIds()
     } finally {
@@ -838,15 +815,16 @@ export default function MapScreen() {
     }
   }, [userLat, userLon, loadCourtsWithLiveStatus, loadFavoriteCourtIds])
 
-  const onSilentBannerCheckOut = useCallback(async () => {
-    if (silentCheckInBanner == null || isOffline) return
-    const id = silentCheckInBanner.id
-    const rm = await deleteCourtCheckIn(id)
-    if (!rm.ok) return
-    notifyBannerSilentCheckoutInitiated(id)
-  }, [silentCheckInBanner, isOffline])
+  /** Auto-dismiss the auto-check-in toast after 7s — no persistent map overlay. */
+  useEffect(() => {
+    if (silentCheckInBanner == null) return
+    const timer = setTimeout(() => {
+      setSilentCheckInBanner(null)
+    }, 7000)
+    return () => clearTimeout(timer)
+  }, [silentCheckInBanner])
 
-  const onMapRegionChangeComplete = useCallback((region: MapRegion) => {
+  const onMapRegionChangeCompleteUi = useCallback((region: MapRegion) => {
     mapRegionRef.current = region
     Keyboard.dismiss()
     setMarkerPinSize(markerPinSizeFromLongitudeDelta(region.longitudeDelta))
@@ -944,60 +922,21 @@ export default function MapScreen() {
   )
 
   const runMapPinReveal = useCallback(
-    async (region: MapRegion) => {
-      if (isOffline) return
+    (region: MapRegion) => {
       mapPinExpandActiveRef.current = true
+      // Client-side only — catalog is already in memory from the initial full load.
       revealDebouncedMapPins(region)
-      await loadCourtsWithLiveStatus(
-        { lat: region.latitude, lon: region.longitude },
-        { background: true, silent: true, bounds: region },
-      )
     },
-    [isOffline, loadCourtsWithLiveStatus, revealDebouncedMapPins],
+    [revealDebouncedMapPins],
   )
 
-  const scheduleMapPinReveal = useCallback(() => {
-    if (isOffline) return
-    if (mapPinRevealTimerRef.current != null) {
-      clearTimeout(mapPinRevealTimerRef.current)
-    }
-    mapPinRevealTimerRef.current = setTimeout(() => {
-      mapPinRevealTimerRef.current = null
-      const latest = mapRegionRef.current
-      if (latest) void runMapPinReveal(latest)
-    }, MAP_PIN_REVEAL_DEBOUNCE_MS)
-  }, [isOffline, runMapPinReveal])
+  const runMapListUpdate = useCallback((region: MapRegion) => {
+    // Re-anchor the nearby sheet to the map center using cached courts (no network).
+    setListMapCenter({ lat: region.latitude, lon: region.longitude })
+    setListDistanceMode('mapCenter')
+  }, [])
 
-  const runMapListUpdate = useCallback(
-    async (region: MapRegion) => {
-      if (isOffline) return
-      setListAreaLoading(true)
-      try {
-        await loadCourtsWithLiveStatus(
-          { lat: region.latitude, lon: region.longitude },
-          { background: true, silent: true, bounds: region },
-        )
-        setListMapCenter({ lat: region.latitude, lon: region.longitude })
-        setListDistanceMode('mapCenter')
-      } finally {
-        setListAreaLoading(false)
-      }
-    },
-    [isOffline, loadCourtsWithLiveStatus],
-  )
-
-  const scheduleMapListUpdate = useCallback(() => {
-    if (isOffline) return
-    if (mapListUpdateTimerRef.current != null) {
-      clearTimeout(mapListUpdateTimerRef.current)
-    }
-    mapListUpdateTimerRef.current = setTimeout(() => {
-      mapListUpdateTimerRef.current = null
-      const latest = mapRegionRef.current
-      if (latest) void runMapListUpdate(latest)
-    }, MAP_LIST_UPDATE_DEBOUNCE_MS)
-  }, [isOffline, runMapListUpdate])
-
+  /** Continuous while dragging — track region + detect intentional pan; do not reveal pins here. */
   const onMapRegionChange = useCallback(
     (region: MapRegion) => {
       mapRegionRef.current = region
@@ -1013,32 +952,41 @@ export default function MapScreen() {
         }
         userHasManuallyPannedRef.current = true
       }
+    },
+    [filteredCourts, mergeMapRevealedIds, userLat, userLon],
+  )
 
-      if (!userHasManuallyPannedRef.current) return
+  /** Fires when pan/zoom settles — reveal viewport pins + update list from in-memory catalog. */
+  const onMapRegionChangeComplete = useCallback(
+    (region: MapRegion) => {
+      onMapRegionChangeCompleteUi(region)
+
+      if (!userHasManuallyPannedRef.current) {
+        if (userLat == null || userLon == null) {
+          mergeMapRevealedIds(courtsInMapRegion(filteredCourts, region).map((c) => c.id))
+        }
+        return
+      }
 
       if (userLat == null || userLon == null) {
         mergeMapRevealedIds(courtsInMapRegion(filteredCourts, region).map((c) => c.id))
       }
 
-      scheduleMapPinReveal()
-      scheduleMapListUpdate()
+      runMapPinReveal(region)
+      runMapListUpdate(region)
     },
-    [filteredCourts, mergeMapRevealedIds, scheduleMapListUpdate, scheduleMapPinReveal, userLat, userLon],
+    [
+      filteredCourts,
+      mergeMapRevealedIds,
+      onMapRegionChangeCompleteUi,
+      runMapListUpdate,
+      runMapPinReveal,
+      userLat,
+      userLon,
+    ],
   )
 
-  useEffect(() => {
-    return () => {
-      if (mapPinRevealTimerRef.current != null) {
-        clearTimeout(mapPinRevealTimerRef.current)
-      }
-      if (mapListUpdateTimerRef.current != null) {
-        clearTimeout(mapListUpdateTimerRef.current)
-      }
-      setListAreaLoading(false)
-    }
-  }, [])
-
-  /** Staged map pins: within 2 mi first, then viewport pins after pan debounce (ids never removed). */
+  /** Staged map pins: within 2 mi first, then viewport pins after pan settles (ids never removed). */
   const mapVisibleCourts = useMemo(
     () => filteredCourts.filter((c) => mapRevealedIds.has(c.id)),
     [filteredCourts, mapRevealedIds],
@@ -1106,15 +1054,28 @@ export default function MapScreen() {
   }, [courtsWithin5Miles, searchQuery])
 
   const filteredListCourts = useMemo(
-    () => searchFilteredListCourts.filter((c) => matchesListFilter(c, listFilter, favoriteIdSet)),
-    [searchFilteredListCourts, listFilter, favoriteIdSet]
+    () =>
+      searchFilteredListCourts.filter(
+        (c) => matchesListFilter(c, listFilter, favoriteIdSet) && matchesCityFilter(c, cityFilter),
+      ),
+    [searchFilteredListCourts, listFilter, favoriteIdSet, cityFilter],
   )
+
+  const nearbyCityOptions = useMemo(
+    () => distinctCitiesFromCourts(courtsWithin5Miles),
+    [courtsWithin5Miles],
+  )
+
+  useEffect(() => {
+    if (cityFilter != null && !nearbyCityOptions.includes(cityFilter)) {
+      setCityFilter(null)
+    }
+  }, [cityFilter, nearbyCityOptions])
 
   const showNoFavoritesYetHint =
     listFilter === 'favorites' && favoritesLoaded && favoriteCourtIds.length === 0
 
   const showNoCourtsWithin5MilesHint =
-    !listAreaLoading &&
     courts.length > 0 &&
     courtsWithin5Miles.length === 0 &&
     (listDistanceMode === 'mapCenter' || (userLat != null && userLon != null))
@@ -1201,33 +1162,6 @@ export default function MapScreen() {
                 {(offlineCacheAgeLabel ? `${offlineCacheAgeLabel}. ` : '') + 'Showing saved courts; live pins wait until you reconnect.'}
               </Text>
             ) : null}
-            {silentCheckInBanner != null ? (
-              <View style={styles.silentBannerWrap}>
-                <Pressable
-                  disabled={isOffline}
-                  style={({ pressed }) => [
-                    styles.silentBanner,
-                    {
-                      backgroundColor: isDark ? 'rgba(34,197,94,0.12)' : 'rgba(29,158,117,0.12)',
-                      borderColor: isDark ? 'rgba(74,222,128,0.35)' : 'rgba(29,158,117,0.28)',
-                      opacity: isOffline ? 0.55 : pressed ? 0.92 : 1,
-                    },
-                  ]}
-                  onPress={() => void onSilentBannerCheckOut()}
-                  accessibilityRole="button"
-                  accessibilityLabel={`Checked in at ${silentCheckInBanner.name}. Tap to check out`}
-                >
-                  <Text
-                    style={[styles.silentBannerText, { color: isDark ? '#86EFAC' : '#0F6E56' }]}
-                    numberOfLines={1}>
-                    Checked in at {silentCheckInBanner.name}
-                  </Text>
-                  <Text style={[styles.silentBannerAction, { color: isDark ? '#BBF7D0' : '#1D9E75' }]}>
-                    Check out
-                  </Text>
-                </Pressable>
-              </View>
-            ) : null}
             {permissionDenied ? (
               <View style={styles.silentBannerWrap}>
                 <Pressable
@@ -1263,15 +1197,18 @@ export default function MapScreen() {
                   fadeInCourtIds={mapFadeInCourtIds}
                   selectedId={selectedId}
                   markerPinSize={markerPinSize}
-                  onSelectCourt={onMapCourtPinPress}
+                  onSelectCourt={openCourtDetail}
                   mapBottomPadding={mapBottomPadding}
                   onMapPress={dismissKeyboard}
                   onRegionChange={onMapRegionChange}
                   onRegionChangeComplete={(region) => {
+                    // Store immediately; reveal after a short settle so rubber-band/jitter doesn't thrash.
+                    mapRegionRef.current = region
                     if (regionChangeTimer.current) clearTimeout(regionChangeTimer.current)
                     regionChangeTimer.current = setTimeout(() => {
-                      onMapRegionChangeComplete(region)
-                    }, 300)
+                      const latest = mapRegionRef.current ?? region
+                      onMapRegionChangeComplete(latest)
+                    }, MAP_PIN_REVEAL_DEBOUNCE_MS)
                   }}
                 />
               ) : (
@@ -1282,6 +1219,28 @@ export default function MapScreen() {
                   ]}
                 />
               )}
+              {silentCheckInBanner != null ? (
+                <View style={styles.checkInToastWrap} pointerEvents="box-none">
+                  <Pressable
+                    onPress={() => openCourtDetail(silentCheckInBanner.id)}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Checked in at ${silentCheckInBanner.name}. Tap to open court details`}
+                    style={({ pressed }) => [
+                      styles.checkInToast,
+                      {
+                        backgroundColor: isDark ? 'rgba(15, 28, 24, 0.94)' : 'rgba(255,255,255,0.96)',
+                        borderColor: isDark ? 'rgba(74,222,128,0.4)' : 'rgba(29,158,117,0.35)',
+                        opacity: pressed ? 0.92 : 1,
+                      },
+                    ]}>
+                    <Text
+                      style={[styles.checkInToastText, { color: isDark ? '#86EFAC' : '#0F6E56' }]}
+                      numberOfLines={1}>
+                      Checked in at {silentCheckInBanner.name}
+                    </Text>
+                  </Pressable>
+                </View>
+              ) : null}
               {areaLoading ? (
                 <View
                   style={[
@@ -1356,6 +1315,9 @@ export default function MapScreen() {
             courts={filteredListCourts}
             filter={listFilter}
             onFilterChange={setListFilter}
+            cityFilter={cityFilter}
+            onCityFilterChange={setCityFilter}
+            cityOptions={nearbyCityOptions}
             onCourtPress={openCourtDetail}
             selectedId={selectedId}
             isDark={isDark}
@@ -1364,93 +1326,8 @@ export default function MapScreen() {
             showNoFavoritesYetHint={showNoFavoritesYetHint}
             showNoCourtsWithin5MilesHint={showNoCourtsWithin5MilesHint}
             listLoading={sheetListLoading}
-            listFindingCourts={listAreaLoading}
+            listFindingCourts={false}
           />
-          <BottomSheet
-            ref={bottomSheetRef}
-            index={-1}
-            snapPoints={courtPreviewSnapPoints}
-            enablePanDownToClose
-            onChange={(index) => {
-              if (index === -1) setSelectedCourt(null)
-            }}
-            backgroundStyle={{
-              backgroundColor: isDark ? '#18181B' : '#FFFFFF',
-            }}
-            handleIndicatorStyle={{
-              backgroundColor: isDark ? '#52525B' : '#CBD5E1',
-              width: 40,
-            }}
-            style={styles.courtPreviewSheet}>
-            <BottomSheetView style={[styles.courtPreviewContent, { paddingBottom: insets.bottom + 16 }]}>
-              {selectedCourt ? (
-                <>
-                  <Text style={[styles.courtPreviewName, { color: isDark ? '#F8FAFC' : '#0F172A' }]}>
-                    {selectedCourt.name}
-                  </Text>
-                  <Text style={[styles.courtPreviewAddress, { color: isDark ? '#A1A1AA' : '#64748B' }]}>
-                    {[
-                      selectedCourt.indoorOutdoor?.trim(),
-                      `${selectedCourt.courtCount} court${selectedCourt.courtCount === 1 ? '' : 's'}`,
-                    ]
-                      .filter(Boolean)
-                      .join(' · ')}
-                  </Text>
-                  <View style={styles.courtPreviewStatusRow}>
-                    {selectedCourt.liveCourtsAvailable != null &&
-                    Number.isFinite(selectedCourt.liveCourtsAvailable) ? (
-                      <View
-                        style={[
-                          styles.courtPreviewStatusPill,
-                          {
-                            backgroundColor: STATUS_PIN_COLOR[
-                              courtsAvailableToPinStatus(
-                                Math.min(
-                                  Math.max(0, Math.floor(selectedCourt.liveCourtsAvailable)),
-                                  Math.max(1, selectedCourt.courtCount),
-                                ),
-                                Math.max(1, selectedCourt.courtCount),
-                              )
-                            ],
-                          },
-                        ]}>
-                        <Text style={styles.courtPreviewStatusPillText}>
-                          {`${Math.min(
-                            Math.max(0, Math.floor(selectedCourt.liveCourtsAvailable)),
-                            Math.max(1, selectedCourt.courtCount),
-                          )} of ${Math.max(1, selectedCourt.courtCount)} open`}
-                        </Text>
-                      </View>
-                    ) : (
-                      <View
-                        style={[
-                          styles.courtPreviewStatusPill,
-                          { backgroundColor: isDark ? '#374151' : '#E5E7EB' },
-                        ]}>
-                        <Text
-                          style={[
-                            styles.courtPreviewStatusPillText,
-                            { color: isDark ? '#9CA3AF' : '#6B7280' },
-                          ]}>
-                          {courtStatusLabel(selectedCourt.status)} · No report
-                        </Text>
-                      </View>
-                    )}
-                  </View>
-                  <Pressable
-                    accessibilityRole="button"
-                    accessibilityLabel="View full court details"
-                    onPress={() => openCourtDetail(selectedCourt.id)}
-                    style={({ pressed }) => [
-                      styles.courtPreviewDetailsBtn,
-                      { backgroundColor: '#1D9E75', opacity: pressed ? 0.9 : 1 },
-                    ]}>
-                    <Text style={styles.courtPreviewDetailsBtnText}>View Full Details</Text>
-                  </Pressable>
-                </>
-              ) : null}
-            </BottomSheetView>
-          </BottomSheet>
         </View>
       </MapTabGestureRoot>
       <LocationPurposeModal
@@ -1483,23 +1360,28 @@ const styles = StyleSheet.create({
     marginTop: 2,
     marginBottom: 4,
   },
-  silentBanner: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: 10,
+  checkInToastWrap: {
+    position: 'absolute',
+    top: 12,
+    left: 12,
+    right: 72,
+    zIndex: 14,
+    alignItems: 'flex-start',
+  },
+  checkInToast: {
+    maxWidth: '100%',
     borderWidth: StyleSheet.hairlineWidth,
     borderRadius: 999,
     paddingHorizontal: 14,
-    paddingVertical: 9,
+    paddingVertical: 10,
+    shadowColor: '#000',
+    shadowOpacity: 0.18,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 6,
   },
-  silentBannerText: {
-    flex: 1,
+  checkInToastText: {
     fontSize: 13,
-    fontWeight: '600',
-  },
-  silentBannerAction: {
-    fontSize: 12,
     fontWeight: '700',
   },
   locationDeniedBanner: {
@@ -1622,47 +1504,5 @@ const styles = StyleSheet.create({
   hint: {
     marginTop: 12,
     fontSize: 15,
-  },
-  courtPreviewSheet: {
-    zIndex: 30,
-  },
-  courtPreviewContent: {
-    paddingHorizontal: 20,
-    paddingTop: 4,
-    gap: 10,
-  },
-  courtPreviewName: {
-    fontSize: 22,
-    fontWeight: '700',
-    lineHeight: 28,
-  },
-  courtPreviewAddress: {
-    fontSize: 15,
-    lineHeight: 21,
-  },
-  courtPreviewStatusRow: {
-    marginTop: 4,
-  },
-  courtPreviewStatusPill: {
-    alignSelf: 'flex-start',
-    borderRadius: 999,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-  },
-  courtPreviewStatusPillText: {
-    color: '#FFFFFF',
-    fontSize: 13,
-    fontWeight: '700',
-  },
-  courtPreviewDetailsBtn: {
-    marginTop: 8,
-    borderRadius: 14,
-    paddingVertical: 14,
-    alignItems: 'center',
-  },
-  courtPreviewDetailsBtnText: {
-    color: '#FFFFFF',
-    fontSize: 16,
-    fontWeight: '700',
   },
 })

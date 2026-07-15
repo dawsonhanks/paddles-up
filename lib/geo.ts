@@ -38,7 +38,11 @@ export function isWithinNearbyListRadius(distanceKm: number): boolean {
 
 export function formatDistanceMiles(km: number): string {
   const mi = kmToMiles(km)
-  if (mi < 0.05) return 'Nearby'
+  // Under ~0.05 mi (~260 ft) — show feet so being at/on a court isn't "Nearby".
+  if (mi < 0.05) {
+    const ft = Math.max(1, Math.round(mi * 5280))
+    return `${ft} ft`
+  }
   if (mi < 10) return `${mi.toFixed(1)} mi`
   return `${Math.round(mi)} mi`
 }
@@ -52,7 +56,10 @@ export function formatDistanceDetail(km: number): string {
   return `${Math.round(mi)} mi away`
 }
 
-/** Max distance (km) at which check-in and availability reports are accepted — 150 m. */
+/** Max distance (km) at which check-in and availability reports are accepted — 150 m.
+ * TEMP: court-detail reporting/check-in gates are disabled for pitch demo (see app/court/[id].tsx).
+ * Still used by map silent auto check-in / checkout radius (app/(tabs)/index.tsx, lib/mapAutoCheckinCoordinator.ts).
+ */
 export const REPORTING_RADIUS_KM = 0.15
 
 export function isWithinReportingRadius(distanceKm: number): boolean {

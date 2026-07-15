@@ -1,17 +1,18 @@
 import { ContentFadeIn } from '@/components/content-fade-in'
 import { SkeletonCourtSheetRow } from '@/components/skeleton-card'
-import { courtsAvailableToPinStatus } from '@/lib/availability'
-import { STATUS_PIN_COLOR, type Court } from '@/lib/courts'
+import { STATUS_PIN_COLOR, type Court, type CourtStatus } from '@/lib/courts'
 import { formatDistanceMiles } from '@/lib/geo'
+import { venueSummaryBadgeLabel, venueSummaryToCourtStatus, type VenueZoneSummary } from '@/lib/zones'
 import { MaterialIcons } from '@expo/vector-icons'
 import BottomSheet, { BottomSheetFlatList } from '@gorhom/bottom-sheet'
 import type { ReactNode } from 'react'
-import { useCallback, useMemo } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import {
   ActivityIndicator,
   Dimensions,
   FlatList,
   Keyboard,
+  Modal,
   Platform,
   Pressable,
   ScrollView,
@@ -29,11 +30,17 @@ export type CourtWithDistance = Court & { distanceKm: number }
 const BRAND_GREEN = '#1D9E75'
 /**
  * Map tab only: `CourtMap` bottom padding for the Apple/Google legal line.
- * Intentionally **not** tied to the bottom sheet's visual peek height.
+ * Tuned roughly to the collapsed sheet; not required to match peek px exactly.
  */
-export const MAP_NEARBY_SHEET_COLLAPSED_BASE_PX = 108
-/** Bottom sheet first snap: room for title + filter row + first court card. */
-const COLLAPSED_SHEET_PEEK_PX = 210
+export const MAP_NEARBY_SHEET_COLLAPSED_BASE_PX = 60
+/**
+ * Collapsed peek height (plus safe-area bottom separately).
+ * Budget: handle padding+indicator (24) + list top pad (4) + title (~22) +
+ * title marginBottom-as-breathing-room (10) = 60 — stops just as filter pills begin.
+ */
+const PEEK_CONTENT_PX = 60
+/** Expanded snap — full header, filters, and scrollable list. */
+const EXPANDED_SNAP = '55%'
 
 export function matchesListFilter(court: Court, filter: ListFilter, favoriteIds?: ReadonlySet<string>): boolean {
   if (filter === 'favorites') return favoriteIds?.has(court.id) ?? false
@@ -45,44 +52,153 @@ export function matchesListFilter(court: Court, filter: ListFilter, favoriteIds?
   return true
 }
 
-const FILTER_OPTIONS: { key: ListFilter; label: string; icon?: 'favorite' }[] = [
+/** City filter — courts with no parseable city always pass (stay visible). */
+export function matchesCityFilter(court: Court, city: string | null): boolean {
+  if (city == null) return true
+  if (court.city == null) return true
+  return court.city === city
+}
+
+/** Distinct cities for the picker — null/unparseable cities excluded. Sorted A→Z. */
+export function distinctCitiesFromCourts(courts: readonly Court[]): string[] {
+  const set = new Set<string>()
+  for (const c of courts) {
+    if (c.city) set.add(c.city)
+  }
+  return Array.from(set).sort((a, b) => a.localeCompare(b))
+}
+
+const FILTER_OPTIONS: { key: ListFilter; label: string }[] = [
   { key: 'all', label: 'All' },
-  { key: 'favorites', label: 'Favorites', icon: 'favorite' },
-  { key: 'open', label: 'Open only' },
+  { key: 'favorites', label: 'Favorites' },
+  { key: 'open', label: 'Open' },
   { key: 'outdoor', label: 'Outdoor' },
   { key: 'indoor', label: 'Indoor' },
 ]
 
 function CourtsOpenBadge({
   liveCourtsAvailable,
+  liveOpenTotal,
+  liveBusyCount,
+  liveUnknownCount,
   courtCount,
+  status,
   isDark,
 }: {
   liveCourtsAvailable: number | null | undefined
+  liveOpenTotal: number | null | undefined
+  liveBusyCount: number | null | undefined
+  liveUnknownCount: number | null | undefined
   courtCount: number
+  status: CourtStatus
   isDark: boolean
 }) {
-  const total = Math.max(1, courtCount)
-  const raw =
-    liveCourtsAvailable != null && Number.isFinite(liveCourtsAvailable)
-      ? Math.floor(liveCourtsAvailable)
-      : null
-  if (raw === null) {
+  const hasZoneSummary =
+    liveOpenTotal != null &&
+    liveOpenTotal > 0 &&
+    liveCourtsAvailable != null &&
+    Number.isFinite(liveCourtsAvailable)
+
+  if (hasZoneSummary) {
+    const summary: VenueZoneSummary = {
+      open: Math.max(0, Math.floor(liveCourtsAvailable!)),
+      busy: Math.max(0, Math.floor(liveBusyCount ?? 0)),
+      unknown: Math.max(0, Math.floor(liveUnknownCount ?? 0)),
+      total: Math.max(1, liveOpenTotal!),
+    }
+    // Normalize unknown if busy/open were partial
+    if (summary.open + summary.busy + summary.unknown !== summary.total) {
+      summary.unknown = Math.max(0, summary.total - summary.open - summary.busy)
+    }
+    const st = venueSummaryToCourtStatus(summary)
+    const label = venueSummaryBadgeLabel(summary)
     return (
-      <View style={[styles.badgeNoReport, { backgroundColor: isDark ? '#374151' : '#E5E7EB' }]}>
-        <Text style={[styles.badgeNoReportText, { color: isDark ? '#9CA3AF' : '#6B7280' }]} numberOfLines={1}>
-          No report
+      <View style={[styles.badgePill, styles.badgePillShrink, { backgroundColor: STATUS_PIN_COLOR[st] }]}>
+        <Text style={styles.badgePillText} numberOfLines={1}>
+          {label}
         </Text>
       </View>
     )
   }
-  const clamped = Math.min(Math.max(0, raw), total)
-  const st = courtsAvailableToPinStatus(clamped, total)
-  const bg = STATUS_PIN_COLOR[st]
+
+  // Crowdsourced-only fallback (no zone rows): keep status + simple count/label.
+  const raw =
+    liveCourtsAvailable != null && Number.isFinite(liveCourtsAvailable)
+      ? Math.floor(liveCourtsAvailable)
+      : null
+  if (raw !== null) {
+    const total = Math.max(1, courtCount)
+    const clamped = Math.min(Math.max(0, raw), total)
+    return (
+      <View style={[styles.badgePill, styles.badgePillShrink, { backgroundColor: STATUS_PIN_COLOR[status] }]}>
+        <Text style={styles.badgePillText} numberOfLines={1}>{`${clamped} of ${total} open`}</Text>
+      </View>
+    )
+  }
+
+  if (status === 'open' || status === 'busy' || status === 'full') {
+    const label = status === 'open' ? 'Open' : status === 'busy' ? 'Busy' : 'Full'
+    return (
+      <View style={[styles.badgePill, styles.badgePillShrink, { backgroundColor: STATUS_PIN_COLOR[status] }]}>
+        <Text style={styles.badgePillText} numberOfLines={1}>
+          {label}
+        </Text>
+      </View>
+    )
+  }
+
   return (
-    <View style={[styles.badgePill, styles.badgePillShrink, { backgroundColor: bg }]}>
-      <Text style={styles.badgePillText} numberOfLines={1}>{`${clamped} of ${total} open`}</Text>
+    <View style={[styles.badgeNoReport, { backgroundColor: isDark ? '#374151' : '#E5E7EB' }]}>
+      <Text style={[styles.badgeNoReportText, { color: isDark ? '#9CA3AF' : '#6B7280' }]} numberOfLines={1}>
+        No report
+      </Text>
     </View>
+  )
+}
+
+function FilterPillButton({
+  label,
+  active,
+  isDark,
+  onPress,
+  trailing,
+  maxWidth,
+}: {
+  label: string
+  active: boolean
+  isDark: boolean
+  onPress: () => void
+  trailing?: ReactNode
+  maxWidth?: number
+}) {
+  return (
+    <Pressable
+      onPress={onPress}
+      style={({ pressed }) => [
+        styles.filterPill,
+        {
+          flexDirection: 'row',
+          alignItems: 'center',
+          gap: trailing ? 4 : 0,
+          maxWidth,
+          backgroundColor: active ? BRAND_GREEN : isDark ? '#27272A' : '#F1F5F9',
+          borderColor: active ? BRAND_GREEN : isDark ? '#3F3F46' : '#E2E8F0',
+          opacity: pressed ? 0.85 : 1,
+        },
+      ]}>
+      <Text
+        numberOfLines={1}
+        style={[
+          styles.filterPillText,
+          {
+            color: active ? '#FFFFFF' : isDark ? '#A1A1AA' : '#475569',
+            flexShrink: maxWidth != null ? 1 : undefined,
+          },
+        ]}>
+        {label}
+      </Text>
+      {trailing}
+    </Pressable>
   )
 }
 
@@ -90,11 +206,16 @@ function FilterPills({
   filter,
   onChange,
   isDark,
+  cityFilter,
+  onCityPress,
 }: {
   filter: ListFilter
   onChange: (f: ListFilter) => void
   isDark: boolean
+  cityFilter: string | null
+  onCityPress: () => void
 }) {
+  const cityActive = cityFilter != null
   return (
     <View style={styles.filterWrap}>
       <Text style={[styles.sheetTitle, { color: isDark ? '#F8FAFC' : '#0F172A' }]}>Nearby courts</Text>
@@ -102,35 +223,38 @@ function FilterPills({
         horizontal
         showsHorizontalScrollIndicator={false}
         contentContainerStyle={styles.filterScroll}>
-        {FILTER_OPTIONS.map((opt) => {
-          const active = filter === opt.key
-          return (
-            <Pressable
-              key={opt.key}
-              onPress={() =>
-                filter === opt.key && opt.key === 'favorites' ? onChange('all') : onChange(opt.key)
-              }
-              style={({ pressed }) => [
-                styles.filterPill,
-                {
-                  flexDirection: 'row',
-                  alignItems: 'center',
-                  gap: opt.icon ? 6 : 0,
-                  backgroundColor: active ? BRAND_GREEN : isDark ? '#27272A' : '#F1F5F9',
-                  borderColor: active ? BRAND_GREEN : isDark ? '#3F3F46' : '#E2E8F0',
-                  opacity: pressed ? 0.85 : 1,
-                },
-              ]}>
-              {opt.icon === 'favorite' ? (
-                <MaterialIcons name={opt.icon} size={17} color={active ? '#FFFFFF' : BRAND_GREEN} />
-              ) : null}
-              <Text
-                style={[styles.filterPillText, { color: active ? '#FFFFFF' : isDark ? '#A1A1AA' : '#475569' }]}>
-                {opt.label}
-              </Text>
-            </Pressable>
-          )
-        })}
+        {/* All → City → Favorites → … */}
+        <FilterPillButton
+          label="All"
+          active={filter === 'all'}
+          isDark={isDark}
+          onPress={() => onChange('all')}
+        />
+        <FilterPillButton
+          label={cityActive ? cityFilter! : 'City'}
+          active={cityActive}
+          isDark={isDark}
+          onPress={onCityPress}
+          maxWidth={160}
+          trailing={
+            <MaterialIcons
+              name="arrow-drop-down"
+              size={18}
+              color={cityActive ? '#FFFFFF' : isDark ? '#A1A1AA' : '#475569'}
+            />
+          }
+        />
+        {FILTER_OPTIONS.filter((opt) => opt.key !== 'all').map((opt) => (
+          <FilterPillButton
+            key={opt.key}
+            label={opt.label}
+            active={filter === opt.key}
+            isDark={isDark}
+            onPress={() =>
+              filter === opt.key && opt.key === 'favorites' ? onChange('all') : onChange(opt.key)
+            }
+          />
+        ))}
       </ScrollView>
     </View>
   )
@@ -170,7 +294,15 @@ function CourtRow({
           {formatDistanceMiles(item.distanceKm)} · {courtsLabel} · {venue}
         </Text>
       </View>
-      <CourtsOpenBadge liveCourtsAvailable={item.liveCourtsAvailable} courtCount={item.courtCount} isDark={isDark} />
+      <CourtsOpenBadge
+        liveCourtsAvailable={item.liveCourtsAvailable}
+        liveOpenTotal={item.liveOpenTotal}
+        liveBusyCount={item.liveBusyCount}
+        liveUnknownCount={item.liveUnknownCount}
+        courtCount={item.courtCount}
+        status={item.status}
+        isDark={isDark}
+      />
     </Pressable>
   )
 }
@@ -181,6 +313,11 @@ type NearbyCourtsSheetProps = {
   courts: CourtWithDistance[]
   filter: ListFilter
   onFilterChange: (f: ListFilter) => void
+  /** Active city name, or null for all nearby cities. */
+  cityFilter: string | null
+  onCityFilterChange: (city: string | null) => void
+  /** Distinct cities from the nearby (5 mi) set for the picker. */
+  cityOptions: string[]
   onCourtPress: (id: string) => void
   selectedId: string | null
   isDark: boolean
@@ -201,6 +338,9 @@ export function NearbyCourtsSheet(props: NearbyCourtsSheetProps) {
     courts,
     filter,
     onFilterChange,
+    cityFilter,
+    onCityFilterChange,
+    cityOptions,
     onCourtPress,
     selectedId,
     isDark,
@@ -212,11 +352,24 @@ export function NearbyCourtsSheet(props: NearbyCourtsSheetProps) {
     listFindingCourts = false,
   } = props
   const insets = useSafeAreaInsets()
-  const collapsedPeekPx = useMemo(
-    () => Math.round(COLLAPSED_SHEET_PEEK_PX + insets.bottom),
+  const [cityPickerOpen, setCityPickerOpen] = useState(false)
+
+  const peekSnapPx = useMemo(
+    () => Math.round(PEEK_CONTENT_PX + insets.bottom),
     [insets.bottom],
   )
-  const snapPoints = useMemo(() => [collapsedPeekPx, '66%', '90%'], [collapsedPeekPx])
+  const snapPoints = useMemo(() => [peekSnapPx, EXPANDED_SNAP], [peekSnapPx])
+
+  const openCityPicker = useCallback(() => setCityPickerOpen(true), [])
+  const closeCityPicker = useCallback(() => setCityPickerOpen(false), [])
+
+  const selectCity = useCallback(
+    (city: string | null) => {
+      onCityFilterChange(city)
+      setCityPickerOpen(false)
+    },
+    [onCityFilterChange],
+  )
 
   const renderCourtItem = useCallback(
     ({ item }: { item: CourtWithDistance }) => (
@@ -235,7 +388,13 @@ export function NearbyCourtsSheet(props: NearbyCourtsSheetProps) {
   const ListHeader = useCallback(
     () => (
       <View>
-        <FilterPills filter={filter} onChange={onFilterChange} isDark={isDark} />
+        <FilterPills
+          filter={filter}
+          onChange={onFilterChange}
+          isDark={isDark}
+          cityFilter={cityFilter}
+          onCityPress={openCityPicker}
+        />
         {listFindingCourts ? (
           <View style={styles.findingCourtsRow}>
             <ActivityIndicator size="small" color={BRAND_GREEN} />
@@ -246,7 +405,7 @@ export function NearbyCourtsSheet(props: NearbyCourtsSheetProps) {
         ) : null}
       </View>
     ),
-    [filter, onFilterChange, isDark, listFindingCourts],
+    [filter, onFilterChange, isDark, cityFilter, openCityPicker, listFindingCourts],
   )
 
   const EmptyList = useCallback(() => {
@@ -269,48 +428,184 @@ export function NearbyCourtsSheet(props: NearbyCourtsSheetProps) {
     )
   }, [isDark, showNoCourtsWithin5MilesHint, showNoFavoritesYetHint])
 
+  const cityPicker = (
+    <Modal visible={cityPickerOpen} transparent animationType="fade" onRequestClose={closeCityPicker}>
+      <Pressable style={styles.cityPickerBackdrop} onPress={closeCityPicker}>
+        <Pressable
+          style={[
+            styles.cityPickerCard,
+            {
+              backgroundColor: isDark ? '#1C1C1E' : '#FFFFFF',
+              borderColor: isDark ? '#3F3F46' : '#E2E8F0',
+              paddingBottom: Math.max(insets.bottom, 12),
+            },
+          ]}
+          onPress={(e) => e.stopPropagation()}>
+          <Text style={[styles.cityPickerTitle, { color: isDark ? '#F8FAFC' : '#0F172A' }]}>Filter by city</Text>
+          <ScrollView style={styles.cityPickerScroll} keyboardShouldPersistTaps="handled">
+            <Pressable
+              onPress={() => selectCity(null)}
+              style={({ pressed }) => [
+                styles.cityPickerRow,
+                {
+                  backgroundColor: cityFilter == null ? (isDark ? 'rgba(29,158,117,0.18)' : '#ECFDF5') : 'transparent',
+                  opacity: pressed ? 0.85 : 1,
+                },
+              ]}>
+              <Text
+                style={[
+                  styles.cityPickerRowText,
+                  {
+                    color: cityFilter == null ? BRAND_GREEN : isDark ? '#E4E4E7' : '#334155',
+                    fontWeight: cityFilter == null ? '700' : '500',
+                  },
+                ]}>
+                All cities
+              </Text>
+              {cityFilter == null ? <MaterialIcons name="check" size={20} color={BRAND_GREEN} /> : null}
+            </Pressable>
+            {cityOptions.map((city) => {
+              const selected = cityFilter === city
+              return (
+                <Pressable
+                  key={city}
+                  onPress={() => selectCity(city)}
+                  style={({ pressed }) => [
+                    styles.cityPickerRow,
+                    {
+                      backgroundColor: selected ? (isDark ? 'rgba(29,158,117,0.18)' : '#ECFDF5') : 'transparent',
+                      opacity: pressed ? 0.85 : 1,
+                    },
+                  ]}>
+                  <Text
+                    numberOfLines={1}
+                    style={[
+                      styles.cityPickerRowText,
+                      {
+                        color: selected ? BRAND_GREEN : isDark ? '#E4E4E7' : '#334155',
+                        fontWeight: selected ? '700' : '500',
+                      },
+                    ]}>
+                    {city}
+                  </Text>
+                  {selected ? <MaterialIcons name="check" size={20} color={BRAND_GREEN} /> : null}
+                </Pressable>
+              )
+            })}
+            {cityOptions.length === 0 ? (
+              <Text style={[styles.cityPickerEmpty, { color: isDark ? '#A1A1AA' : '#64748B' }]}>
+                No cities in this area yet
+              </Text>
+            ) : null}
+          </ScrollView>
+        </Pressable>
+      </Pressable>
+    </Modal>
+  )
+
   if (Platform.OS === 'web') {
     return (
-      <View
-        style={[
-          styles.webSheet,
-          {
-            maxHeight: WEB_SHEET_MAX,
-            paddingBottom: insets.bottom + 8,
-            backgroundColor: isDark ? '#18181B' : '#FFFFFF',
-            borderColor: isDark ? '#3F3F46' : '#E2E8F0',
-          },
-        ]}>
-        <View style={[styles.handle, { backgroundColor: isDark ? '#52525B' : '#CBD5E1' }]} />
-        <FilterPills filter={filter} onChange={onFilterChange} isDark={isDark} />
-        {listFindingCourts ? (
-          <View style={styles.findingCourtsRow}>
-            <ActivityIndicator size="small" color={BRAND_GREEN} />
-            <Text style={[styles.findingCourtsText, { color: isDark ? '#94A3B8' : '#64748B' }]}>
-              Finding courts…
-            </Text>
-          </View>
-        ) : null}
-        {listLoading ? (
-          <FlatList
-            data={[...SHEET_SKELETON_KEYS]}
-            keyExtractor={(item) => item}
-            renderItem={renderSkeletonSheetItem}
-            contentContainerStyle={styles.listPad}
-            style={{ flex: 1 }}
-            nestedScrollEnabled
+      <>
+        <View
+          style={[
+            styles.webSheet,
+            {
+              maxHeight: WEB_SHEET_MAX,
+              paddingBottom: insets.bottom + 8,
+              backgroundColor: isDark ? '#18181B' : '#FFFFFF',
+              borderColor: isDark ? '#3F3F46' : '#E2E8F0',
+            },
+          ]}>
+          <View style={[styles.handle, { backgroundColor: isDark ? '#52525B' : '#CBD5E1' }]} />
+          <FilterPills
+            filter={filter}
+            onChange={onFilterChange}
+            isDark={isDark}
+            cityFilter={cityFilter}
+            onCityPress={openCityPicker}
           />
-        ) : (
-          <ContentFadeIn show style={{ flex: 1 }}>
+          {listFindingCourts ? (
+            <View style={styles.findingCourtsRow}>
+              <ActivityIndicator size="small" color={BRAND_GREEN} />
+              <Text style={[styles.findingCourtsText, { color: isDark ? '#94A3B8' : '#64748B' }]}>
+                Finding courts…
+              </Text>
+            </View>
+          ) : null}
+          {listLoading ? (
             <FlatList
-              data={courts}
-              extraData={filter}
-              keyExtractor={(item) => item.id}
-              renderItem={renderCourtItem}
-              ListEmptyComponent={EmptyList}
+              data={[...SHEET_SKELETON_KEYS]}
+              keyExtractor={(item) => item}
+              renderItem={renderSkeletonSheetItem}
               contentContainerStyle={styles.listPad}
               style={{ flex: 1 }}
               nestedScrollEnabled
+            />
+          ) : (
+            <ContentFadeIn show style={{ flex: 1 }}>
+              <FlatList
+                data={courts}
+                extraData={`${filter}:${cityFilter ?? ''}`}
+                keyExtractor={(item) => item.id}
+                renderItem={renderCourtItem}
+                ListEmptyComponent={EmptyList}
+                contentContainerStyle={styles.listPad}
+                style={{ flex: 1 }}
+                nestedScrollEnabled
+                keyboardShouldPersistTaps="handled"
+                keyboardDismissMode="on-drag"
+                onScrollBeginDrag={() => Keyboard.dismiss()}
+                onRefresh={onRefresh}
+                refreshing={refreshing}
+                tintColor="#1D9E75"
+                colors={['#1D9E75']}
+              />
+            </ContentFadeIn>
+          )}
+        </View>
+        {cityPicker}
+      </>
+    )
+  }
+
+  return (
+    <>
+      <BottomSheet
+        index={0}
+        snapPoints={snapPoints}
+        enablePanDownToClose={false}
+        enableOverDrag={false}
+        enableDynamicSizing={false}
+        // Let the sheet sit flush against the tab bar (avoid a visible gap).
+        bottomInset={0}
+        backgroundStyle={{
+          backgroundColor: isDark ? '#18181B' : '#FFFFFF',
+        }}
+        handleIndicatorStyle={{
+          backgroundColor: isDark ? '#52525B' : '#CBD5E1',
+          width: 40,
+        }}
+        style={styles.sheetRoot}>
+        {listLoading ? (
+          <BottomSheetFlatList
+            data={[...SHEET_SKELETON_KEYS]}
+            keyExtractor={(item) => item}
+            renderItem={renderSkeletonSheetItem}
+            ListHeaderComponent={ListHeader}
+            contentContainerStyle={[styles.listPad, { paddingBottom: 16 }]}
+            ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
+          />
+        ) : (
+          <ContentFadeIn show style={{ flex: 1 }}>
+            <BottomSheetFlatList
+              data={courts}
+              extraData={`${filter}:${cityFilter ?? ''}`}
+              keyExtractor={(item) => item.id}
+              renderItem={renderCourtItem}
+              ListHeaderComponent={ListHeader}
+              ListEmptyComponent={EmptyList}
+              contentContainerStyle={[styles.listPad, { paddingBottom: 16 }]}
+              ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
               keyboardShouldPersistTaps="handled"
               keyboardDismissMode="on-drag"
               onScrollBeginDrag={() => Keyboard.dismiss()}
@@ -321,56 +616,9 @@ export function NearbyCourtsSheet(props: NearbyCourtsSheetProps) {
             />
           </ContentFadeIn>
         )}
-      </View>
-    )
-  }
-
-  return (
-    <BottomSheet
-      index={0}
-      snapPoints={snapPoints}
-      enablePanDownToClose={false}
-      // Let the sheet sit flush against the tab bar (avoid a visible gap).
-      bottomInset={0}
-      backgroundStyle={{
-        backgroundColor: isDark ? '#18181B' : '#FFFFFF',
-      }}
-      handleIndicatorStyle={{
-        backgroundColor: isDark ? '#52525B' : '#CBD5E1',
-        width: 40,
-      }}
-      style={styles.sheetRoot}>
-      {listLoading ? (
-        <BottomSheetFlatList
-          data={[...SHEET_SKELETON_KEYS]}
-          keyExtractor={(item) => item}
-          renderItem={renderSkeletonSheetItem}
-          ListHeaderComponent={ListHeader}
-          contentContainerStyle={[styles.listPad, { paddingBottom: 16 }]}
-          ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
-        />
-      ) : (
-        <ContentFadeIn show style={{ flex: 1 }}>
-          <BottomSheetFlatList
-            data={courts}
-            extraData={filter}
-            keyExtractor={(item) => item.id}
-            renderItem={renderCourtItem}
-            ListHeaderComponent={ListHeader}
-            ListEmptyComponent={EmptyList}
-            contentContainerStyle={[styles.listPad, { paddingBottom: 16 }]}
-            ItemSeparatorComponent={() => <View style={{ height: 10 }} />}
-            keyboardShouldPersistTaps="handled"
-            keyboardDismissMode="on-drag"
-            onScrollBeginDrag={() => Keyboard.dismiss()}
-            onRefresh={onRefresh}
-            refreshing={refreshing}
-            tintColor="#1D9E75"
-            colors={['#1D9E75']}
-          />
-        </ContentFadeIn>
-      )}
-    </BottomSheet>
+      </BottomSheet>
+      {cityPicker}
+    </>
   )
 }
 
@@ -384,7 +632,8 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   sheetRoot: {
-    flex: 1,
+    // Avoid flex:1 here — it can trap the sheet at an oversized height and fight snap points.
+    zIndex: 20,
   },
   webSheet: {
     position: 'absolute',
@@ -516,5 +765,44 @@ const styles = StyleSheet.create({
   findingCourtsText: {
     fontSize: 13,
     fontWeight: '500',
+  },
+  cityPickerBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(15, 23, 42, 0.45)',
+    justifyContent: 'flex-end',
+  },
+  cityPickerCard: {
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    maxHeight: '55%',
+    paddingTop: 14,
+  },
+  cityPickerTitle: {
+    fontSize: 17,
+    fontWeight: '700',
+    paddingHorizontal: 18,
+    marginBottom: 8,
+  },
+  cityPickerScroll: {
+    paddingHorizontal: 8,
+  },
+  cityPickerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+    paddingVertical: 14,
+    paddingHorizontal: 12,
+    borderRadius: 12,
+  },
+  cityPickerRowText: {
+    flex: 1,
+    fontSize: 16,
+  },
+  cityPickerEmpty: {
+    textAlign: 'center',
+    paddingVertical: 24,
+    fontSize: 14,
   },
 })

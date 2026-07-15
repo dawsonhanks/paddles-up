@@ -23,15 +23,25 @@ export function courtsAvailabilityHeadlineColors(
   const total = Math.max(1, Math.floor(totalCourts))
   const clamped = Math.min(Math.max(0, Math.floor(available)), total)
   const st = courtsAvailableToPinStatus(clamped, total)
-  const dot = STATUS_PIN_COLOR[st]
+  return courtStatusHeadlineColors(st, isDark)
+}
+
+/** Headline text/dot colors for a resolved CourtStatus (three-state zone rollup). */
+export function courtStatusHeadlineColors(
+  status: CourtStatus,
+  isDark: boolean,
+): { dot: string; text: string } {
+  const dot = STATUS_PIN_COLOR[status]
   if (!isDark) {
-    if (st === 'full') return { dot, text: '#B91C1C' }
-    if (st === 'open') return { dot, text: '#166534' }
-    return { dot, text: '#B45309' }
+    if (status === 'full') return { dot, text: '#B91C1C' }
+    if (status === 'open') return { dot, text: '#166534' }
+    if (status === 'busy') return { dot, text: '#B45309' }
+    return { dot, text: '#64748B' }
   }
-  if (st === 'full') return { dot, text: '#FECACA' }
-  if (st === 'open') return { dot, text: '#86EFAC' }
-  return { dot, text: '#FCD34D' }
+  if (status === 'full') return { dot, text: '#FECACA' }
+  if (status === 'open') return { dot, text: '#86EFAC' }
+  if (status === 'busy') return { dot, text: '#FCD34D' }
+  return { dot, text: '#94A3B8' }
 }
 
 export type CourtsAvailabilityInsert = {

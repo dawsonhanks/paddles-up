@@ -10,10 +10,24 @@ export type Court = {
   liveCheckins?: number
   /** Latest unexpired venue-wide availability report, when present. */
   liveCourtsAvailable?: number | null
+  /**
+   * Denominator for "X of Y open" when derived from zones (sensor + zone reports).
+   * Falls back to `courtCount` when null.
+   */
+  liveOpenTotal?: number | null
+  /** Confirmed-busy zone count when derived from zones. */
+  liveBusyCount?: number | null
+  /** Zones with no sensor and no live report. */
+  liveUnknownCount?: number | null
   /** Number of courts at the venue (for lists / pins). */
   courtCount: number
   /** Human-readable venue type, e.g. Indoor / Outdoor. */
   indoorOutdoor: string | null
+  /**
+   * City parsed from address (`street, City, ST ZIP`).
+   * Null when address is missing or not in that standard form.
+   */
+  city: string | null
 }
 
 export type CourtAmenities = {
@@ -61,6 +75,21 @@ function pickString(row: Record<string, unknown>, keys: string[]): string | null
     if (typeof v === 'string' && v.trim()) return v.trim()
   }
   return null
+}
+
+/**
+ * Derive city from a US-style `street, City, ST ZIP` address.
+ * Requires at least 3 comma-separated parts; returns the second-to-last segment.
+ */
+export function parseCityFromAddress(address: string | null | undefined): string | null {
+  if (address == null) return null
+  const parts = address
+    .split(',')
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0)
+  if (parts.length < 3) return null
+  const city = parts[parts.length - 2]
+  return city.length > 0 ? city : null
 }
 
 function pickNumber(row: Record<string, unknown>, keys: string[]): number | null {
@@ -214,6 +243,8 @@ function parseCourtBase(row: Record<string, unknown>): Court | null {
   const pos = coordinatesFromRow(row)
   if (!pos) return null
 
+  const address = pickString(row, ['address', 'full_address', 'street_address', 'formatted_address'])
+
   return {
     id: id || `${pos.lat},${pos.lon}`,
     name,
@@ -222,6 +253,7 @@ function parseCourtBase(row: Record<string, unknown>): Court | null {
     status: statusFromRow(row),
     courtCount: courtCountFromRow(row),
     indoorOutdoor: indoorOutdoorLabel(row),
+    city: parseCityFromAddress(address),
   }
 }
 
