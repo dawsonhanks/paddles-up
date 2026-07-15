@@ -51,6 +51,7 @@ import {
   insertZoneReport,
   countOpenZones,
   resolveZoneStatus,
+  venueSummaryHeadline,
   venueSummaryToCourtStatus,
   type CourtZoneRow,
 } from '@/lib/zones'
@@ -1164,19 +1165,25 @@ export default function CourtDetailScreen() {
 
   const zoneSensorsByZone = useMemo(() => courtSensorsByZone(courtSensors), [courtSensors])
 
-  /** Headline "X of Y courts open" — confirmed-open count; color uses three-state venue rollup. */
+  /** Headline "X of Y courts open" — unknown zones are not counted as open. */
   const courtsOpenHeadline = useMemo(() => {
     if (courtZones.length === 0) {
+      const total = Math.max(1, court?.courtCount ?? 1)
       return {
         open: 0,
         busy: 0,
-        unknown: Math.max(1, court?.courtCount ?? 1),
-        total: Math.max(1, court?.courtCount ?? 1),
+        unknown: total,
+        total,
         status: 'unknown' as const,
+        label: 'No live court data',
       }
     }
     const summary = countOpenZones(courtZones, zoneSensorsByZone, zoneReportsByZone)
-    return { ...summary, status: venueSummaryToCourtStatus(summary) }
+    return {
+      ...summary,
+      status: venueSummaryToCourtStatus(summary),
+      label: venueSummaryHeadline(summary),
+    }
   }, [court?.courtCount, courtZones, zoneReportsByZone, zoneSensorsByZone])
 
   if (court === undefined) {
@@ -1317,7 +1324,7 @@ export default function CourtDetailScreen() {
                 color: courtStatusHeadlineColors(courtsOpenHeadline.status, isDark).text,
               },
             ]}>
-            {`${courtsOpenHeadline.open} of ${courtsOpenHeadline.total} courts open`}
+            {courtsOpenHeadline.label}
           </Text>
         </View>
 

@@ -13,13 +13,14 @@ export type ZoneLatestReport = {
   reported_at: string
 }
 
-/** Per-zone: sensor wins; else live report; else literally no data. */
+/** Per-zone: sensor wins; else live report; else unknown (no data ≠ open). */
 export type ZoneStatus = 'open' | 'busy' | 'unknown'
 
 /** Venue rollup for map pin + list badge (same rules as court-detail rows). */
 export type VenueZoneSummary = {
   open: number
   busy: number
+  /** Zones with neither sensor nor live report. */
   unknown: number
   total: number
 }
@@ -32,15 +33,15 @@ const COURT_ID_IN_CHUNK = 80
 
 /**
  * Same Open/Busy/Unknown rule as court-detail zone rows:
- * sensor wins when present; otherwise latest zone report; else unknown.
+ * sensor wins when present; otherwise latest zone report; no data → unknown.
  */
 export function resolveZoneStatus(
   sensor: { is_active: boolean } | null | undefined,
   report: { status: 'open' | 'busy' } | null | undefined,
 ): ZoneStatus {
   if (sensor != null) return sensor.is_active ? 'busy' : 'open'
-  if (report?.status === 'open') return 'open'
   if (report?.status === 'busy') return 'busy'
+  if (report?.status === 'open') return 'open'
   return 'unknown'
 }
 
@@ -61,8 +62,8 @@ export function summarizeVenueZones(
   let unknown = 0
   for (const z of zones) {
     const st = resolveZoneStatus(sensorsByZone.get(z.id), reportsByZone.get(z.id))
-    if (st === 'open') open += 1
-    else if (st === 'busy') busy += 1
+    if (st === 'busy') busy += 1
+    else if (st === 'open') open += 1
     else unknown += 1
   }
   return { open, busy, unknown, total: zones.length }
@@ -78,28 +79,41 @@ export function countOpenZones(
 }
 
 /**
- * Facility pin / badge color from zone rollup:
- * - green/open: every zone confirmed open (no busy, no unknown)
- * - red/full: every zone confirmed busy (no unknown)
- * - orange/busy: any unknown, or a mix of open + busy
+ * Facility pin / badge color from zone rollup (same function for map + list):
+ * - green/open: every zone confirmed open
+ * - red/full: every zone confirmed busy
+ * - orange/busy: any confirmed-busy mix that is not all-busy (open+busy, busy+unknown, …)
+ * - grey/unknown: no confirmed busy, but unknowns present (all unknown, or open+unknown)
  */
 export function venueSummaryToCourtStatus(summary: VenueZoneSummary): CourtStatus {
-  const { open, busy, unknown, total } = summary
+  const { busy, unknown, total } = summary
   if (total <= 0) return 'unknown'
-  if (unknown === 0 && busy === 0 && open > 0) return 'open'
-  if (unknown === 0 && busy === total) return 'full'
+  if (busy === 0 && unknown === 0) return 'open'
+  if (busy === total) return 'full'
+  if (busy === 0) return 'unknown'
   return 'busy'
 }
 
-/**
- * List-badge copy:
- * - All zones confirmed → "X of Y open" (matches green/red/orange mix-of-known)
- * - Any unknown → "Partial" (orange) so we never show a red-looking "0 of N" next to an orange pin
- */
+/** List-badge / headline copy aligned with venueSummaryToCourtStatus. */
 export function venueSummaryBadgeLabel(summary: VenueZoneSummary): string {
   if (summary.total <= 0) return 'No report'
-  if (summary.unknown > 0) return 'Partial'
+  const st = venueSummaryToCourtStatus(summary)
+  if (st === 'unknown') {
+    if (summary.unknown === summary.total) return 'No data'
+    return 'Partial'
+  }
   return `${summary.open} of ${summary.total} open`
+}
+
+/** Detail-screen headline — same rollup rules as the list badge. */
+export function venueSummaryHeadline(summary: VenueZoneSummary): string {
+  if (summary.total <= 0) return 'No report'
+  const st = venueSummaryToCourtStatus(summary)
+  if (st === 'unknown') {
+    if (summary.unknown === summary.total) return 'No live court data'
+    return `${summary.open} of ${summary.total} courts open · partial`
+  }
+  return `${summary.open} of ${summary.total} courts open`
 }
 
 export async function fetchZonesForCourt(courtId: string): Promise<CourtZoneRow[]> {
@@ -167,7 +181,7 @@ export async function insertZoneReport(input: {
 
 /**
  * Batch zone summaries for map/list: sensors + live zone_reports per zone,
- * matching court-detail open / busy / unknown.
+ * matching court-detail open / busy / unknown (unreported → unknown).
  */
 export async function fetchVenueOpenCountsByCourtIds(
   courtIds: string[],

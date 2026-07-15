@@ -17,7 +17,7 @@ export type Court = {
   liveOpenTotal?: number | null
   /** Confirmed-busy zone count when derived from zones. */
   liveBusyCount?: number | null
-  /** Zones with no sensor and no live report. */
+  /** Zones with neither sensor nor live report when derived from zones. */
   liveUnknownCount?: number | null
   /** Number of courts at the venue (for lists / pins). */
   courtCount: number
@@ -77,9 +77,71 @@ function pickString(row: Record<string, unknown>, keys: string[]): string | null
   return null
 }
 
+/** Full US state names — used when addresses write "City, Colorado, 80027" instead of "City, CO 80027". */
+const US_STATE_NAMES = new Set(
+  [
+    'alabama',
+    'alaska',
+    'arizona',
+    'arkansas',
+    'california',
+    'colorado',
+    'connecticut',
+    'delaware',
+    'florida',
+    'georgia',
+    'hawaii',
+    'idaho',
+    'illinois',
+    'indiana',
+    'iowa',
+    'kansas',
+    'kentucky',
+    'louisiana',
+    'maine',
+    'maryland',
+    'massachusetts',
+    'michigan',
+    'minnesota',
+    'mississippi',
+    'missouri',
+    'montana',
+    'nebraska',
+    'nevada',
+    'new hampshire',
+    'new jersey',
+    'new mexico',
+    'new york',
+    'north carolina',
+    'north dakota',
+    'ohio',
+    'oklahoma',
+    'oregon',
+    'pennsylvania',
+    'rhode island',
+    'south carolina',
+    'south dakota',
+    'tennessee',
+    'texas',
+    'utah',
+    'vermont',
+    'virginia',
+    'washington',
+    'west virginia',
+    'wisconsin',
+    'wyoming',
+  ].map((s) => s.toLowerCase()),
+)
+
+function looksLikeZipOnly(segment: string): boolean {
+  return /^\d{5}(-\d{4})?$/.test(segment.trim())
+}
+
 /**
- * Derive city from a US-style `street, City, ST ZIP` address.
- * Requires at least 3 comma-separated parts; returns the second-to-last segment.
+ * Derive city from a US-style address.
+ * Standard: `street, City, ST ZIP` → second-to-last segment.
+ * Overcorrection: `…, City, Statename, ZIP` → if second-to-last is a full state name and last is ZIP-only,
+ * use the segment before the state (keeps `Washington, UT 84780` intact — last is not ZIP-only).
  */
 export function parseCityFromAddress(address: string | null | undefined): string | null {
   if (address == null) return null
@@ -88,7 +150,19 @@ export function parseCityFromAddress(address: string | null | undefined): string
     .map((p) => p.trim())
     .filter((p) => p.length > 0)
   if (parts.length < 3) return null
-  const city = parts[parts.length - 2]
+
+  let cityIdx = parts.length - 2
+  const candidate = parts[cityIdx]
+  const last = parts[parts.length - 1]
+  if (
+    cityIdx > 0 &&
+    US_STATE_NAMES.has(candidate.toLowerCase()) &&
+    looksLikeZipOnly(last)
+  ) {
+    cityIdx -= 1
+  }
+
+  const city = parts[cityIdx]
   return city.length > 0 ? city : null
 }
 

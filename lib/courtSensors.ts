@@ -113,7 +113,7 @@ export function resolveCourtPinStatus(
 }
 
 /**
- * Prefer zone-derived three-state summary; else crowdsourced availability_reports; else unknown.
+ * Prefer zone-derived open/busy/unknown rollup; else availability_reports; else unknown.
  */
 export function resolveVenuePinStatus(params: {
   venueOpen: VenueZoneSummary | undefined

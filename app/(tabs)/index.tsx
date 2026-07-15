@@ -1,8 +1,7 @@
 import {
   MapTabGestureRoot,
   MAP_NEARBY_SHEET_COLLAPSED_BASE_PX,
-  matchesCityFilter,
-  matchesListFilter,
+  matchesSheetFilters,
   NearbyCourtsSheet,
   distinctCitiesFromCourts,
   type CourtWithDistance,
@@ -885,10 +884,15 @@ export default function MapScreen() {
     return courtsWithDistance.filter((c) => c.name.toLowerCase().includes(q))
   }, [courtsWithDistance, searchQuery])
 
-  /** Map pins — not limited to the 5 mi list radius. */
+  const passesSheetFilters = useCallback(
+    (c: Court) => matchesSheetFilters(c, listFilter, cityFilter, favoriteIdSet),
+    [listFilter, cityFilter, favoriteIdSet],
+  )
+
+  /** Map pins — same list/city/search filters as the sheet; not limited to the 5 mi list radius. */
   const filteredCourts = useMemo(
-    () => searchFilteredCourts.filter((c) => matchesListFilter(c, listFilter, favoriteIdSet)),
-    [searchFilteredCourts, listFilter, favoriteIdSet]
+    () => searchFilteredCourts.filter(passesSheetFilters),
+    [searchFilteredCourts, passesSheetFilters],
   )
 
   const mergeMapRevealedIds = useCallback((ids: string[], opts?: { fadeIn?: boolean }) => {
@@ -1028,6 +1032,45 @@ export default function MapScreen() {
     return { lat: FALLBACK_MAP_LAT, lon: FALLBACK_MAP_LON }
   }, [listDistanceMode, listMapCenter, userLat, userLon])
 
+  /** Favorites / Open / Outdoor / Indoor / City / search — expand pin reveal so list rows get pins. */
+  const sheetFiltersOrSearchActive =
+    listFilter !== 'all' || cityFilter != null || searchQuery.trim().length > 0
+
+  /**
+   * While filters are active, reveal filtered matches that are already revealed, within 2mi of GPS,
+   * in the current viewport, or within the list's 5mi radius — without moving the camera.
+   */
+  useEffect(() => {
+    if (!sheetFiltersOrSearchActive) return
+    const region = mapRegionRef.current
+    const { lat: anchorLat, lon: anchorLon } = listDistanceAnchor
+    const ids = filteredCourts
+      .filter((c) => {
+        if (mapRevealedIdsRef.current.has(c.id)) return true
+        if (isWithinNearbyListRadius(distanceKm(anchorLat, anchorLon, c.latitude, c.longitude))) {
+          return true
+        }
+        if (userLat != null && userLon != null) {
+          if (
+            isWithinMapInitialPinRadius(distanceKm(userLat, userLon, c.latitude, c.longitude))
+          ) {
+            return true
+          }
+        }
+        if (region != null && courtsInMapRegion([c], region).length > 0) return true
+        return false
+      })
+      .map((c) => c.id)
+    mergeMapRevealedIds(ids)
+  }, [
+    sheetFiltersOrSearchActive,
+    filteredCourts,
+    listDistanceAnchor,
+    userLat,
+    userLon,
+    mergeMapRevealedIds,
+  ])
+
   const courtsWithDistanceForList: CourtWithDistance[] = useMemo(() => {
     if (courts.length === 0) return []
     const { lat, lon } = listDistanceAnchor
@@ -1054,11 +1097,8 @@ export default function MapScreen() {
   }, [courtsWithin5Miles, searchQuery])
 
   const filteredListCourts = useMemo(
-    () =>
-      searchFilteredListCourts.filter(
-        (c) => matchesListFilter(c, listFilter, favoriteIdSet) && matchesCityFilter(c, cityFilter),
-      ),
-    [searchFilteredListCourts, listFilter, favoriteIdSet, cityFilter],
+    () => searchFilteredListCourts.filter(passesSheetFilters),
+    [searchFilteredListCourts, passesSheetFilters],
   )
 
   const nearbyCityOptions = useMemo(

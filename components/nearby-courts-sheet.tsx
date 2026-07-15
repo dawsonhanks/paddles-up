@@ -52,11 +52,23 @@ export function matchesListFilter(court: Court, filter: ListFilter, favoriteIds?
   return true
 }
 
-/** City filter — courts with no parseable city always pass (stay visible). */
+/**
+ * City filter — when a specific city is selected, only courts with that city match.
+ * Null-city courts are visible only when no city filter is active (`city === null`).
+ */
 export function matchesCityFilter(court: Court, city: string | null): boolean {
   if (city == null) return true
-  if (court.city == null) return true
   return court.city === city
+}
+
+/** List + city filters composed — shared by nearby sheet and map pins. */
+export function matchesSheetFilters(
+  court: Court,
+  filter: ListFilter,
+  city: string | null,
+  favoriteIds?: ReadonlySet<string>,
+): boolean {
+  return matchesListFilter(court, filter, favoriteIds) && matchesCityFilter(court, city)
 }
 
 /** Distinct cities for the picker — null/unparseable cities excluded. Sorted A→Z. */
@@ -88,7 +100,7 @@ function CourtsOpenBadge({
   liveCourtsAvailable: number | null | undefined
   liveOpenTotal: number | null | undefined
   liveBusyCount: number | null | undefined
-  liveUnknownCount: number | null | undefined
+  liveUnknownCount?: number | null | undefined
   courtCount: number
   status: CourtStatus
   isDark: boolean
@@ -99,17 +111,21 @@ function CourtsOpenBadge({
     liveCourtsAvailable != null &&
     Number.isFinite(liveCourtsAvailable)
 
+  // Zone-derived open/busy/unknown → badge color + label from the shared rollup.
   if (hasZoneSummary) {
-    const summary: VenueZoneSummary = {
-      open: Math.max(0, Math.floor(liveCourtsAvailable!)),
-      busy: Math.max(0, Math.floor(liveBusyCount ?? 0)),
-      unknown: Math.max(0, Math.floor(liveUnknownCount ?? 0)),
-      total: Math.max(1, liveOpenTotal!),
+    const total = Math.max(1, liveOpenTotal!)
+    let busy = Math.max(0, Math.floor(liveBusyCount ?? 0))
+    let unknown = Math.max(0, Math.floor(liveUnknownCount ?? 0))
+    let open = Math.max(0, Math.floor(liveCourtsAvailable!))
+    if (open + busy + unknown !== total) {
+      // Prefer busy + unknown as reported; remainder is confirmed open.
+      const remainder = Math.max(0, total - busy - unknown)
+      open = remainder
+      if (busy + unknown > total) {
+        unknown = Math.max(0, total - busy)
+      }
     }
-    // Normalize unknown if busy/open were partial
-    if (summary.open + summary.busy + summary.unknown !== summary.total) {
-      summary.unknown = Math.max(0, summary.total - summary.open - summary.busy)
-    }
+    const summary: VenueZoneSummary = { open, busy, unknown, total }
     const st = venueSummaryToCourtStatus(summary)
     const label = venueSummaryBadgeLabel(summary)
     return (
