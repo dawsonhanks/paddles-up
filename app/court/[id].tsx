@@ -42,6 +42,7 @@ import {
   applyCourtSensorRealtimeChange,
   courtSensorsByZone,
   fetchCourtSensorsForCourt,
+  formatLastMotionAgo,
   resolveFacilityCourtStatus,
   type CourtSensorRow,
 } from '@/lib/courtSensors'
@@ -285,6 +286,7 @@ export default function CourtDetailScreen() {
     data: CachedCourtWeather | null
   }>({ loading: false, error: null, data: null })
   const [courtSensors, setCourtSensors] = useState<CourtSensorRow[]>([])
+  const [expandedMotionZoneIds, setExpandedMotionZoneIds] = useState<Record<string, boolean>>({})
 
   const notifySuccessAlertTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -1060,7 +1062,7 @@ export default function CourtDetailScreen() {
     }
   }, [isCourtScreenFocused, courtId, isOffline, loadCheckins, loadZonesAndReports, loadCourtSensors])
 
-  useEffect(() => { setFavoriteReady(false); setIsFavorite(false); setCourtSensors([]) }, [courtId])
+  useEffect(() => { setFavoriteReady(false); setIsFavorite(false); setCourtSensors([]); setExpandedMotionZoneIds({}) }, [courtId])
 
   useEffect(() => {
     if (!courtId || court == null) return
@@ -1388,6 +1390,9 @@ export default function CourtDetailScreen() {
               const zoneDivider = isDark ? 'rgba(255,255,255,0.08)' : 'rgba(15,23,42,0.08)'
               const isLast = zoneIndex === courtZones.length - 1
               const zname = z?.zone_name ?? 'Zone'
+              const lastMotionAt = zoneSensor?.last_motion_at ?? null
+              const showMotionRow = hasSensor && lastMotionAt != null
+              const motionExpanded = showMotionRow && expandedMotionZoneIds[zid] === true
               return (
                 <View
                   key={zid || `zone-${zoneIndex}`}
@@ -1395,11 +1400,39 @@ export default function CourtDetailScreen() {
                     styles.zoneRowFlat,
                     { borderBottomColor: zoneDivider, borderBottomWidth: isLast ? 0 : StyleSheet.hairlineWidth },
                   ]}>
-                  <View style={styles.zoneNameRow}>
-                    <Text style={[styles.zoneNameFlat, { color: isDark ? '#F8FAFC' : '#0F172A' }]} numberOfLines={1}>
-                      {zname}
-                    </Text>
-                    {hasSensor ? <SensorTag isDark={isDark} mutedColor={muted} /> : null}
+                  <View style={styles.zoneNameBlock}>
+                    <View style={styles.zoneNameRow}>
+                      <Text style={[styles.zoneNameFlat, { color: isDark ? '#F8FAFC' : '#0F172A' }]} numberOfLines={1}>
+                        {zname}
+                      </Text>
+                      {hasSensor ? <SensorTag isDark={isDark} mutedColor={muted} /> : null}
+                    </View>
+                    {showMotionRow && lastMotionAt ? (
+                      <Pressable
+                        onPress={() =>
+                          setExpandedMotionZoneIds((prev) => ({
+                            ...prev,
+                            [zid]: !prev[zid],
+                          }))
+                        }
+                        accessibilityRole="button"
+                        accessibilityLabel={
+                          motionExpanded
+                            ? `Sensor last motion details for ${zname}`
+                            : `Show sensor last motion details for ${zname}`
+                        }
+                        style={({ pressed }) => [styles.zoneMotionRow, { opacity: pressed ? 0.75 : 1 }]}>
+                        <Text style={[styles.zoneMotionCollapsed, { color: muted }]} numberOfLines={motionExpanded ? 3 : 1}>
+                          {`📡 Sensor · Last motion detected ${formatLastMotionAgo(lastMotionAt)}`}
+                          {motionExpanded
+                            ? `\n${new Date(lastMotionAt).toLocaleString(undefined, {
+                                dateStyle: 'medium',
+                                timeStyle: 'short',
+                              })}`
+                            : ''}
+                        </Text>
+                      </Pressable>
+                    ) : null}
                   </View>
                   <View style={styles.zoneTogglePair}>
                     <Pressable
@@ -1949,14 +1982,20 @@ const styles = StyleSheet.create({
     paddingVertical: 16,
     paddingHorizontal: 0,
   },
-  zoneNameRow: {
+  zoneNameBlock: {
     flex: 1,
+    minWidth: 0,
+    gap: 4,
+  },
+  zoneNameRow: {
     minWidth: 0,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
   },
   zoneNameFlat: { flex: 1, minWidth: 0, fontSize: 16, fontWeight: '700', letterSpacing: -0.2 },
+  zoneMotionRow: { alignSelf: 'stretch', paddingRight: 4 },
+  zoneMotionCollapsed: { fontSize: 12, fontWeight: '600', lineHeight: 16 },
   dashProxRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 10, paddingVertical: 12, marginBottom: 4 },
   dashProxText: { flex: 1, lineHeight: 18 },
   directionsFab: {

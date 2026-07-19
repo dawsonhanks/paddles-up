@@ -14,6 +14,7 @@ export type CourtSensorRow = {
   is_active: boolean
   last_synced_at: string | null
   last_event_at: string | null
+  last_motion_at: string | null
 }
 
 export type CourtSensorSummary = {
@@ -34,7 +35,24 @@ function rowFromRecord(raw: Record<string, unknown>): CourtSensorRow | null {
     is_active: raw.is_active === true,
     last_synced_at: raw.last_synced_at != null ? String(raw.last_synced_at) : null,
     last_event_at: raw.last_event_at != null ? String(raw.last_event_at) : null,
+    last_motion_at: raw.last_motion_at != null ? String(raw.last_motion_at) : null,
   }
+}
+
+/** Relative time for last_motion_at ("just now", "2 min ago", "1 hr ago"). */
+export function formatLastMotionAgo(dateStr: string): string {
+  const diffMs = Date.now() - new Date(dateStr).getTime()
+  if (!Number.isFinite(diffMs) || diffMs < 0) return 'just now'
+  const mins = Math.floor(diffMs / 60000)
+  if (mins < 1) return 'just now'
+  if (mins === 1) return '1 min ago'
+  if (mins < 60) return `${mins} min ago`
+  const hrs = Math.floor(mins / 60)
+  if (hrs === 1) return '1 hr ago'
+  if (hrs < 24) return `${hrs} hr ago`
+  const days = Math.floor(hrs / 24)
+  if (days === 1) return '1 day ago'
+  return `${days} days ago`
 }
 
 /** Parse a Realtime `payload.new` / `payload.old` row into a CourtSensorRow. */
@@ -66,6 +84,7 @@ export function applyCourtSensorRealtimeChange(
     existing.is_active === nextRow.is_active &&
     existing.last_synced_at === nextRow.last_synced_at &&
     existing.last_event_at === nextRow.last_event_at &&
+    existing.last_motion_at === nextRow.last_motion_at &&
     existing.zone_id === nextRow.zone_id
   ) {
     return prev
@@ -136,7 +155,7 @@ export async function fetchCourtSensorsForCourt(courtId: string): Promise<CourtS
 
   const { data, error } = await supabase
     .from('court_sensors')
-    .select('id, court_id, zone_id, is_active, last_synced_at, last_event_at')
+    .select('id, court_id, zone_id, is_active, last_synced_at, last_event_at, last_motion_at')
     .eq('court_id', id)
 
   if (error) {
