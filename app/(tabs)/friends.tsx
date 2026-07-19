@@ -8,9 +8,15 @@ import { useColorScheme } from '@/hooks/use-color-scheme'
 import { USERNAME_AVAILABILITY_DEBOUNCE_MS } from '@/hooks/use-username-availability'
 import { ensureFavoritesUser } from '@/lib/favorites'
 import {
+  acceptFriendRequest,
+  cancelFriendRequest,
+  declineFriendRequest,
   fetchFriendsWithStats,
+  fetchPendingFriendRequests,
   searchPlayersFriendshipAware,
+  sendFriendRequest,
   type FriendPlayerWithRecord,
+  type FriendRequestItem,
   type FriendSearchResult,
 } from '@/lib/friends'
 import { userFriendlyFromUnknown } from '@/lib/errors'
@@ -35,8 +41,6 @@ import {
 } from 'react-native'
 import { SafeAreaView } from 'react-native-safe-area-context'
 
-import { supabase } from '@/supabase'
-
 import type { ContentReportType } from '@/lib/contentReports'
 
 export default function FriendsScreen() {
@@ -51,6 +55,8 @@ export default function FriendsScreen() {
   const muted = isDark ? '#94A3B8' : '#64748B'
 
   const [friends, setFriends] = useState<FriendPlayerWithRecord[]>([])
+  const [incoming, setIncoming] = useState<FriendRequestItem[]>([])
+  const [outgoing, setOutgoing] = useState<FriendRequestItem[]>([])
   const [loading, setLoading] = useState(true)
   const [filter, setFilter] = useState('')
 
@@ -59,6 +65,7 @@ export default function FriendsScreen() {
   const [searchResults, setSearchResults] = useState<FriendSearchResult[]>([])
   const [searching, setSearching] = useState(false)
   const [addingId, setAddingId] = useState<string | null>(null)
+  const [actingRequestId, setActingRequestId] = useState<string | null>(null)
   const [friendsBanner, setFriendsBanner] = useState<string | null>(null)
   const [myUserId, setMyUserId] = useState<string | null>(null)
   const [reportTarget, setReportTarget] = useState<{ type: ContentReportType; id: string } | null>(null)
@@ -86,12 +93,21 @@ export default function FriendsScreen() {
     if (deadRef.current) return
     setLoading(true)
     try {
-      const { friends: list, error } = await fetchFriendsWithStats()
+      const [friendsRes, requestsRes] = await Promise.all([
+        fetchFriendsWithStats(),
+        fetchPendingFriendRequests(),
+      ])
       if (cancelledRef?.current || deadRef.current) return
-      if (error) {
-        setFriendsBanner(userFriendlyFromUnknown(error))
+      if (friendsRes.error) {
+        setFriendsBanner(userFriendlyFromUnknown(friendsRes.error))
       } else {
-        setFriends(list)
+        setFriends(friendsRes.friends)
+      }
+      if (requestsRes.error) {
+        setFriendsBanner(userFriendlyFromUnknown(requestsRes.error))
+      } else {
+        setIncoming(requestsRes.incoming)
+        setOutgoing(requestsRes.outgoing)
       }
     } finally {
       if (!cancelledRef?.current && !deadRef.current) setLoading(false)
@@ -139,6 +155,22 @@ export default function FriendsScreen() {
       return name.includes(q) || un.includes(q)
     })
   }, [friends, filter])
+
+  const filterRequests = useCallback(
+    (items: FriendRequestItem[]) => {
+      const q = filter.trim().toLowerCase()
+      if (!q) return items
+      return items.filter((item) => {
+        const name = (item.player.display_name ?? '').toLowerCase()
+        const un = (item.player.username ?? '').toLowerCase()
+        return name.includes(q) || un.includes(q)
+      })
+    },
+    [filter],
+  )
+
+  const filteredIncoming = useMemo(() => filterRequests(incoming), [filterRequests, incoming])
+  const filteredOutgoing = useMemo(() => filterRequests(outgoing), [filterRequests, outgoing])
 
   async function searchPlayers() {
     if (!searchQuery.trim()) return
@@ -191,24 +223,89 @@ export default function FriendsScreen() {
   async function addFriend(friendUserId: string) {
     setAddingId(friendUserId)
     try {
-      const gate = await ensureFavoritesUser()
+      const result = await sendFriendRequest(friendUserId)
       if (deadRef.current) return
-      if ('error' in gate) {
-        setFriendsBanner(userFriendlyFromUnknown(gate.error))
+      if (result.error) {
+        setFriendsBanner(userFriendlyFromUnknown(result.error))
         return
       }
-      const { error } = await supabase.from('friendships').insert({ user_id: gate.userId, friend_id: friendUserId })
-      if (deadRef.current) return
-      if (error) {
-        setFriendsBanner(userFriendlyFromUnknown(error.message))
-        return
+      if (result.autoAccepted) {
+        setSearchResults((prev) =>
+          prev.map((p) =>
+            p.user_id === friendUserId ? { ...p, linkStatus: 'friends' as const, requestId: undefined } : p,
+          ),
+        )
+      } else {
+        setSearchResults((prev) =>
+          prev.map((p) =>
+            p.user_id === friendUserId
+              ? { ...p, linkStatus: 'outgoing_pending' as const, requestId: result.requestId }
+              : p,
+          ),
+        )
       }
-      setSearchResults((prev) =>
-        prev.map((p) => (p.user_id === friendUserId ? { ...p, linkStatus: 'friends' as const } : p)),
-      )
       await loadFriends()
     } finally {
       if (!deadRef.current) setAddingId(null)
+    }
+  }
+
+  async function onAcceptRequest(requestId: string, fromSearchUserId?: string) {
+    setActingRequestId(requestId)
+    try {
+      const { error } = await acceptFriendRequest(requestId)
+      if (deadRef.current) return
+      if (error) {
+        setFriendsBanner(userFriendlyFromUnknown(error))
+        return
+      }
+      if (fromSearchUserId) {
+        setSearchResults((prev) =>
+          prev.map((p) =>
+            p.user_id === fromSearchUserId ? { ...p, linkStatus: 'friends' as const, requestId: undefined } : p,
+          ),
+        )
+      }
+      await loadFriends()
+    } finally {
+      if (!deadRef.current) setActingRequestId(null)
+    }
+  }
+
+  async function onDeclineRequest(requestId: string) {
+    setActingRequestId(requestId)
+    try {
+      const { error } = await declineFriendRequest(requestId)
+      if (deadRef.current) return
+      if (error) {
+        setFriendsBanner(userFriendlyFromUnknown(error))
+        return
+      }
+      await loadFriends()
+    } finally {
+      if (!deadRef.current) setActingRequestId(null)
+    }
+  }
+
+  async function onCancelRequest(requestId: string, toUserId?: string) {
+    setActingRequestId(requestId)
+    try {
+      const { error } = await cancelFriendRequest(requestId)
+      if (deadRef.current) return
+      if (error) {
+        setFriendsBanner(userFriendlyFromUnknown(error))
+        return
+      }
+      if (toUserId) {
+        setSearchResults((prev) =>
+          prev.map((p) =>
+            p.user_id === toUserId ? { ...p, linkStatus: 'none' as const, requestId: undefined } : p,
+          ),
+        )
+      }
+      await loadFriends()
+    } finally {
+      if (!deadRef.current) setActingRequestId(null)
     }
   }
 
@@ -247,8 +344,135 @@ export default function FriendsScreen() {
     )
   }
 
+  function renderIncomingCard(item: FriendRequestItem) {
+    const busy = actingRequestId === item.id
+    return (
+      <View
+        key={item.id}
+        style={[styles.requestCard, { backgroundColor: cardBg, borderColor: '#F59E0B' }]}>
+        <View style={styles.requestTop}>
+          <FriendAvatar friend={item.player} size={48} />
+          <View style={styles.friendMid}>
+            <Text style={[styles.friendDisplay, { color: theme.text }]} numberOfLines={1}>
+              {item.player.display_name ?? item.player.username ?? 'Player'}
+            </Text>
+            {item.player.username ? (
+              <Text style={[styles.friendUsername, { color: muted }]} numberOfLines={1}>
+                @{item.player.username}
+              </Text>
+            ) : null}
+            <Text style={[styles.pendingHint, { color: '#D97706' }]}>Wants to be friends</Text>
+          </View>
+        </View>
+        <View style={styles.requestActions}>
+          <TouchableOpacity
+            style={[styles.acceptBtn, busy && { opacity: 0.6 }]}
+            onPress={() => onAcceptRequest(item.id)}
+            disabled={busy}
+            activeOpacity={0.8}>
+            {busy ? <ActivityIndicator color="#fff" size="small" /> : <Text style={styles.acceptBtnText}>Accept</Text>}
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.declineBtn, { borderColor: cardBorder }, busy && { opacity: 0.6 }]}
+            onPress={() => onDeclineRequest(item.id)}
+            disabled={busy}
+            activeOpacity={0.8}>
+            <Text style={[styles.declineBtnText, { color: theme.text }]}>Decline</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    )
+  }
+
+  function renderOutgoingCard(item: FriendRequestItem) {
+    const busy = actingRequestId === item.id
+    return (
+      <View
+        key={item.id}
+        style={[styles.requestCard, { backgroundColor: cardBg, borderColor: cardBorder }]}>
+        <View style={styles.requestTop}>
+          <FriendAvatar friend={item.player} size={48} />
+          <View style={styles.friendMid}>
+            <Text style={[styles.friendDisplay, { color: theme.text }]} numberOfLines={1}>
+              {item.player.display_name ?? item.player.username ?? 'Player'}
+            </Text>
+            {item.player.username ? (
+              <Text style={[styles.friendUsername, { color: muted }]} numberOfLines={1}>
+                @{item.player.username}
+              </Text>
+            ) : null}
+            <Text style={[styles.pendingHint, { color: muted }]}>Pending</Text>
+          </View>
+          <View style={styles.pendingBadge}>
+            <Text style={styles.pendingBadgeText}>Pending</Text>
+          </View>
+        </View>
+        <View style={styles.requestActions}>
+          <TouchableOpacity
+            style={[styles.declineBtn, { borderColor: cardBorder, flex: 1 }, busy && { opacity: 0.6 }]}
+            onPress={() => onCancelRequest(item.id)}
+            disabled={busy}
+            activeOpacity={0.8}>
+            {busy ? (
+              <ActivityIndicator color={theme.text} size="small" />
+            ) : (
+              <Text style={[styles.declineBtnText, { color: theme.text }]}>Cancel</Text>
+            )}
+          </TouchableOpacity>
+        </View>
+      </View>
+    )
+  }
+
   function renderSearchRow(player: FriendSearchResult, i: number) {
     const isLast = i === searchResults.length - 1
+    const busyAdd = addingId === player?.user_id
+    const busyReq = player.requestId != null && actingRequestId === player.requestId
+
+    let action
+    if (player?.linkStatus === 'friends') {
+      action = (
+        <View style={styles.friendedBadge}>
+          <MaterialIcons name="check" size={16} color="#1D9E75" />
+          <Text style={styles.friendedText}>Friends</Text>
+        </View>
+      )
+    } else if (player?.linkStatus === 'outgoing_pending') {
+      action = (
+        <TouchableOpacity
+          style={[styles.declineBtn, { borderColor: cardBorder, paddingHorizontal: 12, minWidth: 88 }, busyReq && { opacity: 0.6 }]}
+          onPress={() => player.requestId && onCancelRequest(player.requestId, player.user_id)}
+          disabled={busyReq || !player.requestId}
+          activeOpacity={0.8}>
+          {busyReq ? (
+            <ActivityIndicator color={theme.text} size="small" />
+          ) : (
+            <Text style={[styles.declineBtnText, { color: theme.text }]}>Cancel</Text>
+          )}
+        </TouchableOpacity>
+      )
+    } else if (player?.linkStatus === 'they_added_you') {
+      action = (
+        <TouchableOpacity
+          style={[styles.addBtn, busyReq && { opacity: 0.6 }]}
+          onPress={() => player.requestId && onAcceptRequest(player.requestId, player.user_id)}
+          disabled={busyReq || !player.requestId}
+          activeOpacity={0.8}>
+          {busyReq ? <ActivityIndicator color="#fff" size="small" /> : <Text style={styles.addBtnTxt}>Accept</Text>}
+        </TouchableOpacity>
+      )
+    } else {
+      action = (
+        <TouchableOpacity
+          style={[styles.addBtn, busyAdd && { opacity: 0.6 }]}
+          onPress={() => addFriend(player?.user_id ?? '')}
+          disabled={busyAdd}
+          activeOpacity={0.8}>
+          {busyAdd ? <ActivityIndicator color="#fff" size="small" /> : <Text style={styles.addBtnTxt}>Add Friend</Text>}
+        </TouchableOpacity>
+      )
+    }
+
     return (
       <View
         key={player?.user_id ?? String(i)}
@@ -276,29 +500,38 @@ export default function FriendsScreen() {
             {player?.linkStatus === 'they_added_you' ? (
               <Text style={[styles.pendingHint, { color: '#D97706' }]}>Added you</Text>
             ) : null}
+            {player?.linkStatus === 'outgoing_pending' ? (
+              <Text style={[styles.pendingHint, { color: muted }]}>Request sent</Text>
+            ) : null}
           </View>
         </Pressable>
-        {player?.linkStatus === 'friends' ? (
-          <View style={styles.friendedBadge}>
-            <MaterialIcons name="check" size={16} color="#1D9E75" />
-            <Text style={styles.friendedText}>Friends</Text>
-          </View>
-        ) : (
-          <TouchableOpacity
-            style={[styles.addBtn, addingId === player?.user_id && { opacity: 0.6 }]}
-            onPress={() => addFriend(player?.user_id ?? '')}
-            disabled={addingId === player?.user_id}
-            activeOpacity={0.8}>
-            {addingId === player.user_id ? (
-              <ActivityIndicator color="#fff" size="small" />
-            ) : (
-              <Text style={styles.addBtnTxt}>Add Friend</Text>
-            )}
-          </TouchableOpacity>
-        )}
+        {action}
       </View>
     )
   }
+
+  const listHeader = (
+    <>
+      {filteredIncoming.length > 0 ? (
+        <View style={styles.section}>
+          <Text style={[styles.sectionTitle, { color: theme.text }]}>Requests</Text>
+          {filteredIncoming.map(renderIncomingCard)}
+        </View>
+      ) : null}
+      {filteredOutgoing.length > 0 ? (
+        <View style={styles.section}>
+          <Text style={[styles.sectionTitle, { color: theme.text }]}>Sent</Text>
+          {filteredOutgoing.map(renderOutgoingCard)}
+        </View>
+      ) : null}
+      {filteredFriends.length > 0 ? (
+        <Text style={[styles.sectionTitle, { color: theme.text }]}>Friends</Text>
+      ) : null}
+    </>
+  )
+
+  const showEmpty =
+    filteredFriends.length === 0 && filteredIncoming.length === 0 && filteredOutgoing.length === 0
 
   return (
     <SafeAreaView style={[styles.root, { backgroundColor: theme.background }]} edges={['bottom']}>
@@ -324,9 +557,9 @@ export default function FriendsScreen() {
             <SkeletonCard key={k} isDark={isDark} />
           ))}
         </View>
-      ) : filteredFriends.length === 0 ? (
+      ) : showEmpty ? (
         <Text style={[styles.empty, { color: muted }]}>
-          {friends.length === 0
+          {friends.length === 0 && incoming.length === 0 && outgoing.length === 0
             ? 'No friends yet. Tap search to find players by @username.'
             : 'No friends match your search.'}
         </Text>
@@ -336,6 +569,7 @@ export default function FriendsScreen() {
             data={filteredFriends}
             keyExtractor={(item) => item?.user_id ?? ''}
             renderItem={renderFriendCard}
+            ListHeaderComponent={listHeader}
             contentContainerStyle={styles.listContent}
             keyboardShouldPersistTaps="handled"
           />
@@ -421,6 +655,8 @@ const styles = StyleSheet.create({
   },
   searchBarInput: { flex: 1, paddingVertical: 11, fontSize: 16 },
   listContent: { paddingHorizontal: 16, paddingBottom: 24 },
+  section: { marginBottom: 8 },
+  sectionTitle: { fontSize: 17, fontWeight: '700', marginBottom: 10, marginTop: 4 },
   friendCard: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -430,6 +666,42 @@ const styles = StyleSheet.create({
     marginBottom: 10,
     gap: 12,
   },
+  requestCard: {
+    borderRadius: 14,
+    borderWidth: 1,
+    padding: 14,
+    marginBottom: 10,
+  },
+  requestTop: { flexDirection: 'row', alignItems: 'flex-start', gap: 12 },
+  requestActions: { flexDirection: 'row', gap: 10, marginTop: 14 },
+  acceptBtn: {
+    flex: 1,
+    backgroundColor: '#1D9E75',
+    paddingVertical: 12,
+    borderRadius: 10,
+    alignItems: 'center',
+    minHeight: 44,
+    justifyContent: 'center',
+  },
+  acceptBtnText: { color: '#fff', fontWeight: '700', fontSize: 14 },
+  declineBtn: {
+    flex: 1,
+    paddingVertical: 12,
+    borderRadius: 10,
+    alignItems: 'center',
+    borderWidth: 0.5,
+    minHeight: 44,
+    justifyContent: 'center',
+  },
+  declineBtnText: { fontWeight: '600', fontSize: 14 },
+  pendingBadge: {
+    backgroundColor: '#FEF3C7',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 20,
+    alignSelf: 'flex-start',
+  },
+  pendingBadgeText: { fontSize: 12, fontWeight: '600', color: '#92400E' },
   friendMid: { flex: 1, minWidth: 0 },
   friendTrail: { alignItems: 'flex-end', gap: 6 },
   friendDisplay: { fontSize: 16, fontWeight: '700' },
@@ -490,6 +762,8 @@ const styles = StyleSheet.create({
     borderRadius: 10,
     minWidth: 96,
     alignItems: 'center',
+    justifyContent: 'center',
+    minHeight: 36,
   },
   addBtnTxt: { color: '#fff', fontWeight: '700', fontSize: 13 },
 })
