@@ -209,16 +209,29 @@ Deno.serve(async (req) => {
           ? new Date(stateChangedAt).toISOString()
           : now
 
+        // Advance last_motion_at on every poll while motion is actively detected.
+        // Leave it unchanged when state is 'normal' (do not null it out).
+        const sensorUpdate: {
+          is_active: boolean
+          last_event_at: string | null
+          last_synced_at: string
+          raw_last_state: YoLinkStateResponse
+          last_motion_at?: string
+        } = {
+          is_active: isActive,
+          last_event_at: stateChangedAt != null
+            ? new Date(stateChangedAt).toISOString()
+            : null,
+          last_synced_at: now,
+          raw_last_state: rawState,
+        }
+        if (state === 'alert') {
+          sensorUpdate.last_motion_at = now
+        }
+
         const { error: updateErr } = await supabase
           .from('court_sensors')
-          .update({
-            is_active: isActive,
-            last_event_at: stateChangedAt != null
-              ? new Date(stateChangedAt).toISOString()
-              : null,
-            last_synced_at: now,
-            raw_last_state: rawState,
-          })
+          .update(sensorUpdate)
           .eq('id', sensor.id)
 
         if (updateErr) {
