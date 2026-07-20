@@ -1423,7 +1423,7 @@ export default function CourtDetailScreen() {
                         }
                         style={({ pressed }) => [styles.zoneMotionRow, { opacity: pressed ? 0.75 : 1 }]}>
                         <Text style={[styles.zoneMotionCollapsed, { color: muted }]} numberOfLines={motionExpanded ? 3 : 1}>
-                          {`📡 Sensor · Last motion detected ${formatLastMotionAgo(lastMotionAt)}`}
+                          {`Last motion detected ${formatLastMotionAgo(lastMotionAt)}`}
                           {motionExpanded
                             ? `\n${new Date(lastMotionAt).toLocaleString(undefined, {
                                 dateStyle: 'medium',
