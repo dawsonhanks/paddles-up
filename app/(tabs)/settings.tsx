@@ -27,15 +27,17 @@ import { useFocusEffect } from '@react-navigation/native'
 import * as ImagePicker from 'expo-image-picker'
 import * as Linking from 'expo-linking'
 import * as WebBrowser from 'expo-web-browser'
-import { useRouter } from 'expo-router'
-import { useCallback, useState } from 'react'
+import { useNavigation, useRouter } from 'expo-router'
+import { useCallback, useLayoutEffect, useMemo, useState } from 'react'
 import AsyncStorage from '@react-native-async-storage/async-storage'
 import {
   ActivityIndicator,
   Alert,
+  FlatList,
   Image,
   Keyboard,
   Modal,
+  Pressable,
   RefreshControl,
   ScrollView,
   Share,
@@ -49,6 +51,15 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context'
 
 import { supabase } from '@/supabase'
+import {
+  fetchLastViewedAt,
+  fetchNotifications,
+  formatRelativeTime,
+  isNotificationUnread,
+  markNotificationsViewed,
+  unreadCount as countUnreadNotifications,
+  type AppNotification,
+} from '@/lib/notifications'
 
 /** Matches App Store / Play metadata and GitHub Pages (`index.html` at repo root). */
 const PRIVACY_POLICY_URL = 'https://dawsonhanks.github.io/paddles-up-privacy/'
@@ -90,6 +101,7 @@ export default function ProfileScreen() {
   const theme = Colors[colorScheme ?? 'light']
   const isDark = colorScheme === 'dark'
   const router = useRouter()
+  const navigation = useNavigation()
 
   const cardBg = isDark ? '#1C1C1E' : '#FFFFFF'
   const cardBorder = isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.08)'
@@ -133,10 +145,71 @@ export default function ProfileScreen() {
   const [deleteAccountLoading, setDeleteAccountLoading] = useState(false)
   const [signInEmail, setSignInEmail] = useState<string | null>(null)
 
+  const [notifications, setNotifications] = useState<AppNotification[]>([])
+  const [lastViewedAt, setLastViewedAt] = useState<string | null>(null)
+  /** Snapshot used to tint unread rows; set when opening the sheet, before mark-viewed. */
+  const [unreadBaselineAt, setUnreadBaselineAt] = useState<string | null>(null)
+  const [showNotifications, setShowNotifications] = useState(false)
+  const [notificationsLoading, setNotificationsLoading] = useState(false)
+
   const loadSignInEmail = useCallback(async () => {
     const { data } = await supabase.auth.getUser()
     setSignInEmail(data.user?.email?.trim() || null)
   }, [])
+
+  const loadNotifications = useCallback(async (cancelledRef?: { current: boolean }) => {
+    const gate = await ensureFavoritesUser()
+    if (cancelledRef?.current) return
+    if ('error' in gate) return
+    setNotificationsLoading(true)
+    try {
+      const [listRes, viewedRes] = await Promise.all([
+        fetchNotifications(gate.userId),
+        fetchLastViewedAt(gate.userId),
+      ])
+      if (cancelledRef?.current) return
+      if (!listRes.error) setNotifications(listRes.notifications)
+      if (!viewedRes.error) setLastViewedAt(viewedRes.lastViewedAt)
+    } finally {
+      if (!cancelledRef?.current) setNotificationsLoading(false)
+    }
+  }, [])
+
+  const badgeCount = useMemo(
+    () => countUnreadNotifications(notifications, lastViewedAt),
+    [notifications, lastViewedAt],
+  )
+
+  const openNotifications = useCallback(() => {
+    // Capture unread baseline before clearing so rows stay visually unread in this open.
+    setUnreadBaselineAt(lastViewedAt)
+    setShowNotifications(true)
+    setLastViewedAt(new Date().toISOString())
+    void markNotificationsViewed()
+  }, [lastViewedAt])
+
+  useLayoutEffect(() => {
+    navigation.setOptions({
+      headerRight: () => (
+        <TouchableOpacity
+          onPress={openNotifications}
+          style={styles.bellBtn}
+          hitSlop={12}
+          accessibilityLabel={
+            badgeCount > 0
+              ? `Notifications, ${badgeCount > 9 ? '9 or more' : badgeCount} unread`
+              : 'Notifications'
+          }>
+          <MaterialIcons name="notifications" size={24} color={theme.tint} />
+          {badgeCount > 0 ? (
+            <View style={styles.bellBadge}>
+              <Text style={styles.bellBadgeText}>{badgeCount > 9 ? '9+' : String(badgeCount)}</Text>
+            </View>
+          ) : null}
+        </TouchableOpacity>
+      ),
+    })
+  }, [navigation, openNotifications, badgeCount, theme.tint])
 
   const loadProfile = useCallback(async (cancelledRef?: { current: boolean }) => {
     setLoading(true)
@@ -179,10 +252,11 @@ export default function ProfileScreen() {
       const cancelled = { current: false }
       void loadSignInEmail()
       void loadProfile(cancelled)
+      void loadNotifications(cancelled)
       return () => {
         cancelled.current = true
       }
-    }, [loadProfile, loadSignInEmail]),
+    }, [loadProfile, loadSignInEmail, loadNotifications]),
   )
 
   async function signOut() {
@@ -193,11 +267,25 @@ export default function ProfileScreen() {
   const onRefresh = useCallback(async () => {
     setRefreshing(true)
     try {
-      await loadProfile()
+      await Promise.all([loadProfile(), loadNotifications()])
     } finally {
       setRefreshing(false)
     }
-  }, [loadProfile])
+  }, [loadProfile, loadNotifications])
+
+  function onNotificationPress(item: AppNotification) {
+    setShowNotifications(false)
+    const t = item.type
+    if (t === 'friend_request_received' || t === 'friend_request_accepted') {
+      router.push('/(tabs)/friends')
+      return
+    }
+    if (t === 'challenge_invite_received' || t === 'challenge_completed') {
+      router.push('/(tabs)/record')
+      return
+    }
+    router.push('/(tabs)/friends')
+  }
 
   async function pickImage() {
     if (avatarUploading) return
@@ -501,7 +589,7 @@ export default function ProfileScreen() {
   }
 
   return (
-    <SafeAreaView style={[styles.root, { backgroundColor: theme.background }]} edges={['top']}>
+    <SafeAreaView style={[styles.root, { backgroundColor: theme.background }]} edges={['bottom']}>
       <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
         <View style={styles.root}>
       <ScrollView
@@ -594,10 +682,24 @@ export default function ProfileScreen() {
                   {profile?.username ? (
                     <TouchableOpacity
                       style={styles.shareBtn}
-                      onPress={() => Share.share({
-                        message: `Check out my Paddles Up profile: https://paddlesup.app/${profile.username}`,
-                        url: `https://paddlesup.app/${profile.username}`,
-                      })}
+                      onPress={() => {
+                        const handle = profile.username!.trim()
+                        // Expo Go → exp://…/--/profile/… ; native build → pickleballapp://profile/…
+                        const url = Linking.createURL(`profile/${encodeURIComponent(handle)}`)
+                        void Share.share({
+                          message: `Check out my Paddles Up profile:\n${url}`,
+                          url,
+                        }).catch(() => {
+                          // If the share sheet fails, still allow opening the profile in-app.
+                          router.push(`/profile/${encodeURIComponent(handle)}`)
+                        })
+                      }}
+                      onLongPress={() => {
+                        // Long-press opens the public profile in-app (best Expo Go test).
+                        const handle = profile.username!.trim()
+                        router.push(`/profile/${encodeURIComponent(handle)}`)
+                      }}
+                      delayLongPress={350}
                       activeOpacity={0.8}>
                       <MaterialIcons name="share" size={16} color="#0EA5E9" />
                       <Text style={styles.shareBtnText}>Share Profile</Text>
@@ -977,6 +1079,69 @@ export default function ProfileScreen() {
       </Modal>
       </View>
       </TouchableWithoutFeedback>
+      {/* Notifications sheet */}
+      <Modal
+        visible={showNotifications}
+        animationType="slide"
+        presentationStyle="pageSheet"
+        onRequestClose={() => setShowNotifications(false)}>
+        <SafeAreaView style={[styles.modal, { backgroundColor: theme.background }]} edges={['top']}>
+          <View style={styles.modalHeader}>
+            <Text style={[styles.modalTitle, { color: theme.text }]}>Notifications</Text>
+            <TouchableOpacity onPress={() => setShowNotifications(false)} hitSlop={12}>
+              <MaterialIcons name="close" size={24} color={muted} />
+            </TouchableOpacity>
+          </View>
+          {notificationsLoading && notifications.length === 0 ? (
+            <View style={styles.notifEmpty}>
+              <ActivityIndicator color="#1D9E75" />
+            </View>
+          ) : (
+            <FlatList
+              data={notifications}
+              keyExtractor={(item) => item.id}
+              contentContainerStyle={
+                notifications.length === 0 ? styles.notifEmptyList : styles.notifList
+              }
+              ListEmptyComponent={
+                <Text style={[styles.notifEmptyText, { color: muted }]}>No notifications yet</Text>
+              }
+              renderItem={({ item }) => {
+                const unread = isNotificationUnread(item.created_at, unreadBaselineAt)
+                return (
+                  <Pressable
+                    onPress={() => onNotificationPress(item)}
+                    style={({ pressed }) => [
+                      styles.notifRow,
+                      {
+                        backgroundColor: unread
+                          ? isDark
+                            ? 'rgba(29, 158, 117, 0.12)'
+                            : 'rgba(29, 158, 117, 0.08)'
+                          : 'transparent',
+                        borderBottomColor: cardBorder,
+                        opacity: pressed ? 0.85 : 1,
+                      },
+                    ]}>
+                    <View style={styles.notifRowMain}>
+                      {unread ? <View style={styles.notifUnreadDot} /> : <View style={styles.notifDotSpacer} />}
+                      <View style={styles.notifTextCol}>
+                        <Text style={[styles.notifMessage, { color: theme.text }]} numberOfLines={3}>
+                          {item.message}
+                        </Text>
+                        <Text style={[styles.notifTime, { color: muted }]}>
+                          {formatRelativeTime(item.created_at)}
+                        </Text>
+                      </View>
+                      <MaterialIcons name="chevron-right" size={20} color={muted} />
+                    </View>
+                  </Pressable>
+                )
+              }}
+            />
+          )}
+        </SafeAreaView>
+      </Modal>
     </SafeAreaView>
   )
 }
@@ -984,6 +1149,40 @@ export default function ProfileScreen() {
 const styles = StyleSheet.create({
   root: { flex: 1 },
   container: { padding: 24 },
+  bellBtn: { marginRight: 8, padding: 6, position: 'relative' },
+  bellBadge: {
+    position: 'absolute',
+    top: 2,
+    right: 2,
+    minWidth: 16,
+    height: 16,
+    borderRadius: 8,
+    backgroundColor: '#E24B4A',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 3,
+  },
+  bellBadgeText: { color: '#fff', fontSize: 10, fontWeight: '800' },
+  notifList: { paddingBottom: 28 },
+  notifEmptyList: { flexGrow: 1, justifyContent: 'center', paddingHorizontal: 24 },
+  notifEmpty: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+  notifEmptyText: { textAlign: 'center', fontSize: 15, lineHeight: 22 },
+  notifRow: {
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    paddingVertical: 14,
+    paddingHorizontal: 16,
+  },
+  notifRowMain: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  notifUnreadDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#1D9E75',
+  },
+  notifDotSpacer: { width: 8, height: 8 },
+  notifTextCol: { flex: 1, minWidth: 0, gap: 4 },
+  notifMessage: { fontSize: 15, fontWeight: '600', lineHeight: 20 },
+  notifTime: { fontSize: 12, fontWeight: '500' },
   profileSection: { alignItems: 'center', marginBottom: 24 },
   avatarWrap: { position: 'relative', marginBottom: 16 },
   avatar: { width: 90, height: 90, borderRadius: 45 },

@@ -242,6 +242,7 @@ export default function TabLayout() {
           options={{
             title: 'Profile',
             tabBarLabel: 'Profile',
+            headerShown: true,
             tabBarIcon: ({ color }) => <IconSymbol size={28} name="person.fill" color={color} />,
             tabBarBadge: unreadCount > 0 ? (unreadCount > 99 ? '99+' : unreadCount) : undefined,
           }}

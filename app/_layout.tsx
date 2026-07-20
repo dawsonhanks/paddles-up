@@ -5,9 +5,11 @@ import { PersistentOfflineBanner } from '@/components/persistent-offline-banner'
 import { NetworkStatusProvider } from '@/contexts/network-status-context'
 import { Colors } from '@/constants/theme'
 import { useColorScheme } from '@/hooks/use-color-scheme'
+import { establishSessionFromAuthUrl } from '@/lib/auth'
 import { isSupabaseConfigured, supabase } from '@/supabase'
 import Constants from 'expo-constants'
 import * as Device from 'expo-device'
+import * as Linking from 'expo-linking'
 import * as Notifications from 'expo-notifications'
 import { router, Stack } from 'expo-router'
 import { StatusBar } from 'expo-status-bar'
@@ -120,6 +122,50 @@ export default function RootLayout() {
     }
   }, [])
 
+  // Password recovery deep links: exchange tokens/code, then open the reset screen.
+  useEffect(() => {
+    let handling = false
+
+    async function handleAuthUrl(url: string | null) {
+      if (!url || handling) return
+      const looksLikeAuthRedirect =
+        url.includes('reset-password') ||
+        url.includes('type=recovery') ||
+        url.includes('access_token=') ||
+        url.includes('code=')
+      if (!looksLikeAuthRedirect) return
+
+      handling = true
+      try {
+        const result = await establishSessionFromAuthUrl(url)
+        if (result.ok || url.includes('reset-password')) {
+          router.replace('/reset-password')
+        }
+      } finally {
+        handling = false
+      }
+    }
+
+    void Linking.getInitialURL().then((url) => {
+      void handleAuthUrl(url)
+    })
+
+    const linkSub = Linking.addEventListener('url', ({ url }) => {
+      void handleAuthUrl(url)
+    })
+
+    const { data: authSub } = supabase.auth.onAuthStateChange((event) => {
+      if (event === 'PASSWORD_RECOVERY') {
+        router.replace('/reset-password')
+      }
+    })
+
+    return () => {
+      linkSub.remove()
+      authSub.subscription.unsubscribe()
+    }
+  }, [])
+
   useEffect(() => {
     if (!isNativePlatform) return
 
@@ -174,12 +220,14 @@ export default function RootLayout() {
                   <Stack.Screen name="index" />
                   <Stack.Screen name="onboarding" />
                   <Stack.Screen name="auth" />
+                  <Stack.Screen name="reset-password" options={{ headerShown: false }} />
                   <Stack.Screen name="(tabs)" />
                   <Stack.Screen name="court/[id]" options={{ headerShown: false }} />
                   <Stack.Screen name="court/reviews/[id]" options={{ headerShown: false }} />
                   <Stack.Screen name="messages/index" options={{ headerShown: false }} />
                   <Stack.Screen name="messages/[id]" options={{ headerShown: false }} />
                   <Stack.Screen name="friends/[id]" options={{ headerShown: false }} />
+                  <Stack.Screen name="profile/[username]" options={{ headerShown: false }} />
                   <Stack.Screen name="blocked-players" options={{ headerShown: false }} />
                   <Stack.Screen name="match/[id]" options={{ headerShown: false }} />
                   <Stack.Screen name="play/skill-filter" options={{ headerShown: false, presentation: 'modal' }} />

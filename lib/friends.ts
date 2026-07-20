@@ -14,7 +14,17 @@ export type FriendPlayer = {
 export type FriendPlayerWithRecord = FriendPlayer & { wins: number; losses: number }
 
 export type FriendSearchResult = FriendPlayer & {
-  linkStatus: 'none' | 'friends' | 'they_added_you'
+  linkStatus: 'none' | 'friends' | 'outgoing_pending' | 'they_added_you'
+  /** Present when linkStatus is outgoing_pending or they_added_you */
+  requestId?: string
+}
+
+export type FriendRequestItem = {
+  id: string
+  from_user: string
+  to_user: string
+  created_at: string
+  player: FriendPlayer
 }
 
 function aggregateWinsLosses(rows: { user_id: string; result: string }[] | null) {
@@ -26,6 +36,16 @@ function aggregateWinsLosses(rows: { user_id: string; result: string }[] | null)
     byUser.set(r.user_id, cur)
   }
   return byUser
+}
+
+async function loadPlayersByUserIds(ids: string[]): Promise<{ players: FriendPlayer[]; error?: string }> {
+  if (ids.length === 0) return { players: [] }
+  const { data, error } = await supabase
+    .from('players')
+    .select('user_id, display_name, username, avatar_url, skill_rating')
+    .in('user_id', ids)
+  if (error) return { players: [], error: error.message }
+  return { players: (data as FriendPlayer[]) ?? [] }
 }
 
 /** Friends of the current user with win/loss aggregates. */
@@ -100,6 +120,199 @@ export async function addFriendshipIfAbsent(friendUserId: string): Promise<{ err
   const { error } = await supabase.from('friendships').insert({ user_id: gate.userId, friend_id: friendUserId })
   if (error) return { error: error.message }
   return {}
+}
+
+export async function fetchPendingFriendRequests(): Promise<{
+  incoming: FriendRequestItem[]
+  outgoing: FriendRequestItem[]
+  error?: string
+}> {
+  const gate = await ensureFavoritesUser()
+  if ('error' in gate) return { incoming: [], outgoing: [], error: gate.error }
+  const myId = gate.userId
+
+  const { data: rows, error } = await supabase
+    .from('friend_requests')
+    .select('id, from_user, to_user, created_at')
+    .eq('status', 'pending')
+    .or(`from_user.eq.${myId},to_user.eq.${myId}`)
+    .order('created_at', { ascending: false })
+
+  if (error) return { incoming: [], outgoing: [], error: error.message }
+
+  const list = rows ?? []
+  if (list.length === 0) return { incoming: [], outgoing: [] }
+
+  const otherIds = list.map((r) => (r.from_user === myId ? r.to_user : r.from_user))
+  const { players, error: pErr } = await loadPlayersByUserIds(otherIds)
+  if (pErr) return { incoming: [], outgoing: [], error: pErr }
+
+  const byId = new Map(players.map((p) => [p.user_id, p]))
+  const blocked = new Set(await fetchBlockedUserIds())
+
+  const incoming: FriendRequestItem[] = []
+  const outgoing: FriendRequestItem[] = []
+
+  for (const r of list) {
+    const otherId = r.from_user === myId ? r.to_user : r.from_user
+    if (blocked.has(otherId)) continue
+    const player = byId.get(otherId) ?? {
+      user_id: otherId,
+      display_name: null,
+      username: null,
+      avatar_url: null,
+    }
+    const item: FriendRequestItem = {
+      id: r.id,
+      from_user: r.from_user,
+      to_user: r.to_user,
+      created_at: r.created_at,
+      player,
+    }
+    if (r.to_user === myId) incoming.push(item)
+    else outgoing.push(item)
+  }
+
+  return { incoming, outgoing }
+}
+
+/**
+ * Accept a pending request: insert mutual friendships (A↔B), then delete the request.
+ * Reciprocal insert relies on friendships_insert_reciprocal_on_accept while the row is still pending.
+ */
+export async function acceptFriendRequest(requestId: string): Promise<{ error?: string }> {
+  const gate = await ensureFavoritesUser()
+  if ('error' in gate) return { error: gate.error }
+  const myId = gate.userId
+
+  const { data: req, error: fetchErr } = await supabase
+    .from('friend_requests')
+    .select('id, from_user, to_user, status')
+    .eq('id', requestId)
+    .maybeSingle()
+
+  if (fetchErr) return { error: fetchErr.message }
+  if (!req || req.status !== 'pending') return { error: 'Request not found' }
+  if (req.to_user !== myId) return { error: 'Only the recipient can accept this request' }
+
+  const fromUser = req.from_user as string
+
+  const { data: existingMine } = await supabase
+    .from('friendships')
+    .select('id')
+    .eq('user_id', myId)
+    .eq('friend_id', fromUser)
+    .maybeSingle()
+
+  if (!existingMine) {
+    const { error: insMine } = await supabase.from('friendships').insert({ user_id: myId, friend_id: fromUser })
+    if (insMine) return { error: insMine.message }
+  }
+
+  // Reciprocal row: RLS blocks SELECT on their side, so insert and treat unique as already present.
+  // Must happen while the friend_requests row is still pending (reciprocal insert policy).
+  const { error: insTheirs } = await supabase
+    .from('friendships')
+    .insert({ user_id: fromUser, friend_id: myId })
+  if (insTheirs && insTheirs.code !== '23505') return { error: insTheirs.message }
+
+  const { error: delErr } = await supabase.from('friend_requests').delete().eq('id', requestId)
+  if (delErr) return { error: delErr.message }
+  return {}
+}
+
+export async function declineFriendRequest(requestId: string): Promise<{ error?: string }> {
+  const gate = await ensureFavoritesUser()
+  if ('error' in gate) return { error: gate.error }
+
+  const { data: req, error: fetchErr } = await supabase
+    .from('friend_requests')
+    .select('id, to_user, status')
+    .eq('id', requestId)
+    .maybeSingle()
+
+  if (fetchErr) return { error: fetchErr.message }
+  if (!req || req.status !== 'pending') return { error: 'Request not found' }
+  if (req.to_user !== gate.userId) return { error: 'Only the recipient can decline this request' }
+
+  const { error } = await supabase.from('friend_requests').delete().eq('id', requestId)
+  if (error) return { error: error.message }
+  return {}
+}
+
+export async function cancelFriendRequest(requestId: string): Promise<{ error?: string }> {
+  const gate = await ensureFavoritesUser()
+  if ('error' in gate) return { error: gate.error }
+
+  const { data: req, error: fetchErr } = await supabase
+    .from('friend_requests')
+    .select('id, from_user, status')
+    .eq('id', requestId)
+    .maybeSingle()
+
+  if (fetchErr) return { error: fetchErr.message }
+  if (!req || req.status !== 'pending') return { error: 'Request not found' }
+  if (req.from_user !== gate.userId) return { error: 'Only the sender can cancel this request' }
+
+  const { error } = await supabase.from('friend_requests').delete().eq('id', requestId)
+  if (error) return { error: error.message }
+  return {}
+}
+
+/**
+ * Send a friend request. If the other user already has a pending request to you, auto-accept instead.
+ */
+export async function sendFriendRequest(
+  toUserId: string,
+): Promise<{ error?: string; autoAccepted?: boolean; alreadyPending?: boolean; requestId?: string }> {
+  const gate = await ensureFavoritesUser()
+  if ('error' in gate) return { error: gate.error }
+  const myId = gate.userId
+
+  if (toUserId === myId) return { error: 'You cannot add yourself' }
+
+  const { data: alreadyFriend } = await supabase
+    .from('friendships')
+    .select('friend_id')
+    .eq('user_id', myId)
+    .eq('friend_id', toUserId)
+    .maybeSingle()
+  if (alreadyFriend) return { error: 'Already friends' }
+
+  const { data: outgoing } = await supabase
+    .from('friend_requests')
+    .select('id')
+    .eq('status', 'pending')
+    .eq('from_user', myId)
+    .eq('to_user', toUserId)
+    .maybeSingle()
+  if (outgoing) return { alreadyPending: true, requestId: outgoing.id }
+
+  const { data: incoming } = await supabase
+    .from('friend_requests')
+    .select('id')
+    .eq('status', 'pending')
+    .eq('from_user', toUserId)
+    .eq('to_user', myId)
+    .maybeSingle()
+
+  if (incoming?.id) {
+    const accepted = await acceptFriendRequest(incoming.id)
+    if (accepted.error) return { error: accepted.error }
+    return { autoAccepted: true }
+  }
+
+  const { data: inserted, error } = await supabase
+    .from('friend_requests')
+    .insert({
+      from_user: myId,
+      to_user: toUserId,
+      status: 'pending',
+    })
+    .select('id')
+    .maybeSingle()
+  if (error) return { error: error.message }
+  return { requestId: inserted?.id }
 }
 
 export async function fetchFriendProfileBundle(friendUserId: string): Promise<
@@ -197,19 +410,39 @@ export async function searchPlayersFriendshipAware(
   const ids = (results ?? []).map((r) => r.user_id as string)
   if (ids.length === 0) return { results: [] }
 
-  const [{ data: iFollow }, { data: theyFollow }] = await Promise.all([
+  const [{ data: iFollow }, { data: outgoingReqs }, { data: incomingReqs }] = await Promise.all([
     supabase.from('friendships').select('friend_id').eq('user_id', myId).in('friend_id', ids),
-    supabase.from('friendships').select('user_id').eq('friend_id', myId).in('user_id', ids),
+    supabase
+      .from('friend_requests')
+      .select('id, to_user')
+      .eq('status', 'pending')
+      .eq('from_user', myId)
+      .in('to_user', ids),
+    supabase
+      .from('friend_requests')
+      .select('id, from_user')
+      .eq('status', 'pending')
+      .eq('to_user', myId)
+      .in('from_user', ids),
   ])
 
-  const iFollowSet = new Set(iFollow?.map((r) => r.friend_id) ?? [])
-  const theyFollowSet = new Set(theyFollow?.map((r) => r.user_id) ?? [])
+  const friendSet = new Set(iFollow?.map((r) => r.friend_id) ?? [])
+  const outgoingByUser = new Map((outgoingReqs ?? []).map((r) => [r.to_user as string, r.id as string]))
+  const incomingByUser = new Map((incomingReqs ?? []).map((r) => [r.from_user as string, r.id as string]))
 
   const enriched: FriendSearchResult[] = (results as FriendPlayer[]).map((p) => {
     let linkStatus: FriendSearchResult['linkStatus'] = 'none'
-    if (iFollowSet.has(p.user_id)) linkStatus = 'friends'
-    else if (theyFollowSet.has(p.user_id)) linkStatus = 'they_added_you'
-    return { ...p, linkStatus }
+    let requestId: string | undefined
+    if (friendSet.has(p.user_id)) {
+      linkStatus = 'friends'
+    } else if (outgoingByUser.has(p.user_id)) {
+      linkStatus = 'outgoing_pending'
+      requestId = outgoingByUser.get(p.user_id)
+    } else if (incomingByUser.has(p.user_id)) {
+      linkStatus = 'they_added_you'
+      requestId = incomingByUser.get(p.user_id)
+    }
+    return { ...p, linkStatus, requestId }
   })
 
   const blocked = new Set(await fetchBlockedUserIds())

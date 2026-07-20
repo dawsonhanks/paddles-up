@@ -1,6 +1,7 @@
 import { mapAuthErrorMessage, MIN_PASSWORD_LENGTH } from '@/lib/authErrors'
 import { isValidEmail, isValidUsername, normalizeUsername } from '@/lib/profileValidation'
 import { supabase } from '@/supabase'
+import * as Linking from 'expo-linking'
 
 export type AuthFieldErrors = {
   fullName?: string
@@ -206,11 +207,90 @@ export async function sendPasswordResetEmail(emailRaw: string): Promise<AuthResu
     return fail({ email: 'Enter a valid email address.' })
   }
 
-  const { error } = await supabase.auth.resetPasswordForEmail(email)
+  const redirectTo = Linking.createURL('reset-password')
+  const { error } = await supabase.auth.resetPasswordForEmail(email, { redirectTo })
 
   if (error) {
     return fail({ form: mapAuthErrorMessage(error.message) })
   }
 
   return { ok: true }
+}
+
+export async function updatePasswordWithConfirm(params: {
+  password: string
+  confirmPassword: string
+}): Promise<AuthResult> {
+  const errors: AuthFieldErrors = {}
+  if (!params.password) {
+    errors.password = 'Enter a new password.'
+  } else if (params.password.length < MIN_PASSWORD_LENGTH) {
+    errors.password = `Password must be at least ${MIN_PASSWORD_LENGTH} characters.`
+  }
+  if (!params.confirmPassword) {
+    errors.confirmPassword = 'Confirm your new password.'
+  } else if (params.password !== params.confirmPassword) {
+    errors.confirmPassword = 'Passwords do not match.'
+  }
+  if (Object.keys(errors).length > 0) return fail(errors)
+
+  const { error } = await supabase.auth.updateUser({ password: params.password })
+  if (error) {
+    return fail({ form: mapAuthErrorMessage(error.message) })
+  }
+  return { ok: true }
+}
+
+/** Parse access/refresh tokens or PKCE code from a Supabase auth redirect URL. */
+function parseAuthRedirectParams(url: string): Record<string, string> {
+  const out: Record<string, string> = {}
+  const qIndex = url.indexOf('?')
+  const hIndex = url.indexOf('#')
+  const query = qIndex >= 0 ? url.slice(qIndex + 1, hIndex >= 0 ? hIndex : undefined) : ''
+  const hash = hIndex >= 0 ? url.slice(hIndex + 1) : ''
+  for (const part of [query, hash]) {
+    if (!part) continue
+    for (const pair of part.split('&')) {
+      if (!pair) continue
+      const eq = pair.indexOf('=')
+      const key = eq >= 0 ? pair.slice(0, eq) : pair
+      const val = eq >= 0 ? pair.slice(eq + 1) : ''
+      if (!key) continue
+      try {
+        out[decodeURIComponent(key)] = decodeURIComponent(val.replace(/\+/g, ' '))
+      } catch {
+        out[key] = val
+      }
+    }
+  }
+  return out
+}
+
+/**
+ * Establish a session from a password-recovery (or other auth) deep link.
+ * Returns whether a recovery session was established.
+ */
+export async function establishSessionFromAuthUrl(url: string): Promise<{
+  ok: boolean
+  isRecovery: boolean
+  error?: string
+}> {
+  const params = parseAuthRedirectParams(url)
+  const type = params.type ?? ''
+
+  if (params.code) {
+    const { error } = await supabase.auth.exchangeCodeForSession(params.code)
+    if (error) return { ok: false, isRecovery: type === 'recovery', error: mapAuthErrorMessage(error.message) }
+    return { ok: true, isRecovery: type === 'recovery' || type === '' }
+  }
+
+  const access_token = params.access_token
+  const refresh_token = params.refresh_token
+  if (access_token && refresh_token) {
+    const { error } = await supabase.auth.setSession({ access_token, refresh_token })
+    if (error) return { ok: false, isRecovery: type === 'recovery', error: mapAuthErrorMessage(error.message) }
+    return { ok: true, isRecovery: type === 'recovery' }
+  }
+
+  return { ok: false, isRecovery: false }
 }
