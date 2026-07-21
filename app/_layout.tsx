@@ -232,6 +232,7 @@ export default function RootLayout() {
                   <Stack.Screen name="match/[id]" options={{ headerShown: false }} />
                   <Stack.Screen name="play/skill-filter" options={{ headerShown: false, presentation: 'modal' }} />
                   <Stack.Screen name="admin/submissions" options={{ headerShown: true, title: 'Admin Submissions' }} />
+                  <Stack.Screen name="admin/reports" options={{ headerShown: false }} />
                 </Stack>
               </View>
               <StatusBar style="auto" />

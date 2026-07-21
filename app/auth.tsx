@@ -33,9 +33,14 @@ type AuthMode = 'signup' | 'login'
 const BRAND = '#0F6E56'
 const BRAND_DARK = '#0B3D33'
 const PRIVACY_POLICY_URL = 'https://dawsonhanks.github.io/paddles-up-privacy/'
+const TERMS_OF_USE_URL = 'https://dawsonhanks.github.io/paddles-up-privacy/terms'
 
 function openPrivacyPolicy() {
   void WebBrowser.openBrowserAsync(PRIVACY_POLICY_URL)
+}
+
+function openTermsOfUse() {
+  void WebBrowser.openBrowserAsync(TERMS_OF_USE_URL)
 }
 
 export default function AuthScreen() {
@@ -279,11 +284,20 @@ export default function AuthScreen() {
                 By creating an account, you agree to our{' '}
                 <Text
                   style={styles.privacyLink}
+                  onPress={openTermsOfUse}
+                  accessibilityRole="link"
+                  accessibilityLabel="Terms of Use">
+                  Terms of Use
+                </Text>{' '}
+                and{' '}
+                <Text
+                  style={styles.privacyLink}
                   onPress={openPrivacyPolicy}
                   accessibilityRole="link"
                   accessibilityLabel="Privacy Policy">
                   Privacy Policy
                 </Text>
+                .
               </Text>
             </View>
           </ScrollView>

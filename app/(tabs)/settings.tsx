@@ -63,11 +63,15 @@ import {
 
 /** Matches App Store / Play metadata and GitHub Pages (`index.html` at repo root). */
 const PRIVACY_POLICY_URL = 'https://dawsonhanks.github.io/paddles-up-privacy/'
+const TERMS_OF_USE_URL = 'https://dawsonhanks.github.io/paddles-up-privacy/terms'
+const SUPPORT_URL = 'https://dawsonhanks.github.io/paddles-up-privacy/support'
 
 const ITEMS = [
   { id: 'privacy', label: 'Privacy Policy', icon: 'lock-outline', url: PRIVACY_POLICY_URL },
+  { id: 'terms', label: 'Terms of Use', icon: 'description', url: TERMS_OF_USE_URL },
   { id: 'suggest', label: 'Suggest a Court', icon: 'add-location-alt' },
   { id: 'feedback', label: 'Send Feedback', icon: 'chat-bubble-outline', url: 'mailto:dawsonhanks@gmail.com?subject=Paddles Up Feedback' },
+  { id: 'support', label: 'Support', icon: 'help-outline', url: SUPPORT_URL },
 ]
 
 type Profile = {
@@ -732,7 +736,7 @@ export default function ProfileScreen() {
                   openSuggestCourt()
                   return
                 }
-                if (item.id === 'privacy' && item.url) {
+                if (item.url && /^https?:/i.test(item.url)) {
                   void WebBrowser.openBrowserAsync(item.url).catch(() =>
                     Linking.openURL(item.url!)
                   )
@@ -754,6 +758,15 @@ export default function ProfileScreen() {
             activeOpacity={0.8}>
             <MaterialIcons name="admin-panel-settings" size={18} color="#fff" />
             <Text style={styles.adminNavBtnText}>Court submissions</Text>
+          </TouchableOpacity>
+        ) : null}
+        {profile?.admin === true ? (
+          <TouchableOpacity
+            style={styles.adminNavBtn}
+            onPress={() => router.push('/admin/reports')}
+            activeOpacity={0.8}>
+            <MaterialIcons name="flag" size={18} color="#fff" />
+            <Text style={styles.adminNavBtnText}>Review Reports</Text>
           </TouchableOpacity>
         ) : null}
 
